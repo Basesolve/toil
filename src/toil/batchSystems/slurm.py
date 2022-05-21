@@ -288,10 +288,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             ]
             slurm_resources = req_configs.groupby("partitions").max().reset_index()
             slurm_resources['spot'] = slurm_resources.partitions.str.endswith('s')
-            slurm_resources.sort_values(['cputot', 'realmemory'], ascending=False, inplace=True)
             slurm_resources[['cputot', 'realmemory']] = slurm_resources[
                 ['cputot', 'realmemory']
             ].astype(int)
+            slurm_resources.sort_values(['cputot', 'realmemory'], inplace=True)
             return slurm_resources
         
         def select_partition(self, inferred_slurm_resources, cpus, mem, spot_okay=True):
