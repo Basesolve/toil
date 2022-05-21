@@ -107,10 +107,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             while len(self.waitingJobs) > 0 and \
                     len(self.runningJobs) < int(self.boss.config.maxLocalJobs):
                 activity = True
-                jobID, cpu, memory, command, jobName, environment = self.waitingJobs.pop(0)
+                jobID, cpu, memory, command, jobName, environment, slurm_partition, comment = self.waitingJobs.pop(0)
 
                 # prepare job submission command
-                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment)
+                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, slurm_partition, comment)
                 logger.debug("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 logger.debug("Submitted job %s", str(batchJobID))
@@ -271,7 +271,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                               jobID: int,
                               command: str,
                               jobName: str,
-                              job_environment: Optional[Dict[str, str]] = None) -> List[str]:
+                              job_environment: Optional[Dict[str, str]] = None,
+                              slurm_partition: Optional[str] = None, 
+                              comment: Optional[str] = None) -> List[str]:
             """
             Preparation in putting together a command-line string
             for submitting to batch system (via submitJob().)
@@ -370,9 +372,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             jobID = self.getNextJobID()
             self.currentJobs.add(jobID)
             self.newJobsQueue.put((jobID, jobDesc.cores, jobDesc.memory, jobDesc.command, jobDesc.unitName,
-                                   job_environment))
-            logger.debug("Issued the job command: %s with job id: %s and job name %s", jobDesc.command, str(jobID),
-                         jobDesc.unitName)
+                                   job_environment, jobDesc.slurm_partition, jobDesc.comment))
+            logger.debug("Issued the job command: %s with job id: %s and job name %s on partition %s with comment %s", jobDesc.command, str(jobID),
+                         jobDesc.unitName, jobDesc.slurm_partition, jobDesc.comment)
         return jobID
 
     def killBatchJobs(self, jobIDs):
