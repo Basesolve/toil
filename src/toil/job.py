@@ -459,7 +459,7 @@ class JobDescription(Requirer):
         self.jobName = makeString(jobName)
         self.unitName = makeString(unitName)
         self.displayName = makeString(displayName)
-        self.spot_okay: Optional[bool] = True
+        self.spot_okay: Optional[bool] = spot_okay
         self.comment = makeString(comment)
 
         # Set properties that are not fully filled in on creation.
