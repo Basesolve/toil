@@ -2486,9 +2486,10 @@ class FunctionWrappingJob(Job):
                          disk=resolve('disk', dehumanize=True),
                          preemptable=resolve('preemptable'),
                          checkpoint=resolve('checkpoint', default=False),
-                         unitName=resolve('name', default=None)),
-                         slurm_partition=resolve('slurm_partition', default=None)),
-                         comment=resolve('comment', default=None))
+                         unitName=resolve('name', default=None),
+                         slurm_partition=resolve('slurm_partition', default=None),
+                         comment=resolve('comment', default=None)
+                        )
 
         self.userFunctionModule = ModuleDescriptor.forModule(userFunction.__module__).globalize()
         self.userFunctionName = str(userFunction.__name__)
