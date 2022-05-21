@@ -259,7 +259,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ###
         ### Implementation-specific helper methods
         ###
-        def get_slurm_resources():
+        def get_slurm_resources(self):
             slurm_partition_configs = os.popen(
                 r"""
                 scontrol show node -o |
@@ -288,19 +288,21 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             ]
             slurm_resources = req_configs.groupby("partitions").max().reset_index()
             slurm_resources['spot'] = slurm_resources.partitions.str.endswith('s')
-            slurm_resources.sort_values(['cputot', 'realmemory'], inplace=True)
+            slurm_resources.sort_values(['cputot', 'realmemory'], ascending=False, inplace=True)
             slurm_resources[['cputot', 'realmemory']] = slurm_resources[
                 ['cputot', 'realmemory']
             ].astype(int)
             return slurm_resources
         
-        def select_partition(inferred_slurm_resources, cpus, mem, spot_okay=True):
+        def select_partition(self, inferred_slurm_resources, cpus, mem, spot_okay=True):
             '''Select suitable slurm partition based on requirements'''
-            return inferred_slurm_resources.partitions[
+            possible_partitions = inferred_slurm_resources.partitions[
                 (inferred_slurm_resources['cputot'] >= cpus) &
                 (inferred_slurm_resources['realmemory'] >= mem) &
                 (inferred_slurm_resources['spot'] == spot_okay)
-            ].values[0]
+            ].values
+            logger.info("Partitions: %s", possible_partitions)
+            return possible_partitions[0]
 
         def prepareSbatch(self,
                           cpu: int,
@@ -349,6 +351,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 math.ceil(mem / 2 ** 20),
                 spot_okay=spot_okay
             )
+            logger.info("Selected partition: %s based on cpus: %s and memory: %s on spot capacity: %s", partition, math.ceil(cpu),
+                math.ceil(mem / 2 ** 20),
+                spot_okay)
             sbatch_line.append(f'--partition={partition}')
 
             stdoutfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'out')
