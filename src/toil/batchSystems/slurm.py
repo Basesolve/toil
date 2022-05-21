@@ -17,7 +17,8 @@ import os
 from argparse import ArgumentParser, _ArgumentGroup
 from pipes import quote
 from typing import Callable, Dict, List, Optional, TypeVar, Union
-
+import configparser
+import pandas as pd
 from toil.batchSystems.abstractGridEngineBatchSystem import (
     AbstractGridEngineBatchSystem,
 )
@@ -62,9 +63,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                               command: str,
                               jobName: str,
                               job_environment: Optional[Dict[str, str]] = None,
-                              slurm_partition: Optional[str] = None,
+                              spot_okay: Optional[bool] = True,
                               comment: Optional[str] = None,) -> List[str]:
-            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, slurm_partition, comment) + [f'--wrap={command}']
+            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, spot_okay, comment) + [f'--wrap={command}']
 
         def submitJob(self, subLine):
             try:
@@ -258,6 +259,48 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ###
         ### Implementation-specific helper methods
         ###
+        def get_slurm_resources():
+            slurm_partition_configs = os.popen(
+                r"""
+                scontrol show node -o |
+                sed 's/NodeName=/\[/' |
+                sed 's/ /\] /' |
+                sed 's/ \+/\n/g' |
+                egrep "=|\["
+                """
+            ).read().strip()
+            # print(slurm_partition_configs)
+            config = configparser.ConfigParser()
+            config.read_string(slurm_partition_configs)
+            config_dicts = []
+            for section, val in config._sections.items():
+                cdict = {'NodeName': section}
+                for k, v in val.items():
+                    cdict[k] = v
+                config_dicts.append(cdict)
+
+            config_data = pd.DataFrame.from_dict(config_dicts)
+            # print(config_data)
+            req_configs = config_data[
+                [
+                    'partitions', 'cputot', 'realmemory'
+                ]
+            ]
+            slurm_resources = req_configs.groupby("partitions").max().reset_index()
+            slurm_resources['spot'] = slurm_resources.partitions.str.endswith('s')
+            slurm_resources.sort_values(['cputot', 'realmemory'], inplace=True)
+            slurm_resources[['cputot', 'realmemory']] = slurm_resources[
+                ['cputot', 'realmemory']
+            ].astype(int)
+            return slurm_resources
+        
+        def select_partition(inferred_slurm_resources, cpus, mem, spot_okay=True):
+            '''Select suitable slurm partition based on requirements'''
+            return inferred_slurm_resources.partitions[
+                (inferred_slurm_resources['cputot'] >= cpus) &
+                (inferred_slurm_resources['realmemory'] >= mem) &
+                (inferred_slurm_resources['spot'] == spot_okay)
+            ].values[0]
 
         def prepareSbatch(self,
                           cpu: int,
@@ -265,7 +308,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                           jobID: int,
                           jobName: str,
                           job_environment: Optional[Dict[str, str]],
-                          slurm_partition: Optional[str],
+                          spot_okay: Optional[bool],
                           comment: Optional[str]) -> List[str]:
 
             #  Returns the sbatch command line before the script to run
@@ -292,15 +335,21 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 sbatch_line.append(f'--cpus-per-task={math.ceil(cpu)}')
             if comment is not None:
                 sbatch_line.append(f'--comment={comment}')
-            available_partitions = os.popen(
-                """
-                scontrol show partitions -o |
-                cut -d" " -f1 |
-                cut -d"=" -f2
-                """
-            ).read().strip().split()
-            if slurm_partition is not None and slurm_partition in available_partitions:
-                sbatch_line.append(f'--partition={slurm_partition}')
+            # available_partitions = os.popen(
+            #     """
+            #     scontrol show partitions -o |
+            #     cut -d" " -f1 |
+            #     cut -d"=" -f2
+            #     """
+            # ).read().strip().split()
+            # if slurm_partition is not None and slurm_partition in available_partitions:
+            partition = self.select_partition(
+                self.get_slurm_resources(), 
+                math.ceil(cpu),
+                math.ceil(mem / 2 ** 20),
+                spot_okay=spot_okay
+            )
+            sbatch_line.append(f'--partition={partition}')
 
             stdoutfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'out')
             stderrfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'err')
