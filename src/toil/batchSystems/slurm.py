@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class SlurmBatchSystem(AbstractGridEngineBatchSystem):
-
     class Worker(AbstractGridEngineBatchSystem.Worker):
 
         def getRunningJobIDs(self):
@@ -259,49 +258,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ###
         ### Implementation-specific helper methods
         ###
-        def get_slurm_resources(self):
-            slurm_partition_configs = os.popen(
-                r"""
-                scontrol show node -o |
-                sed 's/NodeName=/\[/' |
-                sed 's/ /\] /' |
-                sed 's/ \+/\n/g' |
-                egrep "=|\["
-                """
-            ).read().strip()
-            # print(slurm_partition_configs)
-            config = configparser.ConfigParser()
-            config.read_string(slurm_partition_configs)
-            config_dicts = []
-            for section, val in config._sections.items():
-                cdict = {'NodeName': section}
-                for k, v in val.items():
-                    cdict[k] = v
-                config_dicts.append(cdict)
-
-            config_data = pd.DataFrame.from_dict(config_dicts)
-            # print(config_data)
-            req_configs = config_data[
-                [
-                    'partitions', 'cputot', 'realmemory'
-                ]
-            ]
-            slurm_resources = req_configs.groupby("partitions").max().reset_index()
-            slurm_resources['spot'] = slurm_resources.partitions.str.endswith('s')
-            slurm_resources[['cputot', 'realmemory']] = slurm_resources[
-                ['cputot', 'realmemory']
-            ].astype(int)
-            slurm_resources.sort_values(['cputot', 'realmemory'], inplace=True)
-            return slurm_resources
         
-        def select_partition(self, inferred_slurm_resources, cpus, mem, spot_okay=True):
+        def select_partition(self, cpus, mem, spot_okay=True):
             '''Select suitable slurm partition based on requirements'''
-            possible_partitions = inferred_slurm_resources.partitions[
-                (inferred_slurm_resources['cputot'] >= cpus) &
-                (inferred_slurm_resources['realmemory'] >= mem) &
-                (inferred_slurm_resources['spot'] == spot_okay)
+            possible_partitions = self.slurm_resources.partitions[
+                (self.slurm_resources['cputot'] >= cpus) &
+                (self.slurm_resources['realmemory'] >= mem) &
+                (self.slurm_resources['spot'] == spot_okay)
             ].values
-            logger.info("Partitions: %s", possible_partitions)
+            logger.info("Usable Partitions: %s", possible_partitions)
             return possible_partitions[0]
 
         def prepareSbatch(self,
@@ -346,7 +311,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # ).read().strip().split()
             # if slurm_partition is not None and slurm_partition in available_partitions:
             partition = self.select_partition(
-                self.get_slurm_resources(), 
                 math.ceil(cpu),
                 math.ceil(mem / 2 ** 20),
                 spot_okay=spot_okay
@@ -391,6 +355,42 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     ###
     ### The interface for SLURM
     ###
+    @classmethod
+    def get_slurm_resources(cls):
+        slurm_partition_configs = os.popen(
+            r"""
+            scontrol show node -o |
+            sed 's/\[.*//g' |
+            sed 's/NodeName=/\[/' |
+            sed 's/ /\] /' |
+            sed 's/ \+/\n/g' |
+            egrep "=|\["
+            """
+        ).read().strip()
+        # print(slurm_partition_configs)
+        config = configparser.ConfigParser()
+        config.read_string(slurm_partition_configs)
+        config_dicts = []
+        for section, val in config._sections.items():
+            cdict = {'NodeName': section}
+            for k, v in val.items():
+                cdict[k] = v
+            config_dicts.append(cdict)
+
+        config_data = pd.DataFrame.from_dict(config_dicts)
+        # print(config_data)
+        req_configs = config_data[
+            [
+                'partitions', 'cputot', 'realmemory'
+            ]
+        ]
+        slurm_resources = req_configs.groupby("partitions").max().reset_index()
+        slurm_resources['spot'] = slurm_resources.partitions.str.endswith('s')
+        slurm_resources[['cputot', 'realmemory']] = slurm_resources[
+            ['cputot', 'realmemory']
+        ].astype(int)
+        slurm_resources.sort_values(['cputot', 'realmemory'], inplace=True)
+        return slurm_resources
 
     @classmethod
     def getWaitDuration(cls):

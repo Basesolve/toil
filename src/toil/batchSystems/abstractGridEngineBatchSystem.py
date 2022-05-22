@@ -52,6 +52,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             self.boss = boss
             self.boss.config.statePollingWait = \
                 self.boss.config.statePollingWait or self.boss.getWaitDuration()
+            self.slurm_resources = self.boss.get_slurm_resources()
             self.newJobsQueue = newJobsQueue
             self.updatedJobsQueue = updatedJobsQueue
             self.killQueue = killQueue
@@ -455,6 +456,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
     @classmethod
     def getWaitDuration(self):
         return 1
+    
+    @classmethod
+    def get_slurm_resources(self):
+        return None
 
     def sleepSeconds(self, sleeptime=1):
         """ Helper function to drop on all state-querying functions to avoid over-querying.
