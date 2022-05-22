@@ -266,8 +266,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 (self.slurm_resources['realmemory'] >= mem) &
                 (self.slurm_resources['spot'] == spot_okay)
             ].values
-            logger.info("Usable Partitions: %s", possible_partitions)
-            return possible_partitions[0]
+            if len(possible_partitions) != 0:
+                logger.info("Partitions: %s", possible_partitions)
+                return possible_partitions[0]
+            else:
+                logger.info("Could find a partition to suffice cpus: %s, memory: %s and spot: %s", cpus, mem, spot_okay)
+                logger.info("Trying with spot: %s", not spot_okay)
+                return self.select_partition(cpus, mem, not spot_okay)
 
         def prepareSbatch(self,
                           cpu: int,
@@ -310,6 +315,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             #     """
             # ).read().strip().split()
             # if slurm_partition is not None and slurm_partition in available_partitions:
+            logger.info("Trying to selecting partition based on cpus: %s and memory: %s on spot capacity: %s", math.ceil(cpu),
+                math.ceil(mem / 2 ** 20),
+                spot_okay
+            )
             partition = self.select_partition(
                 math.ceil(cpu),
                 math.ceil(mem / 2 ** 20),
@@ -317,7 +326,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             )
             logger.info("Selected partition: %s based on cpus: %s and memory: %s on spot capacity: %s", partition, math.ceil(cpu),
                 math.ceil(mem / 2 ** 20),
-                spot_okay)
+                spot_okay
+            )
             sbatch_line.append(f'--partition={partition}')
 
             stdoutfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'out')
