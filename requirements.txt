@@ -8,4 +8,4 @@ addict>=2.2.1, <2.5
 pytz>=2012
 enlighten>=1.5.2, <2
 typing-extensions ; python_version < '3.8'
-pandas>=1.4.2
+pandas>=1.3.5
