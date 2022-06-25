@@ -428,7 +428,7 @@ class JobDescription(Requirer):
         unitName: str = "",
         displayName: str = "",
         command: Optional[str] = None,
-        spot_okay: Optional[str] = True,
+        use_preferred_partition: Optional[str] = True,
         comment: Optional[str] = None,
     ) -> None:
         """
@@ -459,7 +459,7 @@ class JobDescription(Requirer):
         self.jobName = makeString(jobName)
         self.unitName = makeString(unitName)
         self.displayName = makeString(displayName)
-        self.spot_okay: Optional[bool] = spot_okay
+        self.use_preferred_partition: Optional[bool] = use_preferred_partition
         self.comment = makeString(comment)
 
         # Set properties that are not fully filled in on creation.
@@ -1001,7 +1001,7 @@ class Job:
         checkpoint: Optional[bool] = False,
         displayName: Optional[str] = "",
         descriptionClass: Optional[str] = None,
-        spot_okay: Optional[bool] = True,
+        use_preferred_partition: Optional[bool] = True,
         comment: Optional[str] = None,
     ) -> None:
         """
@@ -1047,7 +1047,7 @@ class Job:
         # Create the JobDescription that owns all the scheduling information.
         # Make it with a temporary ID until we can be assigned a real one by
         # the JobStore.
-        self._description = descriptionClass(requirements, jobName, unitName=unitName, displayName=displayName, spot_okay=spot_okay, comment=comment)
+        self._description = descriptionClass(requirements, jobName, unitName=unitName, displayName=displayName, use_preferred_partition=use_preferred_partition, comment=comment)
 
         # Private class variables needed to actually execute a job, in the worker.
         # Also needed for setting up job graph structures before saving to the JobStore.
@@ -1809,7 +1809,7 @@ class Job:
         Is not executed as a job; runs within a ServiceHostJob.
         """
 
-        def __init__(self, memory=None, cores=None, disk=None, preemptable=None, unitName=None, spot_okay=None, comment=None):
+        def __init__(self, memory=None, cores=None, disk=None, preemptable=None, unitName=None, use_preferred_partition=None, comment=None):
             """
             Memory, core and disk requirements are specified identically to as in \
             :func:`toil.job.Job.__init__`.
@@ -2487,7 +2487,7 @@ class FunctionWrappingJob(Job):
                          preemptable=resolve('preemptable'),
                          checkpoint=resolve('checkpoint', default=False),
                          unitName=resolve('name', default=None),
-                         spot_okay=resolve('spot_okay', default=True),
+                         use_preferred_partition=resolve('use_preferred_partition', default=True),
                          comment=resolve('comment', default=None)
                         )
 

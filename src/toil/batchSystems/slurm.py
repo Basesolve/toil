@@ -62,9 +62,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                               command: str,
                               jobName: str,
                               job_environment: Optional[Dict[str, str]] = None,
-                              spot_okay: Optional[bool] = True,
+                              use_preferred_partition: Optional[bool] = True,
                               comment: Optional[str] = None,) -> List[str]:
-            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, spot_okay, comment) + [f'--wrap={command}']
+            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, use_preferred_partition, comment) + [f'--wrap={command}']
 
         def submitJob(self, subLine):
             try:
@@ -132,6 +132,46 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if state in ('PENDING', 'RUNNING', 'CONFIGURING', 'COMPLETING', 'RESIZING', 'SUSPENDED'):
                 rc = None
             return rc
+        
+        def check_and_change_partition(self, job_id, partition, restart_threshold=4):
+            '''Get the job restart count and switch partition.
+            restart_threshold=-1 implies node count per partition.
+
+            :param job_id: pending jobs id
+            :type job_id: int
+            :param restart_threshold: number of restarts to wait for before updating partition, defaults to 4
+            :type restart_threshold: int, optional
+            '''
+            restart_count = call_command(
+                f"""
+                scontrol -o show job {job_id} |
+                sed 's/ /\\n/g' |
+                grep Restarts |
+                cut -d "=" -f2
+                """
+            )
+            total_nodes, alternate_partition = call_command(
+                f"""
+                scontrol -o show partition {partition} |
+                sed 's/ /\\n/g' |
+                egrep 'TotalNodes|Alternate' |
+                cut -d "=" -f2
+                """
+            ).split('\n')
+            # set max_possible restart threshold
+            if restart_threshold == -1:
+                restart_threshold = total_nodes
+            if restart_count > restart_threshold and alternate_partition:
+                logger.warning(
+                    "Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
+                    job_id, restart_threshold, alternate_partition
+                )
+                call_command(
+                    f"""scontrol update jobid={job_id} partition={alternate_partition}"""
+                )
+            else:
+                logger.info("Restart threshold exceeded but not alternate partition available.")
+
 
         def _getJobDetailsFromSacct(self, job_id_list: list) -> dict:
             """
@@ -258,21 +298,49 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ###
         ### Implementation-specific helper methods
         ###
-        
-        def select_partition(self, cpus, mem, spot_okay=True):
-            '''Select suitable slurm partition based on requirements'''
+        def select_partition(self, cpus, mem, preferred=True):
+            '''Select suitable slurm partition based on requirements. Checks state of partition.
+
+            :param cpus: required cps
+            :type cpus: int
+            :param mem: required memory
+            :type mem: integer
+            :param preferred: respect partition preference, defaults to True
+            :type preferred: bool, optional
+            :return: suitable partition for the requirements
+            :rtype: str
+            '''
             possible_partitions = self.slurm_resources.partitions[
                 (self.slurm_resources['cputot'] >= cpus) &
                 (self.slurm_resources['realmemory'] >= mem) &
-                (self.slurm_resources['spot'] == spot_okay)
+                (self.slurm_resources['preference'] == preferred)
             ].values
             if len(possible_partitions) != 0:
                 logger.info("Partitions: %s", possible_partitions)
-                return possible_partitions[0]
-            else:
-                logger.info("Could find a partition to suffice cpus: %s, memory: %s and spot: %s", cpus, mem, spot_okay)
-                logger.info("Trying with spot: %s", not spot_okay)
-                return self.select_partition(cpus, mem, not spot_okay)
+                for partition in possible_partitions:
+                    partition_state = call_command(
+                        f"""
+                        scontrol -o show partition {partition} |
+                        sed 's/ /\\n/g' |
+                        grep State |
+                        cut -d "=" -f2
+                        """
+                    )
+                    if partition_state == 'UP':
+                        return possible_partitions
+                    logger.info(
+                        "Skipping partition: %s, due to state being %s",
+                        partition,
+                        partition_state
+                    )
+            logger.info(
+                "Could not find a partition to suffice cpus: %s, memory: %s and preferred type: %s",
+                cpus,
+                mem,
+                preferred
+            )
+            logger.info("Trying with preferred type: %s", not preferred)
+            return self.select_partition(cpus, mem, not preferred)
 
         def prepareSbatch(self,
                           cpu: int,
@@ -280,7 +348,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                           jobID: int,
                           jobName: str,
                           job_environment: Optional[Dict[str, str]],
-                          spot_okay: Optional[bool],
+                          use_preferred_partition: Optional[bool],
                           comment: Optional[str]) -> List[str]:
 
             #  Returns the sbatch command line before the script to run
@@ -299,36 +367,41 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     argList.append(f'{k}={quoted_value}')
 
                 sbatch_line.append('--export=' + ','.join(argList))
-
             if mem is not None and self.boss.config.allocate_mem:
                 # memory passed in is in bytes, but slurm expects megabytes
-                sbatch_line.append(f'--mem={math.ceil(mem / 2 ** 20)}')
+                slurm_mem = math.ceil(mem / 2 ** 20)
+                sbatch_line.append(f'--mem={slurm_mem}')
+            else:
+                slurm_mem = None
             if cpu is not None:
-                sbatch_line.append(f'--cpus-per-task={math.ceil(cpu)}')
+                slurm_cpu = math.ceil(cpu)
+                sbatch_line.append(f'--cpus-per-task={slurm_cpu}')
+
+            if slurm_mem and slurm_cpu:
+                logger.info(
+                    "Trying to select partition based on cpus: %s and memory: %s of preferred type: %s",
+                    slurm_cpu,
+                    slurm_mem,
+                    use_preferred_partition
+                )
+                partition = self.select_partition(
+                    slurm_cpu,
+                    slurm_mem,
+                    preferred=use_preferred_partition
+                )
+                logger.info(
+                    "Selected partition: %s based on cpus: %s and memory: %s of preferred type: %s",
+                    partition,
+                    slurm_cpu,
+                    slurm_mem,
+                    use_preferred_partition
+                )
+                sbatch_line.append(f'--partition={partition}')
+            else:
+                logger.info("Skipping slurm partition selection as mem and cpu are not specified.")
+            
             if comment is not None:
                 sbatch_line.append(f'--comment={comment}')
-            # available_partitions = os.popen(
-            #     """
-            #     scontrol show partitions -o |
-            #     cut -d" " -f1 |
-            #     cut -d"=" -f2
-            #     """
-            # ).read().strip().split()
-            # if slurm_partition is not None and slurm_partition in available_partitions:
-            logger.info("Trying to selecting partition based on cpus: %s and memory: %s on spot capacity: %s", math.ceil(cpu),
-                math.ceil(mem / 2 ** 20),
-                spot_okay
-            )
-            partition = self.select_partition(
-                math.ceil(cpu),
-                math.ceil(mem / 2 ** 20),
-                spot_okay=spot_okay
-            )
-            logger.info("Selected partition: %s based on cpus: %s and memory: %s on spot capacity: %s", partition, math.ceil(cpu),
-                math.ceil(mem / 2 ** 20),
-                spot_okay
-            )
-            sbatch_line.append(f'--partition={partition}')
 
             stdoutfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'out')
             stderrfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'err')
@@ -366,7 +439,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     ### The interface for SLURM
     ###
     @classmethod
-    def get_slurm_resources(cls):
+    def assessBatchResources(cls):
         slurm_partition_configs = os.popen(
             r"""
             scontrol show node -o |
@@ -395,7 +468,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             ]
         ]
         slurm_resources = req_configs.groupby("partitions").max().reset_index()
-        slurm_resources['spot'] = slurm_resources.partitions.str.endswith('s')
+        preference = os.getenv("TOIL_SLURM_PARTITON_PREFERED")
+        if preference:
+            logger.info(
+                "Setting slurm partition preference: %s",
+                preference
+            )
+            slurm_resources['preference'] = slurm_resources.partitions.str.lower.contains(preference.lower())
         slurm_resources[['cputot', 'realmemory']] = slurm_resources[
             ['cputot', 'realmemory']
         ].astype(int)

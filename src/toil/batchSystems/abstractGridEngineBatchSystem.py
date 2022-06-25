@@ -52,7 +52,13 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             self.boss = boss
             self.boss.config.statePollingWait = \
                 self.boss.config.statePollingWait or self.boss.getWaitDuration()
-            self.slurm_resources = self.boss.get_slurm_resources()
+            try:
+                self.slurm_resources = self.boss.get_slurm_resources()
+            except Exception as err:
+                logger.warning(
+                    "Cannot assess slurm resources. Possibly running on non-slurm bactch system. Error: %s",
+                    err
+                )
             self.newJobsQueue = newJobsQueue
             self.updatedJobsQueue = updatedJobsQueue
             self.killQueue = killQueue
@@ -108,10 +114,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             while len(self.waitingJobs) > 0 and \
                     len(self.runningJobs) < int(self.boss.config.maxLocalJobs):
                 activity = True
-                jobID, cpu, memory, command, jobName, environment, spot_okay, comment = self.waitingJobs.pop(0)
+                jobID, cpu, memory, command, jobName, environment, use_preferred_partition, comment = self.waitingJobs.pop(0)
 
                 # prepare job submission command
-                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, spot_okay, comment)
+                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, use_preferred_partition, comment)
                 logger.debug("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 logger.debug("Submitted job %s", str(batchJobID))
@@ -273,7 +279,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                               command: str,
                               jobName: str,
                               job_environment: Optional[Dict[str, str]] = None,
-                              spot_okay: Optional[bool] = True, 
+                              use_preferred_partition: Optional[bool] = True,
                               comment: Optional[str] = None) -> List[str]:
             """
             Preparation in putting together a command-line string
@@ -285,7 +291,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             :param: string subLine: the command line string to be called
             :param: string jobName: the name of the Toil job, to provide metadata to batch systems if desired
             :param: dict job_environment: the environment variables to be set on the worker
-
+            :param: bool use_preferred_partition: override prefferred partition selection for the job
+            :param: string comment: set a job comment
+            
             :rtype: List[str]
             """
             raise NotImplementedError()
@@ -373,9 +381,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             jobID = self.getNextJobID()
             self.currentJobs.add(jobID)
             self.newJobsQueue.put((jobID, jobDesc.cores, jobDesc.memory, jobDesc.command, jobDesc.unitName,
-                                   job_environment, jobDesc.spot_okay, jobDesc.comment))
+                                   job_environment, jobDesc.use_preferred_partition, jobDesc.comment))
             logger.debug("Issued the job command: %s with job id: %s and job name %s on spot capacity: %s with comment %s", jobDesc.command, str(jobID),
-                         jobDesc.unitName, jobDesc.spot_okay, jobDesc.comment)
+                         jobDesc.unitName, jobDesc.use_preferred_partition, jobDesc.comment)
         return jobID
 
     def killBatchJobs(self, jobIDs):
@@ -458,8 +466,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
         return 1
     
     @classmethod
-    def get_slurm_resources(self):
-        return None
+    def assessBatchResources(self):
+        '''Profile batch system resources for deeper job submission control
+        '''
+        raise NotImplementedError()
 
     def sleepSeconds(self, sleeptime=1):
         """ Helper function to drop on all state-querying functions to avoid over-querying.
