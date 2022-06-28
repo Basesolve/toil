@@ -133,7 +133,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 rc = None
             return rc
         
-        def check_and_change_partition(self, job_id, partition, restart_threshold=4):
+        def check_and_change_partition(self, job_id, partition, restart_threshold=5):
             '''Get the job restart count and switch partition.
             restart_threshold=-1 implies node count per partition.
 
