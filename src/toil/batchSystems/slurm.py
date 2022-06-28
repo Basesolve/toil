@@ -162,7 +162,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if restart_threshold == -1:
                 restart_threshold = total_nodes
             if restart_count > restart_threshold and alternate_partition:
-                logger.warning(
+                logger.info(
                     "Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
                     job_id, restart_threshold, alternate_partition
                 )
@@ -170,8 +170,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     f"""scontrol update jobid={job_id} partition={alternate_partition}"""
                 )
             else:
-                logger.info("Restart threshold exceeded but not alternate partition available.")
-
+                logger.info("Cannot switch partition: slurm job restart threshold exceeded but no alternate partition configured for %s", partition)
 
         def _getJobDetailsFromSacct(self, job_id_list: list) -> dict:
             """
@@ -184,7 +183,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             args = ['sacct',
                     '-n',  # no header
                     '-j', job_ids,  # job
-                    '--format', 'JobIDRaw,State,ExitCode',  # specify output columns
+                    '--format', 'JobIDRaw,State,ExitCode,Partition',  # specify output columns
                     '-P',  # separate columns with pipes
                     '-S', '1970-01-01']  # override start time limit
             stdout = call_command(args)
@@ -200,7 +199,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 values = line.strip().split('|')
                 if len(values) < 3:
                     continue
-                job_id_raw, state, exitcode = values
+                job_id_raw, state, exitcode, partition = values
                 logger.debug("%s state of job %s is %s", args[0], job_id_raw, state)
                 # JobIDRaw is in the form JobID[.JobStep]; we're not interested in job steps.
                 job_id_parts = job_id_raw.split(".")
@@ -208,6 +207,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     continue
                 job_id = int(job_id_parts[0])
                 status, signal = [int(n) for n in exitcode.split(':')]
+                if status == 'PENDING':
+                    logger.info("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
+                    self.check_and_change_partition(job_id=job_id, partition=partition)
                 if signal > 0:
                     # A non-zero signal may indicate e.g. an out-of-memory killed job
                     status = 128 + signal
@@ -276,6 +278,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if job_id not in job_id_list:
                     continue
                 state = job['JobState']
+                partition = job['Partition']
+                if status == 'PENDING':
+                    logger.info("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
+                    self.check_and_change_partition(job_id=job_id, partition=partition)
                 logger.debug("%s state of job %s is %s", args[0], job_id, state)
                 try:
                     exitcode = job['ExitCode']
