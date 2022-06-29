@@ -53,10 +53,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             self.boss.config.statePollingWait = \
                 self.boss.config.statePollingWait or self.boss.getWaitDuration()
             try:
-                self.slurm_resources = self.boss.get_slurm_resources()
-            except Exception as err:
+                self.batchSystemResources = self.boss.assessBatchResources()
+            except NotImplementedError as err:
                 logger.warning(
-                    "Cannot assess slurm resources. Possibly running on non-slurm bactch system. Error: %s",
+                    "Cannot assess batch system resources. Possibly running on non-slurm batcg system. Error: %s",
                     err
                 )
             self.newJobsQueue = newJobsQueue

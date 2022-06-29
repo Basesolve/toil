@@ -316,10 +316,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :return: suitable partition for the requirements
             :rtype: str
             '''
-            possible_partitions = self.slurm_resources.partitions[
-                (self.slurm_resources['cputot'] >= cpus) &
-                (self.slurm_resources['realmemory'] >= mem) &
-                (self.slurm_resources['preference'] == preferred)
+            possible_partitions = self.batchSystemResources.partitions[
+                (self.batchSystemResources['cputot'] >= cpus) &
+                (self.batchSystemResources['realmemory'] >= mem) &
+                (self.batchSystemResources['preference'] == preferred)
             ].values
             if len(possible_partitions) != 0:
                 logger.info("Partitions: %s", possible_partitions)
