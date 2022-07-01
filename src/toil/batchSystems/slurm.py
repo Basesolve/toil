@@ -153,8 +153,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             alternate_partition = os.popen(
                 f"""
                 scontrol -o show partition {partition} |
-                sed 's/ /\\n/g' |
-                egrep 'TotalNodes|Alternate' |
+                sed 's/ /\n/g' |
+                grep 'Alternate' |
                 cut -d "=" -f2
                 """
             ).read().strip()
