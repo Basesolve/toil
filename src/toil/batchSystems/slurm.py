@@ -332,7 +332,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     (self.batchSystemResources['realmemory'] >= mem)
                 ].values
             if len(possible_partitions) != 0:
-                logger.info("Partitions: %s", possible_partitions)
+                usable_partitions = []
+                logger.info("Available Partitions: %s", possible_partitions)
                 for partition in possible_partitions:
                     partition_state = os.popen(
                         f"""
@@ -343,20 +344,31 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         """
                     ).read().strip()
                     if partition_state == 'UP':
-                        return possible_partitions
+                        usable_partitions.append(partition)
                     logger.info(
                         "Skipping partition: %s, due to state being %s",
                         partition,
                         partition_state
                     )
-            logger.info(
-                "Could not find a partition to suffice cpus: %s, memory: %s and preferred type: %s",
-                cpus,
-                mem,
-                preferred
-            )
-            logger.info("Trying with preferred type: %s", not preferred)
-            return self.select_partition(cpus, mem, not preferred)
+                logger.info("Usable Partitions: %s", usable_partitions)
+                return usable_partitions[0]
+            
+            if 'preference' in self.batchSystemResources.columns:
+                logger.warning(
+                    "Could not find a partition to suffice cpus: %s, memory: %s and preferred type: %s",
+                    cpus,
+                    mem,
+                    preferred
+                )
+                logger.info("Trying with preferred type: %s", not preferred)
+                return self.select_partition(cpus, mem, not preferred)
+            else:
+                logger.error(
+                    "Could not find a partition to suffice cpus: %s, memory: %s",
+                    cpus,
+                    mem
+                )
+                return
 
         def prepareSbatch(self,
                           cpu: int,
