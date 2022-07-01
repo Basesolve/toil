@@ -16,9 +16,11 @@ import math
 import os
 from argparse import ArgumentParser, _ArgumentGroup
 from pipes import quote
+import time
 from typing import Callable, Dict, List, Optional, TypeVar, Union
 import configparser
 import pandas as pd
+from toil import job
 from toil.batchSystems.abstractGridEngineBatchSystem import (
     AbstractGridEngineBatchSystem,
 )
@@ -133,6 +135,28 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 rc = None
             return rc
         
+        def get_last_partition_switch_details(self, comment):
+            '''Get last partition switch time if comment contains it and the switch was done before 2 min
+
+            :param comment: Job comment
+            :type comment: str
+
+            :return: Last partition switch time
+            :rtype: tuple
+            '''
+            last_switch_time, switch_count = (None, None)
+            if comment:
+                if comment.__contains__('ToilSlurmPartitionSwitch'):
+                    comment_list = comment.split('-')
+                    swith_count_index = comment_list.index('ToilSlurmPartitionSwitchCount') + 1
+                    switch_count = int(comment_list[swith_count_index])
+                    switch_time_index = comment_list.index('ToilSlurmPartitionSwitchedAt') + 1
+                    last_switch_time = int(comment_list[switch_time_index])
+                    updated_comment = f'ToilSlurmPartitionSwitchCount-{switch_count + 1} ToilSlurmPartitionSwitchedAt-{int(time.time())}'
+            else:
+                updated_comment = f'ToilSlurmPartitionSwitchCount-1 ToilSlurmPartitionSwitchedAt-{int(time.time())}'
+            return (last_switch_time, switch_count, updated_comment)
+
         def check_and_change_partition(self, job_id, partition, restart_threshold=1):
             '''Get the job restart count and switch partition.
             restart_threshold=-1 implies node count per partition.
@@ -142,14 +166,19 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param restart_threshold: number of restarts to wait for before updating partition, defaults to 4
             :type restart_threshold: int, optional
             '''
-            restart_count = int(os.popen(
+            job_details = os.popen(
                 f"""
                 scontrol -o show job {job_id} |
                 sed 's/ /\\n/g' |
-                grep Restarts |
+                egrep 'Comment|Restarts' |
                 cut -d "=" -f2
                 """
-            ).read().strip())
+            ).read().strip().splitlines()
+            # comment would not be available if not definied during submission
+            if len(job_details) == 2:
+                comment, restart_count = job_details
+            else:
+                comment, restart_count = None, job_details[0]
             alternate_partition = os.popen(
                 f"""
                 scontrol -o show partition {partition} |
@@ -158,24 +187,41 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 cut -d "=" -f2
                 """
             ).read().strip()
+            if alternate_partition:
+                partition_state = os.popen(
+                    f"""
+                    scontrol -o show partition {partition} |
+                    sed 's/ /\\n/g' |
+                    grep State |
+                    cut -d "=" -f2
+                    """
+                ).read().strip()
+                if partition_state != 'UP':
+                    logger.warning("Cannot switch partition: Configured alternate partition %s is %s", alternate_partition, partition_state)
+                    return
+            else:
+                logger.warning("Cannot switch partition: No alternate partition configured for %s", partition)
+                return
+            
             # set max_possible restart threshold
             # if restart_threshold == -1:
             #     restart_threshold = total_nodes
-            if restart_count > restart_threshold and alternate_partition:
-                logger.info(
-                    "Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
+            last_switch_time, switch_count, updated_comment = self.get_last_partition_switch_details(comment)
+            if last_switch_time:
+                logger.debug("Partition was already switched for the job, doubling the restart threshold")
+                restart_threshold *= switch_count + 1
+            if restart_count > restart_threshold:
+                # make sure comment is not none and contains the partition switch term
+                logger.info("Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
                     job_id, restart_threshold, alternate_partition
                 )
-                logger.info(f"Executing: scontrol update jobid={job_id} partition={alternate_partition}")
-                switch_exit_code = os.system(
-                    f"scontrol update jobid={job_id} partition={alternate_partition}"
-                )
+                switch_command = f"scontrol update jobid={job_id} partition={alternate_partition} comment={updated_comment}"
+                logger.info(f"Executing: {switch_command}")
+                switch_exit_code = os.system(switch_command)
                 if switch_exit_code == 0:
                     logger.info(f"Job: %s has been swithced to alternate partition: %s", job_id, alternate_partition)
                 else:
                     logger.warning(f"Job: %s could not be swithced to alternate partition: %s, Error Code: %s", job_id, alternate_partition, switch_exit_code)
-            else:
-                logger.info("Cannot switch partition: slurm job restart threshold exceeded but no alternate partition configured for %s", partition)
 
         def _getJobDetailsFromSacct(self, job_id_list: list) -> dict:
             """
@@ -188,7 +234,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             args = ['sacct',
                     '-n',  # no header
                     '-j', job_ids,  # job
-                    '--format', 'JobIDRaw,State,ExitCode,Partition',  # specify output columns
+                    '--format', 'JobIDRaw,State,ExitCode,Partition,Reason',  # specify output columns
                     '-P',  # separate columns with pipes
                     '-S', '1970-01-01']  # override start time limit
             stdout = call_command(args)
@@ -204,7 +250,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 values = line.strip().split('|')
                 if len(values) < 3:
                     continue
-                job_id_raw, state, exitcode, partition = values
+                job_id_raw, state, exitcode, partition, reason = values
                 logger.debug("%s state of job %s is %s", args[0], job_id_raw, state)
                 # JobIDRaw is in the form JobID[.JobStep]; we're not interested in job steps.
                 job_id_parts = job_id_raw.split(".")
@@ -212,7 +258,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     continue
                 job_id = int(job_id_parts[0])
                 status, signal = [int(n) for n in exitcode.split(':')]
-                if state == 'PENDING':
+                if state == 'PENDING' and reason == "BeginTime":
                     logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
                     self.check_and_change_partition(job_id=job_id, partition=partition)
                 if signal > 0:
