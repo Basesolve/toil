@@ -240,7 +240,11 @@ class FileJobStore(AbstractJobStore):
         with open(self._get_job_file_name(job.jobStoreID) + ".new", 'xb') as f:
             pickle.dump(job, f)
         # This should be atomic for the file system
-        os.rename(self._get_job_file_name(job.jobStoreID) + ".new", self._get_job_file_name(job.jobStoreID))
+        if os.path.exists(self._get_job_file_name(job.jobStoreID) + ".new"):
+            os.rename(self._get_job_file_name(job.jobStoreID) + ".new", self._get_job_file_name(job.jobStoreID))
+        else:
+            logger.info(f"[MOD] {self._get_job_file_name(job.jobStoreID)}.new is missing. trying recreate now.")
+            self.update_job(job)
 
     def delete_job(self, job_id):
         # The jobStoreID is the relative path to the directory containing the job,

@@ -55,7 +55,7 @@ from toil.statsAndLogging import set_logging_from_options
 
 if TYPE_CHECKING:
     from toil.fileStores.abstractFileStore import AbstractFileStore
-    from toil.jobStores.abstractJobStore import AbstractJobStore
+    from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchFileException
 
 logger = logging.getLogger(__name__)
 
@@ -1507,6 +1507,12 @@ class Job:
             promise = UnfulfilledPromiseSentinel(str(self.description), jobStoreFileID, False)
             logger.debug('Issuing promise %s for result of %s', jobStoreFileID, self.description)
             pickle.dump(promise, fileHandle, pickle.HIGHEST_PROTOCOL)
+        try:
+            self._promiseJobStore._check_job_store_file_id(jobStoreFileID)
+            logger.info("[MOD] Dumped promise to pickle for %s to %s", self.description, jobStoreFileID)
+        except NoSuchFileException as nfe:
+            logger.info("Dumped stream file seems missing. retrying promise dump %s", nfe)
+            self.registerPromise(path)
         self._rvs[path].append(jobStoreFileID)
         return self._promiseJobStore.config.jobStore, jobStoreFileID
 
@@ -2115,6 +2121,13 @@ class Job:
                 # Save the body of the job
                 with jobStore.write_file_stream(description.jobStoreID, cleanup=True) as (fileHandle, fileStoreID):
                     pickle.dump(self, fileHandle, pickle.HIGHEST_PROTOCOL)
+                    logger.info("Dumping Job Body to pickle for %s to %s", description.jobStoreID, fileStoreID)
+                try:
+                    jobStore._check_job_store_file_id(fileStoreID)
+                    logger.info("[MOD] Dumped Job Body to pickle for %s to %s", description.jobStoreID, fileStoreID)
+                except NoSuchFileException as nfe:
+                    logger.info("Dumped stream file seems missing. retrying dump %s", nfe)
+                    self.saveBody(jobStore)
             finally:
                 # Restore important fields (before handling errors)
                 self._directPredecessors = directPredecessors
