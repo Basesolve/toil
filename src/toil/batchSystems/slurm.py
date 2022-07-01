@@ -211,7 +211,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     continue
                 job_id = int(job_id_parts[0])
                 status, signal = [int(n) for n in exitcode.split(':')]
-                if status == 'PENDING':
+                if state == 'PENDING':
                     logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
                     self.check_and_change_partition(job_id=job_id, partition=partition)
                 if signal > 0:
@@ -283,7 +283,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     continue
                 state = job['JobState']
                 partition = job['Partition']
-                if status == 'PENDING':
+                if state == 'PENDING':
                     logger.info("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
                     self.check_and_change_partition(job_id=job_id, partition=partition)
                 logger.debug("%s state of job %s is %s", args[0], job_id, state)
@@ -345,6 +345,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     ).read().strip()
                     if partition_state == 'UP':
                         usable_partitions.append(partition)
+                    else:
                         logger.info(
                             "Skipping partition: %s, due to state being %s",
                             partition,
