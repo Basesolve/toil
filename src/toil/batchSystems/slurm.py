@@ -142,33 +142,37 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param restart_threshold: number of restarts to wait for before updating partition, defaults to 4
             :type restart_threshold: int, optional
             '''
-            restart_count = call_command(
+            restart_count = os.popen(
                 f"""
                 scontrol -o show job {job_id} |
                 sed 's/ /\\n/g' |
                 grep Restarts |
                 cut -d "=" -f2
                 """
-            )
-            total_nodes, alternate_partition = call_command(
+            ).read().strip()
+            alternate_partition = os.popen(
                 f"""
                 scontrol -o show partition {partition} |
                 sed 's/ /\\n/g' |
                 egrep 'TotalNodes|Alternate' |
                 cut -d "=" -f2
                 """
-            ).split('\n')
+            ).read().strip()
             # set max_possible restart threshold
-            if restart_threshold == -1:
-                restart_threshold = total_nodes
+            # if restart_threshold == -1:
+            #     restart_threshold = total_nodes
             if restart_count > restart_threshold and alternate_partition:
                 logger.info(
                     "Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
                     job_id, restart_threshold, alternate_partition
                 )
-                call_command(
+                switch_exit_code = os.system(
                     f"""scontrol update jobid={job_id} partition={alternate_partition}"""
                 )
+                if switch_exit_code == 0:
+                    logger.info(f"Job: %s has been swithced to alternate partition: %s", job_id, alternate_partition)
+                else:
+                    logger.warning(f"Job: %s could not be swithced to alternate partition: %s", job_id, alternate_partition)
             else:
                 logger.info("Cannot switch partition: slurm job restart threshold exceeded but no alternate partition configured for %s", partition)
 
@@ -330,14 +334,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if len(possible_partitions) != 0:
                 logger.info("Partitions: %s", possible_partitions)
                 for partition in possible_partitions:
-                    partition_state = call_command(
+                    partition_state = os.popen(
                         f"""
                         scontrol -o show partition {partition} |
                         sed 's/ /\\n/g' |
                         grep State |
                         cut -d "=" -f2
                         """
-                    )
+                    ).read().strip()
                     if partition_state == 'UP':
                         return possible_partitions
                     logger.info(
