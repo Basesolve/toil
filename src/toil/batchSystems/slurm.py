@@ -133,7 +133,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 rc = None
             return rc
         
-        def check_and_change_partition(self, job_id, partition, restart_threshold=5):
+        def check_and_change_partition(self, job_id, partition, restart_threshold=1):
             '''Get the job restart count and switch partition.
             restart_threshold=-1 implies node count per partition.
 
@@ -142,14 +142,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param restart_threshold: number of restarts to wait for before updating partition, defaults to 4
             :type restart_threshold: int, optional
             '''
-            restart_count = os.popen(
+            restart_count = int(os.popen(
                 f"""
                 scontrol -o show job {job_id} |
                 sed 's/ /\\n/g' |
                 grep Restarts |
                 cut -d "=" -f2
                 """
-            ).read().strip()
+            ).read().strip())
             alternate_partition = os.popen(
                 f"""
                 scontrol -o show partition {partition} |
@@ -212,7 +212,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 job_id = int(job_id_parts[0])
                 status, signal = [int(n) for n in exitcode.split(':')]
                 if status == 'PENDING':
-                    logger.info("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
+                    logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
                     self.check_and_change_partition(job_id=job_id, partition=partition)
                 if signal > 0:
                     # A non-zero signal may indicate e.g. an out-of-memory killed job
@@ -345,11 +345,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     ).read().strip()
                     if partition_state == 'UP':
                         usable_partitions.append(partition)
-                    logger.info(
-                        "Skipping partition: %s, due to state being %s",
-                        partition,
-                        partition_state
-                    )
+                        logger.info(
+                            "Skipping partition: %s, due to state being %s",
+                            partition,
+                            partition_state
+                        )
                 logger.info("Usable Partitions: %s", usable_partitions)
                 return usable_partitions[0]
             
