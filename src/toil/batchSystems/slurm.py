@@ -316,11 +316,17 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :return: suitable partition for the requirements
             :rtype: str
             '''
-            possible_partitions = self.batchSystemResources.partitions[
-                (self.batchSystemResources['cputot'] >= cpus) &
-                (self.batchSystemResources['realmemory'] >= mem) &
-                (self.batchSystemResources['preference'] == preferred)
-            ].values
+            if 'preference' in self.batchSystemResources.columns:
+                possible_partitions = self.batchSystemResources.partitions[
+                    (self.batchSystemResources['cputot'] >= cpus) &
+                    (self.batchSystemResources['realmemory'] >= mem) &
+                    (self.batchSystemResources['preference'] == preferred)
+                ].values
+            else:
+                possible_partitions = self.batchSystemResources.partitions[
+                    (self.batchSystemResources['cputot'] >= cpus) &
+                    (self.batchSystemResources['realmemory'] >= mem)
+                ].values
             if len(possible_partitions) != 0:
                 logger.info("Partitions: %s", possible_partitions)
                 for partition in possible_partitions:
@@ -480,7 +486,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 "Setting slurm partition preference: %s",
                 preference
             )
-            slurm_resources['preference'] = slurm_resources.partitions.str.lower.contains(preference.lower())
+            slurm_resources['preference'] = slurm_resources.partitions.str.contains(preference, case=False)
+        else:
+            logger.info(
+                "No slurm partition preference set"
+            )
         slurm_resources[['cputot', 'realmemory']] = slurm_resources[
             ['cputot', 'realmemory']
         ].astype(int)

@@ -2121,10 +2121,9 @@ class Job:
                 # Save the body of the job
                 with jobStore.write_file_stream(description.jobStoreID, cleanup=True) as (fileHandle, fileStoreID):
                     pickle.dump(self, fileHandle, pickle.HIGHEST_PROTOCOL)
-                    logger.info("Dumping Job Body to pickle for %s to %s", description.jobStoreID, fileStoreID)
                 try:
                     jobStore._check_job_store_file_id(fileStoreID)
-                    logger.info("[MOD] Dumped Job Body to pickle for %s to %s", description.jobStoreID, fileStoreID)
+                    logger.info("[MOD] Dumped job body to pickle for %s to %s", description.jobStoreID, fileStoreID)
                 except NoSuchFileException as nfe:
                     logger.info("Dumped stream file seems missing. retrying dump %s", nfe)
                     self.saveBody(jobStore)
