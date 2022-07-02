@@ -234,7 +234,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             args = ['sacct',
                     '-n',  # no header
                     '-j', job_ids,  # job
-                    '--format', 'JobIDRaw,State,ExitCode,Partition,Reason',  # specify output columns
+                    '--format', 'JobIDRaw,State,ExitCode,Partition',  # specify output columns
                     '-P',  # separate columns with pipes
                     '-S', '1970-01-01']  # override start time limit
             stdout = call_command(args)
@@ -250,7 +250,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 values = line.strip().split('|')
                 if len(values) < 3:
                     continue
-                job_id_raw, state, exitcode, partition, reason = values
+                job_id_raw, state, exitcode, partition = values
                 logger.debug("%s state of job %s is %s", args[0], job_id_raw, state)
                 # JobIDRaw is in the form JobID[.JobStep]; we're not interested in job steps.
                 job_id_parts = job_id_raw.split(".")
@@ -258,9 +258,19 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     continue
                 job_id = int(job_id_parts[0])
                 status, signal = [int(n) for n in exitcode.split(':')]
-                if state == 'PENDING' and reason == "BeginTime":
-                    logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
-                    self.check_and_change_partition(job_id=job_id, partition=partition)
+                if state == 'PENDING':
+                    # sacct does not report the job pending reason in realtime. but scontrol does.
+                    reason = os.popen(
+                        f"""
+                        scontrol -o show job {job_id} |
+                        sed 's/ /\\n/g' |
+                        egrep 'Reason' |
+                        cut -d "=" -f2
+                        """
+                    ).read().strip()
+                    if reason == "BeginTime":
+                        logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
+                        self.check_and_change_partition(job_id=job_id, partition=partition)
                 if signal > 0:
                     # A non-zero signal may indicate e.g. an out-of-memory killed job
                     status = 128 + signal
@@ -331,8 +341,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 state = job['JobState']
                 partition = job['Partition']
                 if state == 'PENDING':
-                    logger.info("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
-                    self.check_and_change_partition(job_id=job_id, partition=partition)
+                    reason = job['Reason']
+                    if reason == 'BeginTime':
+                        logger.info("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
+                        self.check_and_change_partition(job_id=job_id, partition=partition)
                 logger.debug("%s state of job %s is %s", args[0], job_id, state)
                 try:
                     exitcode = job['ExitCode']
