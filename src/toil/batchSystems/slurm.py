@@ -144,20 +144,26 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :return: Last partition switch time
             :rtype: tuple
             '''
+            # A job might contain user comments at times.
+            # We would like to store swtich count and time.
+            # Format: <user_comments>;ToilSlurmPartitionSwtich:<switch_count>+<swtich_time>
             last_switch_time, switch_count = (None, None)
             if comment:
                 if comment.__contains__('ToilSlurmPartitionSwitch'):
-                    comment_list = comment.split('-')
-                    swith_count_index = comment_list.index('ToilSlurmPartitionSwitchCount') + 1
-                    switch_count = int(comment_list[swith_count_index])
-                    switch_time_index = comment_list.index('ToilSlurmPartitionSwitchedAt') + 1
-                    last_switch_time = int(comment_list[switch_time_index])
-                    updated_comment = f'ToilSlurmPartitionSwitchCount-{switch_count + 1} ToilSlurmPartitionSwitchedAt-{int(time.time())}'
+                    comment_list = comment.split(';')
+                    swith_detail_index = comment_list.index('ToilSlurmPartitionSwitchCount')
+                    switch_details = comment_list[swith_detail_index].split(":")[1].split['+']
+                    switch_count = int(switch_details[0])
+                    last_switch_time = int(switch_details[1])
+                    updated_comment = f'ToilSlurmPartitionSwitch:{switch_count + 1}+{int(time.time())}'
+                else:
+                    updated_comment = f'{comment};ToilSlurmPartitionSwitch:1+{int(time.time())}'
             else:
-                updated_comment = f'ToilSlurmPartitionSwitchCount-1 ToilSlurmPartitionSwitchedAt-{int(time.time())}'
+                updated_comment = f'ToilSlurmPartitionSwitch:1+{int(time.time())}'
+            logger.debug("Updated Comment: %s", updated_comment)
             return (last_switch_time, switch_count, updated_comment)
 
-        def check_and_change_partition(self, job_id, partition, restart_threshold=1):
+        def check_and_change_partition(self, job_details, restart_threshold=1):
             '''Get the job restart count and switch partition.
             restart_threshold=-1 implies node count per partition.
 
@@ -166,23 +172,16 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param restart_threshold: number of restarts to wait for before updating partition, defaults to 4
             :type restart_threshold: int, optional
             '''
-            job_details = os.popen(
-                f"""
-                scontrol -o show job {job_id} |
-                sed 's/ /\\n/g' |
-                egrep 'Comment|Restarts' |
-                cut -d "=" -f2
-                """
-            ).read().strip().splitlines()
+            # logger.debug("Slurm job details: %s", job_details)
             # comment would not be available if not definied during submission
-            if len(job_details) == 2:
-                comment, restart_count = job_details
-            else:
-                comment, restart_count = None, job_details[0]
+            job_id = job_details.get('JobId')
+            comment = job_details.get('Comment')
+            restart_count = int(job_details.get('Restarts'))
+            partition = job_details.get('Partition')
             alternate_partition = os.popen(
                 f"""
                 scontrol -o show partition {partition} |
-                sed 's/ /\n/g' |
+                sed 's/ /\\n/g' |
                 grep 'Alternate' |
                 cut -d "=" -f2
                 """
@@ -210,7 +209,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if last_switch_time:
                 logger.debug("Partition was already switched for the job, doubling the restart threshold")
                 restart_threshold *= switch_count + 1
-            if restart_count > restart_threshold:
+            if int(restart_count) >= restart_threshold:
                 # make sure comment is not none and contains the partition switch term
                 logger.info("Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
                     job_id, restart_threshold, alternate_partition
@@ -234,7 +233,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             args = ['sacct',
                     '-n',  # no header
                     '-j', job_ids,  # job
-                    '--format', 'JobIDRaw,State,ExitCode,Partition',  # specify output columns
+                    '--format', 'JobIDRaw,State,ExitCode',  # specify output columns
                     '-P',  # separate columns with pipes
                     '-S', '1970-01-01']  # override start time limit
             stdout = call_command(args)
@@ -250,7 +249,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 values = line.strip().split('|')
                 if len(values) < 3:
                     continue
-                job_id_raw, state, exitcode, partition = values
+                job_id_raw, state, exitcode = values
                 logger.debug("%s state of job %s is %s", args[0], job_id_raw, state)
                 # JobIDRaw is in the form JobID[.JobStep]; we're not interested in job steps.
                 job_id_parts = job_id_raw.split(".")
@@ -260,17 +259,21 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 status, signal = [int(n) for n in exitcode.split(':')]
                 if state == 'PENDING':
                     # sacct does not report the job pending reason in realtime. but scontrol does.
-                    reason = os.popen(
+                    job_details = os.popen(
                         f"""
                         scontrol -o show job {job_id} |
-                        sed 's/ /\\n/g' |
-                        egrep 'Reason' |
-                        cut -d "=" -f2
+                        sed 's/ /\\n/g'
                         """
-                    ).read().strip()
+                    ).read().strip().splitlines()
+                    # 'Reason|Comment|Restarts|Partition'
+                    jdict = {}
+                    for jdet in job_details:
+                        key, value = jdet.split(sep='=', maxsplit=1)
+                        jdict[key] = value
+                    reason = jdict.get('Reason')
                     if reason == "BeginTime":
-                        logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
-                        self.check_and_change_partition(job_id=job_id, partition=partition)
+                        logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, state)
+                        self.check_and_change_partition(job_details=jdict)
                 if signal > 0:
                     # A non-zero signal may indicate e.g. an out-of-memory killed job
                     status = 128 + signal
