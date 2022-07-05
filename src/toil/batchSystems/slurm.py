@@ -275,7 +275,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     reason = jdict.get('Reason')
                     if reason == "BeginTime":
                         logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, state)
-                        self.check_and_change_partition(job_details=jdict)
+                        user_slurm_restart_thresh = int(os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5))
+                        logger.debug("User override value for slurm job restart: %i", user_slurm_restart_thresh)
+                        self.check_and_change_partition(job_details=jdict, restart_threshold=user_slurm_restart_thresh)
                 if signal > 0:
                     # A non-zero signal may indicate e.g. an out-of-memory killed job
                     status = 128 + signal
@@ -344,12 +346,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if job_id not in job_id_list:
                     continue
                 state = job['JobState']
-                partition = job['Partition']
                 if state == 'PENDING':
                     reason = job['Reason']
                     if reason == 'BeginTime':
-                        logger.info("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, status)
-                        self.check_and_change_partition(job_id=job_id, partition=partition)
+                        logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, state)
+                        user_slurm_restart_thresh = int(os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5))
+                        logger.debug("User override value for slurm job restart: %i", user_slurm_restart_thresh)
+                        self.check_and_change_partition(job_details=job, restart_threshold=user_slurm_restart_thresh)
                 logger.debug("%s state of job %s is %s", args[0], job_id, state)
                 try:
                     exitcode = job['ExitCode']
