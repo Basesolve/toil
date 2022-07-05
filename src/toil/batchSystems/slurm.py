@@ -150,9 +150,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             last_switch_time, switch_count = (None, None)
             if comment:
                 if comment.__contains__('ToilSlurmPartitionSwitch'):
-                    comment_list = comment.split(';')
-                    swith_detail_index = comment_list.index('ToilSlurmPartitionSwitchCount')
-                    switch_details = comment_list[swith_detail_index].split(":")[1].split['+']
+                    switch_details = next(filter(lambda x: x.startswith('Toil'), comment.split(';'))).split(':')[1].split('+')
                     switch_count = int(switch_details[0])
                     last_switch_time = int(switch_details[1])
                     updated_comment = f'ToilSlurmPartitionSwitch:{switch_count + 1}+{int(time.time())}'
@@ -267,9 +265,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     ).read().strip().splitlines()
                     # 'Reason|Comment|Restarts|Partition'
                     jdict = {}
-                    for jdet in job_details:
-                        key, value = jdet.split(sep='=', maxsplit=1)
-                        jdict[key] = value
+                    for item in job_details:
+                        bits = item.split('=', 1)
+                        if len(bits) == 1:
+                            jdict[key] += ' ' + bits[0]
+                        else:
+                            key = bits[0]
+                            jdict[key] = bits[1]
                     reason = jdict.get('Reason')
                     if reason == "BeginTime":
                         logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, state)
