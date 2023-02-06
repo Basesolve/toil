@@ -21,21 +21,17 @@ from inspect import getsource
 from textwrap import dedent
 from uuid import uuid4
 
-import boto.ec2
 import pytest
 
-from toil.lib.aws import zone_to_region
 from toil.provisioners import cluster_factory
-from toil.provisioners.aws import get_best_aws_zone
 from toil.provisioners.aws.awsProvisioner import AWSProvisioner
-from toil.test import (
-    ToilTest,
-    integrative,
-    needs_aws_ec2,
-    needs_fetchable_appliance,
-    slow,
-    timeLimit,
-)
+from toil.test import (ToilTest,
+                       integrative,
+                       needs_aws_ec2,
+                       needs_fetchable_appliance,
+                       slow,
+                       timeLimit)
+from toil.test.provisioners.clusterTest import AbstractClusterTest
 from toil.version import exactPython
 
 log = logging.getLogger(__name__)
@@ -79,19 +75,14 @@ class AWSProvisionerBenchTest(ToilTest):
 @needs_fetchable_appliance
 @slow
 @integrative
-class AbstractAWSAutoscaleTest(ToilTest):
+class AbstractAWSAutoscaleTest(AbstractClusterTest):
     def __init__(self, methodName):
         super().__init__(methodName=methodName)
-        self.keyName = os.environ.get('TOIL_AWS_KEYNAME', 'id_rsa')
         self.instanceTypes = ["m5a.large"]
         self.clusterName = 'aws-provisioner-test-' + str(uuid4())
         self.numWorkers = ['2']
         self.numSamples = 2
         self.spotBid = 0.15
-        self.zone = get_best_aws_zone()
-        assert self.zone is not None, "Could not determine AWS availability zone to test in; is TOIL_AWS_ZONE set?"
-        # We need a boto2 connection to EC2 to check on the cluster
-        self.boto2_ec2 = boto.ec2.connect_to_region(zone_to_region(self.zone))
         # We can't dump our user script right in /tmp or /home, because hot
         # deploy refuses to zip up those whole directories. So we make sure to
         # have a subdirectory to upload the script to.
@@ -106,18 +97,6 @@ class AbstractAWSAutoscaleTest(ToilTest):
         # Can be changed by derived tests.
         self.scriptName = 'test_script.py'
 
-    def python(self):
-        """
-        Return the full path to the venv Python on the leader.
-        """
-        return os.path.join(self.venvDir, 'bin/python')
-
-    def pip(self):
-        """
-        Return the full path to the venv pip on the leader.
-        """
-        return os.path.join(self.venvDir, 'bin/pip')
-
     def script(self):
         """
         Return the full path to the user script on the leader.
@@ -130,114 +109,11 @@ class AbstractAWSAutoscaleTest(ToilTest):
         """
         return os.path.join(self.dataDir, filename)
 
-    def destroyCluster(self) -> None:
-        """
-        Destroy the cluster we built, if it exists.
-
-        Succeeds if the cluster does not currently exist.
-        """
-        subprocess.check_call(['toil', 'destroy-cluster', '-p=aws', '-z', self.zone, self.clusterName])
-
-    def setUp(self):
-        """
-        Set up for the test.
-        Must be overridden to call this method and set self.jobStore.
-        """
-        super().setUp()
-        # Make sure that destroy works before we create any clusters.
-        # If this fails, no tests will run.
-        self.destroyCluster()
-
-    def tearDown(self):
-        # Note that teardown will run even if the test crashes.
-        super().tearDown()
-        self.destroyCluster()
-        subprocess.check_call(['toil', 'clean', self.jobStore])
-
-    def sshUtil(self, command):
-        """
-        Run the given command on the cluster.
-        Raise subprocess.CalledProcessError if it fails.
-        """
-
-        cmd = ['toil', 'ssh-cluster', '--insecure', '-p=aws', '-z', self.zone, self.clusterName] + command
-        log.info("Running %s.", str(cmd))
-        p = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        # Put in non-blocking mode. See https://stackoverflow.com/a/59291466
-        os.set_blocking(p.stdout.fileno(), False)
-        os.set_blocking(p.stderr.fileno(), False)
-
-        out_buffer = b''
-        err_buffer = b''
-
-        loops_since_line = 0
-
-        running = True
-        while running:
-            # While the process is running, see if it stopped
-            running = (p.poll() is None)
-
-            # Also collect its output
-            out_data = p.stdout.read()
-            if out_data:
-                out_buffer += out_data
-
-            while out_buffer.find(b'\n') != -1:
-                # And log every full line
-                cut = out_buffer.find(b'\n')
-                log.info('STDOUT: %s', out_buffer[0:cut].decode('utf-8', errors='ignore'))
-                loops_since_line = 0
-                out_buffer = out_buffer[cut+1:]
-
-            # Same for the error
-            err_data = p.stderr.read()
-            if err_data:
-                err_buffer += err_data
-
-            while err_buffer.find(b'\n') != -1:
-                cut = err_buffer.find(b'\n')
-                log.info('STDERR: %s', err_buffer[0:cut].decode('utf-8', errors='ignore'))
-                loops_since_line = 0
-                err_buffer = err_buffer[cut+1:]
-
-            loops_since_line += 1
-            if loops_since_line > 60:
-                log.debug('...waiting...')
-                loops_since_line = 0
-
-            time.sleep(1)
-
-        # At the end, log the last lines
-        if out_buffer:
-            log.info('STDOUT: %s', out_buffer.decode('utf-8', errors='ignore'))
-        if err_buffer:
-            log.info('STDERR: %s', err_buffer.decode('utf-8', errors='ignore'))
-
-        if p.returncode != 0:
-            # It failed
-            log.error("Failed to run %s.", str(cmd))
-            raise subprocess.CalledProcessError(p.returncode, ' '.join(cmd))
-
     def rsyncUtil(self, src, dest):
         subprocess.check_call(['toil', 'rsync-cluster', '--insecure', '-p=aws', '-z', self.zone, self.clusterName] + [src, dest])
 
-    def createClusterUtil(self, args=None):
-        args = [] if args is None else args
-
-        command = ['toil', 'launch-cluster', '-p=aws', '-z', self.zone, f'--keyPairName={self.keyName}',
-                   '--leaderNodeType=t2.medium', '--logDebug', self.clusterName] + args
-
-        log.debug('Launching cluster: %s', command)
-
-        # Try creating the cluster
-        subprocess.check_call(command)
-        # If we fail, tearDown will destroy the cluster.
-
-    def launchCluster(self):
-        self.createClusterUtil()
-
     def getRootVolID(self):
-        instances = self.cluster._getNodesInCluster(both=True)
+        instances = self.cluster._get_nodes_in_cluster()
         instances.sort(key=lambda x: x.launch_time)
         leader = instances[0]  # assume leader was launched first
 
@@ -279,7 +155,7 @@ class AbstractAWSAutoscaleTest(ToilTest):
         """
         raise NotImplementedError()
 
-    def _test(self, preemptableJobs=False):
+    def _test(self, preemptibleJobs=False):
         """Does the work of the testing.  Many features' tests are thrown in here in no particular order."""
         # Make a cluster
         self.launchCluster()
@@ -309,8 +185,8 @@ class AbstractAWSAutoscaleTest(ToilTest):
                        '--logFile=' + os.path.join(self.scriptDir, 'sort.log')
                        ]
 
-        if preemptableJobs:
-            toilOptions.extend(['--defaultPreemptable'])
+        if preemptibleJobs:
+            toilOptions.extend(['--defaultPreemptible'])
 
         log.info('Run script...')
         self._runScript(toilOptions)
@@ -395,18 +271,18 @@ class AWSAutoscaleTest(AbstractAWSAutoscaleTest):
     def testSpotAutoScale(self):
         self.instanceTypes = ["m5a.large:%f" % self.spotBid]
         self.numWorkers = ['2']
-        self._test(preemptableJobs=True)
+        self._test(preemptibleJobs=True)
 
     @integrative
     @needs_aws_ec2
     def testSpotAutoScaleBalancingTypes(self):
         self.instanceTypes = ["m5.large/m5a.large:%f" % self.spotBid]
         self.numWorkers = ['2']
-        self._test(preemptableJobs=True)
+        self._test(preemptibleJobs=True)
 
 
 @integrative
-@pytest.mark.timeout(1200)
+@pytest.mark.timeout(2400)
 class AWSStaticAutoscaleTest(AWSAutoscaleTest):
     """Runs the tests on a statically provisioned cluster with autoscaling enabled."""
     def __init__(self, name):
@@ -427,7 +303,7 @@ class AWSStaticAutoscaleTest(AWSAutoscaleTest):
         # visible to EC2 read requests immediately after the create returns,
         # which is the last thing that starting the cluster does.
         time.sleep(10)
-        nodes = self.cluster._getNodesInCluster(both=True)
+        nodes = self.cluster._get_nodes_in_cluster()
         nodes.sort(key=lambda x: x.launch_time)
         # assuming that leader is first
         workers = nodes[1:]
@@ -583,7 +459,7 @@ class AWSRestartTest(AbstractAWSAutoscaleTest):
 
 @integrative
 @pytest.mark.timeout(1200)
-class PreemptableDeficitCompensationTest(AbstractAWSAutoscaleTest):
+class PreemptibleDeficitCompensationTest(AbstractAWSAutoscaleTest):
     def __init__(self, name):
         super().__init__(name)
         self.clusterName = 'deficit-test-' + str(uuid4())
@@ -596,21 +472,21 @@ class PreemptableDeficitCompensationTest(AbstractAWSAutoscaleTest):
         self.jobStore = f'aws:{self.awsRegion()}:deficit-{uuid4()}'
 
     def test(self):
-        self._test(preemptableJobs=True)
+        self._test(preemptibleJobs=True)
 
     def _getScript(self):
         def userScript():
             from toil.common import Toil
             from toil.job import Job
 
-            # Because this is the only job in the pipeline and because it is preemptable,
-            # there will be no non-preemptable jobs. The non-preemptable scaler will therefore
+            # Because this is the only job in the pipeline and because it is preemptible,
+            # there will be no non-preemptible jobs. The non-preemptible scaler will therefore
             # not request any nodes initially. And since we made it impossible for the
-            # preemptable scaler to allocate any nodes (using an abnormally low spot bid),
-            # we will observe a deficit of preemptable nodes that the non-preemptable scaler will
-            # compensate for by spinning up non-preemptable nodes instead.
+            # preemptible scaler to allocate any nodes (using an abnormally low spot bid),
+            # we will observe a deficit of preemptible nodes that the non-preemptible scaler will
+            # compensate for by spinning up non-preemptible nodes instead.
             #
-            def job(job, disk='10M', cores=1, memory='10M', preemptable=True):
+            def job(job, disk='10M', cores=1, memory='10M', preemptible=True):
                 pass
 
             if __name__ == '__main__':
@@ -628,7 +504,7 @@ class PreemptableDeficitCompensationTest(AbstractAWSAutoscaleTest):
         toilOptions.extend(['--provisioner=aws', '--batchSystem=mesos',
                             '--nodeTypes=' + ",".join(self.instanceTypes),
                             '--maxNodes=' + ",".join(self.numWorkers)])
-        toilOptions.extend(['--preemptableCompensation=1.0'])
+        toilOptions.extend(['--preemptibleCompensation=1.0'])
         command = [self.python(), self.script()]
         command.extend(toilOptions)
         self.sshUtil(command)

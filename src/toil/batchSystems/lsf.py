@@ -31,15 +31,12 @@ from dateutil.parser import parse
 from dateutil.tz import tzlocal
 
 from toil.batchSystems.abstractBatchSystem import BatchJobExitReason
-from toil.batchSystems.abstractGridEngineBatchSystem import (
-    AbstractGridEngineBatchSystem,
-)
-from toil.batchSystems.lsfHelper import (
-    check_lsf_json_output_supported,
-    parse_mem_and_cmd_from_output,
-    parse_memory,
-    per_core_reservation,
-)
+from toil.batchSystems.abstractGridEngineBatchSystem import \
+    AbstractGridEngineBatchSystem
+from toil.batchSystems.lsfHelper import (check_lsf_json_output_supported,
+                                         parse_mem_and_cmd_from_output,
+                                         parse_memory,
+                                         per_core_reservation)
 from toil.lib.misc import call_command
 
 logger = logging.getLogger(__name__)
@@ -357,7 +354,7 @@ class LSFBatchSystem(AbstractGridEngineBatchSystem):
             :param jobID: ID number of the job
             """
             try:
-                output = subprocess.check_output(["bjobs", "-l", str(jobID)], universal_newlines=True)
+                output = subprocess.check_output(["bjobs", "-l", str(jobID)], text=True)
                 max_mem, command = parse_mem_and_cmd_from_output(output=output)
                 if not max_mem:
                     logger.warning(f"[job ID {jobID}] Unable to Collect Maximum Memory Usage: {output}")

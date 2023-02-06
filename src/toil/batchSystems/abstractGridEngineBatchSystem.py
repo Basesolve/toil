@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Union
 from toil.batchSystems.abstractBatchSystem import (BatchJobExitReason,
                                                    UpdatedBatchJobInfo)
 from toil.batchSystems.cleanup_support import BatchSystemCleanupSupport
+from toil.bus import ExternalBatchIdMessage
 from toil.lib.misc import CalledProcessErrorStderr
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, use_preferred_partition, comment)
                 logger.debug("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
+                if self.boss._outbox is not None:
+                    #JobID corresponds to the toil version of the jobID, dif from jobstore idea of the id, batchjobid is what we get from slurm
+                    self.boss._outbox.publish(ExternalBatchIdMessage(jobID, batchJobID, self.boss.__class__.__name__))
+
                 logger.debug("Submitted job %s", str(batchJobID))
 
                 # Store dict for mapping Toil job ID to batch job ID
@@ -377,7 +382,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
         if localID:
             return localID
         else:
-            self.checkResourceRequest(jobDesc.memory, jobDesc.cores, jobDesc.disk)
+            self.check_resource_request(jobDesc)
             jobID = self.getNextJobID()
             self.currentJobs.add(jobID)
             self.newJobsQueue.put((jobID, jobDesc.cores, jobDesc.memory, jobDesc.command, jobDesc.unitName,
@@ -401,6 +406,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             if killedJobId is None:
                 break
             jobIDs.remove(killedJobId)
+            if killedJobId in self._getRunningBatchJobIDsCache:
+                # Running batch id cache can sometimes contain a job we kill, so to ensure cache doesn't contain the job, we delete it here
+                del self._getRunningBatchJobIDsCache[killedJobId]
             if killedJobId in self.currentJobs:
                 self.currentJobs.remove(killedJobId)
             if jobIDs:

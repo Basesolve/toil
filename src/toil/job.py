@@ -17,36 +17,51 @@ import importlib
 import inspect
 import itertools
 import logging
+import math
 import os
 import pickle
+import sys
 import time
 import uuid
 from abc import ABCMeta, abstractmethod
 from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser, Namespace
 from contextlib import contextmanager
 from io import BytesIO
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    Iterator,
-    List,
-    Mapping,
-    Optional,
-    Set,
-    Tuple,
-    Union,
-    cast,
-)
+from typing import (TYPE_CHECKING,
+                    Any,
+                    Callable,
+                    Dict,
+                    Iterator,
+                    List,
+                    Mapping,
+                    Optional,
+                    Sequence,
+                    Set,
+                    Tuple,
+                    Union,
+                    cast,
+                    overload)
 
+from toil.lib.compatibility import deprecated
+
+if sys.version_info >= (3, 8):
+    from typing import TypedDict
+else:
+    from typing_extensions import TypedDict
 import dill
-from typing_extensions import Literal, overload
+# TODO: When this gets into the standard library, get it from there and drop
+# typing-extensions dependency on Pythons that are new enough.
+from typing_extensions import NotRequired
+
+if sys.version_info >= (3, 8):
+    from typing import Literal
+else:
+    from typing_extensions import Literal
 
 from toil.common import Config, Toil, addOptions, safeUnpickleFromStream
 from toil.deferred import DeferredFunction
 from toil.fileStores import FileID
-from toil.lib.conversions import human2bytes
+from toil.lib.conversions import bytes2human, human2bytes
 from toil.lib.expando import Expando
 from toil.lib.resources import (get_total_cpu_time,
                                 get_total_cpu_time_and_memory_usage)
@@ -54,6 +69,7 @@ from toil.resource import ModuleDescriptor
 from toil.statsAndLogging import set_logging_from_options
 
 if TYPE_CHECKING:
+    from toil.batchSystems.abstractBatchSystem import BatchJobExitReason
     from toil.fileStores.abstractFileStore import AbstractFileStore
     from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchFileException
 
@@ -132,6 +148,197 @@ class TemporaryID:
     def __ne__(self, other: Any) -> bool:
         return not isinstance(other, TemporaryID) or self._value != other._value
 
+class AcceleratorRequirement(TypedDict):
+    """
+    Represents a requirement for one or more computational accelerators, like a
+    GPU or FPGA.
+    """
+    count: int
+    """
+    How many of the accelerator are needed to run the job.
+    """
+    kind: str
+    """
+    What kind of accelerator is required. Can be "gpu". Other kinds defined in
+    the future might be "fpga", etc.
+    """
+    model: NotRequired[str]
+    """
+    What model of accelerator is needed. The exact set of values available
+    depends on what the backing scheduler calls its accelerators; strings like
+    "nvidia-tesla-k80" might be expected to work. If a specific model of
+    accelerator is not required, this should be absent.
+    """
+    brand: NotRequired[str]
+    """
+    What brand or manufacturer of accelerator is required. The exact set of
+    values available depends on what the backing scheduler calls the brands of
+    its accleerators; strings like "nvidia" or "amd" might be expected to work.
+    If a specific brand of accelerator is not required (for example, because
+    the job can use multiple brands of accelerator that support a given API)
+    this should be absent.
+    """
+    api: NotRequired[str]
+    """
+    What API is to be used to communicate with the accelerator. This can be
+    "cuda". Other APIs supported in the future might be "rocm", "opencl",
+    "metal", etc. If the job does not need a particular API to talk to the
+    accelerator, this should be absent.
+    """
+
+    # TODO: support requesting any GPU with X amount of vram
+
+    @staticmethod
+    def parse(spec: Union[int, str, Dict[str, Union[str, int]]]) -> 'AcceleratorRequirement':
+        """
+        Parse an AcceleratorRequirement specified by user code. Supports formats like:
+
+        >>> AcceleratorRequirement.parse(8)
+        {'count': 8, 'kind': 'gpu'}
+
+        >>> AcceleratorRequirement.parse("1")
+        {'count': 1, 'kind': 'gpu'}
+
+        >>> AcceleratorRequirement.parse("nvidia-tesla-k80")
+        {'count': 1, 'kind': 'gpu', 'brand': 'nvidia', 'model': 'nvidia-tesla-k80'}
+
+        >>> AcceleratorRequirement.parse("nvidia-tesla-k80:2")
+        {'count': 2, 'kind': 'gpu', 'brand': 'nvidia', 'model': 'nvidia-tesla-k80'}
+
+        >>> AcceleratorRequirement.parse("gpu")
+        {'count': 1, 'kind': 'gpu'}
+
+        >>> AcceleratorRequirement.parse("cuda:1")
+        {'count': 1, 'kind': 'gpu', 'brand': 'nvidia', 'api': 'cuda'}
+
+        >>> AcceleratorRequirement.parse({"kind": "gpu"})
+        {'count': 1, 'kind': 'gpu'}
+
+        >>> AcceleratorRequirement.parse({"brand": "nvidia", "count": 5})
+        {'count': 5, 'kind': 'gpu', 'brand': 'nvidia'}
+
+        Assumes that if not specified, we are talking about GPUs, and about one
+        of them. Knows that "gpu" is a kind, and "cuda" is an API, and "nvidia"
+        is a brand.
+
+        Raises ValueError if it gets somethign it can't parse, and TypeError if
+        it gets something it can't parse because it's the wrong type.
+        """
+
+        KINDS = {'gpu'}
+        BRANDS = {'nvidia', 'amd'}
+        APIS = {'cuda', 'rocm', 'opencl'}
+
+        parsed: AcceleratorRequirement = {'count': 1, 'kind': 'gpu'}
+
+        if isinstance(spec, int):
+            parsed['count'] = spec
+        elif isinstance(spec, str):
+            parts = spec.split(':')
+
+            if len(parts) > 2:
+                raise ValueError("Could not parse AcceleratorRequirement: " + spec)
+
+            possible_count = parts[-1]
+
+            try:
+                # If they have : and then a count, or just a count, handle that.
+                parsed['count'] = int(possible_count)
+                if len(parts) > 1:
+                    # Then we take whatever was before the colon as text
+                    possible_description = parts[0]
+                else:
+                    possible_description = None
+            except ValueError:
+                # It doesn't end with a number
+                if len(parts) == 2:
+                    # We should have a number though.
+                    raise ValueError("Could not parse AcceleratorRequirement count in: " + spec)
+                else:
+                    # Must be just the description
+                    possible_description = possible_count
+
+            # Determine if we have a kind, brand, API, or (by default) model
+            if possible_description in KINDS:
+                parsed['kind'] = possible_description
+            elif possible_description in BRANDS:
+                parsed['brand'] = possible_description
+            elif possible_description in APIS:
+                parsed['api'] = possible_description
+            else:
+                parsed['model'] = possible_description
+        elif isinstance(spec, dict):
+            # It's a dict, so merge with the defaults.
+            parsed.update(spec)
+            # TODO: make sure they didn't misspell keys or something
+        else:
+            raise TypeError(f"Cannot parse value of type {type(spec)} as an AcceleratorRequirement")
+
+        if parsed['kind'] == 'gpu':
+            # Use some smarts about what current GPUs are like to elaborate the
+            # description.
+
+            if 'brand' not in parsed and 'model' in parsed:
+                # Try to guess the brand from the model
+                for brand in BRANDS:
+                    if parsed['model'].startswith(brand):
+                        # The model often starts with the brand
+                        parsed['brand'] = brand
+                        break
+
+            if 'brand' not in parsed and 'api' in parsed:
+                # Try to guess the brand from the API
+                if parsed['api'] == 'cuda':
+                    # Only nvidia makes cuda cards
+                    parsed['brand'] = 'nvidia'
+                elif parsed['api'] == 'rocm':
+                    # Only amd makes rocm cards
+                    parsed['brand'] = 'amd'
+
+        return parsed
+
+    @staticmethod
+    def satisfies(candidate: 'AcceleratorRequirement', requirement: 'AcceleratorRequirement') -> bool:
+        """
+        Return True if the given candidate at least partially satisfies the given requirement (i.e. check all fields other than count).
+        """
+
+        for key in ['kind', 'brand', 'api', 'model']:
+            if key in requirement:
+                if key not in candidate:
+                    logger.debug('Candidate %s does not satisfy requirement %s because it does not have a %s', candidate, requirement, key)
+                    return False
+                if candidate[key] != requirement[key]:
+                    logger.debug('Candidate %s does not satisfy requirement %s because it does not have the correct %s', candidate, requirement, key)
+                    return False
+        # If all these match or are more specific than required, we match!
+        return True
+
+class RequirementsDict(TypedDict):
+    """
+    Typed storage for requirements for a job, where requirement values are of
+    different types depending on the requirement.
+    """
+
+    cores: NotRequired[Union[int, float]]
+    memory: NotRequired[int]
+    disk: NotRequired[int]
+    accelerators: NotRequired[List[AcceleratorRequirement]]
+    preemptible: NotRequired[bool]
+
+# These must be all the key names in RequirementsDict
+REQUIREMENT_NAMES = ["disk", "memory", "cores", "accelerators", "preemptible"]
+
+# This is the supertype of all value types in RequirementsDict
+ParsedRequirement = Union[int, float, bool, List[AcceleratorRequirement]]
+
+# We define some types for things we can parse into different kind of requirements
+ParseableIndivisibleResource = Union[str, int]
+ParseableDivisibleResource = Union[str, int, float]
+ParseableFlag = Union[str, int, bool]
+ParseableAcceleratorRequirement = Union[str, int, Mapping[str, Any], AcceleratorRequirement, Sequence[Union[str, int, Mapping[str, Any], AcceleratorRequirement]]]
+
+ParseableRequirement = Union[ParseableIndivisibleResource, ParseableDivisibleResource, ParseableFlag, ParseableAcceleratorRequirement]
 
 class Requirer:
     """
@@ -139,22 +346,23 @@ class Requirer:
     cores, memory, disk, and preemptability as properties.
     """
 
-    _requirementOverrides: Dict[str, Union[int, float, bool]]
+    _requirementOverrides: RequirementsDict
 
     def __init__(
-        self, requirements: Mapping[str, Union[int, str, float, bool, None]]
+        self, requirements: Mapping[str, ParseableRequirement]
     ) -> None:
         """
         Parse and save the given requirements.
 
-        :param dict requirements: Dict from string to number, string, or bool
+        :param dict requirements: Dict from string to value
             describing a set of resource requirments. 'cores', 'memory',
-            'disk', and 'preemptable' fields, if set, are parsed and broken out
-            into properties. If unset, the relevant property will be
-            unspecified, and will be pulled from the assigned Config object if
-            queried (see :meth:`toil.job.Requirer.assignConfig`). If
-            unspecified and no Config object is assigned, an AttributeError
-            will be raised at query time.
+            'disk', 'preemptible', and 'accelerators' fields, if set, are
+            parsed and broken out into properties. If unset, the relevant
+            property will be unspecified, and will be pulled from the assigned
+            Config object if queried (see
+            :meth:`toil.job.Requirer.assignConfig`). If unspecified and no
+            Config object is assigned, an AttributeError will be raised at
+            query time.
         """
         super().__init__()
 
@@ -192,19 +400,14 @@ class Requirer:
 
     def __copy__(self) -> "Requirer":
         """Return a semantically-shallow copy of the object, for :meth:`copy.copy`."""
-        # See https://stackoverflow.com/a/40484215 for how to do an override
-        # that uses the base implementation
+        # The hide-the-method-and-call-the-copy-module approach from
+        # <https://stackoverflow.com/a/40484215> doesn't seem to work for
+        # __copy__. So we try the method of
+        # <https://stackoverflow.com/a/51043609>. But we go through the
+        # pickling state hook.
 
-        # Hide this override
-        implementation = self.__copy__
-        self.__copy__ = None  # type: ignore[assignment]
-
-        # Do the copy which omits the config via __getstate__ override
-        clone = copy.copy(self)
-
-        # Put back the override on us and the copy
-        self.__copy__ = implementation  # type: ignore[assignment]
-        clone.__copy__ = implementation  # type: ignore[assignment]
+        clone = type(self).__new__(self.__class__)
+        clone.__dict__.update(self.__getstate__())
 
         if self._config is not None:
             # Share a config reference
@@ -237,35 +440,42 @@ class Requirer:
     @overload
     @staticmethod
     def _parseResource(
-        name: Union[Literal["memory"], Literal["disks"]], value: Union[str, int]
+        name: Union[Literal["memory"], Literal["disks"]], value: ParseableIndivisibleResource
     ) -> int:
         ...
 
     @overload
     @staticmethod
     def _parseResource(
-        name: Literal["cores"], value: Union[str, int, float]
+        name: Literal["cores"], value: ParseableDivisibleResource
     ) -> Union[int, float]:
         ...
 
     @overload
     @staticmethod
     def _parseResource(
-        name: str, value: Union[str, int, float, bool]
-    ) -> Union[int, float, bool]:
+        name: Literal["accelerators"], value: ParseableAcceleratorRequirement
+    ) -> List[AcceleratorRequirement]:
         ...
 
     @overload
     @staticmethod
     def _parseResource(
-        name: str, value: Union[str, int, float, bool, None]
-    ) -> Union[int, float, bool, None]:
+        name: str, value: ParseableRequirement
+    ) -> ParsedRequirement:
+        ...
+
+    @overload
+    @staticmethod
+    def _parseResource(
+        name: str, value: None
+    ) -> None:
         ...
 
     @staticmethod
     def _parseResource(
-        name: str, value: Union[str, int, float, bool, None]
-    ) -> Union[int, float, bool, None]:
+        name: str, value: Optional[ParseableRequirement]
+    ) -> Optional[ParsedRequirement]:
         """
         Parse a Toil resource requirement value and apply resource-specific type checks.
 
@@ -308,7 +518,7 @@ class Requirer:
                 return value
             else:
                 raise TypeError(f"The '{name}' requirement does not accept values that are of type {type(value)}")
-        elif name == 'preemptable':
+        elif name == 'preemptible':
             if isinstance(value, str):
                 if value.lower() == "true":
                     return True
@@ -322,16 +532,23 @@ class Requirer:
                 if value == 0:
                     return False
                 else:
-                    raise ValueError(f"The '{name}' requirement, asn an int, must be 1 or 0 but is {value}")
+                    raise ValueError(f"The '{name}' requirement, as an int, must be 1 or 0 but is {value}")
             elif isinstance(value, bool):
                 return value
             else:
                 raise TypeError(f"The '{name}' requirement does not accept values that are of type {type(value)}")
+        elif name == 'accelerators':
+            # The type checking for this is delegated to the
+            # AcceleratorRequirement class.
+            if isinstance(value, list):
+                return [AcceleratorRequirement.parse(v) for v in value]
+            else:
+                return [AcceleratorRequirement.parse(value)]
         else:
             # Anything else we just pass along without opinons
-            return cast(Union[int, float, bool], value)
+            return cast(ParsedRequirement, value)
 
-    def _fetchRequirement(self, requirement: str) -> Union[int, float, bool, None]:
+    def _fetchRequirement(self, requirement: str) -> Optional[ParsedRequirement]:
         """
         Get the value of the specified requirement ('blah').
 
@@ -362,7 +579,7 @@ class Requirer:
             )
 
     @property
-    def requirements(self) -> Dict[str, Union[int, float, str, bool]]:
+    def requirements(self) -> RequirementsDict:
         """Get dict containing all non-None, non-defaulted requirements."""
         return dict(self._requirementOverrides)
 
@@ -372,7 +589,7 @@ class Requirer:
         return cast(int, self._fetchRequirement("disk"))
 
     @disk.setter
-    def disk(self, val: Union[str, int]) -> None:
+    def disk(self, val: ParseableIndivisibleResource) -> None:
         self._requirementOverrides["disk"] = Requirer._parseResource("disk", val)
 
     @property
@@ -381,7 +598,7 @@ class Requirer:
         return cast(int, self._fetchRequirement("memory"))
 
     @memory.setter
-    def memory(self, val: Union[str, int]) -> None:
+    def memory(self, val: ParseableIndivisibleResource) -> None:
         self._requirementOverrides["memory"] = Requirer._parseResource("memory", val)
 
     @property
@@ -390,19 +607,76 @@ class Requirer:
         return cast(Union[int, float], self._fetchRequirement("cores"))
 
     @cores.setter
-    def cores(self, val: Union[str, int, float]) -> None:
+    def cores(self, val: ParseableDivisibleResource) -> None:
         self._requirementOverrides["cores"] = Requirer._parseResource("cores", val)
 
     @property
-    def preemptable(self) -> bool:
-        """Whether a preemptable node is permitted, or a nonpreemptable one is required."""
-        return cast(bool, self._fetchRequirement("preemptable"))
+    def preemptible(self) -> bool:
+        """Whether a preemptible node is permitted, or a nonpreemptible one is required."""
+        return cast(bool, self._fetchRequirement("preemptible"))
 
-    @preemptable.setter
-    def preemptable(self, val: Union[int, str, bool]) -> None:
-        self._requirementOverrides["preemptable"] = Requirer._parseResource(
-            "preemptable", val
+    @preemptible.setter
+    def preemptible(self, val: ParseableFlag) -> None:
+        self._requirementOverrides["preemptible"] = Requirer._parseResource(
+            "preemptible", val
         )
+
+    @deprecated(new_function_name="preemptible")
+    def preemptable(self, val: ParseableFlag) -> None:
+        self._requirementOverrides["preemptible"] = Requirer._parseResource(
+            "preemptible", val
+        )
+    @property
+    def accelerators(self) -> List[AcceleratorRequirement]:
+        """Any accelerators, such as GPUs, that are needed."""
+        return cast(List[AcceleratorRequirement], self._fetchRequirement("accelerators"))
+
+    @accelerators.setter
+    def accelerators(self, val: ParseableAcceleratorRequirement) -> None:
+        self._requirementOverrides["accelerators"] = Requirer._parseResource(
+            "accelerators", val
+        )
+
+    def scale(self, requirement: str, factor: float) -> "Requirer":
+        """
+        Return a copy of this object with the given requirement scaled up or
+        down by the given factor. Only works on requirements where that makes
+        sense.
+        """
+
+        # Make a shallow copy
+        scaled = copy.copy(self)
+        # But make sure it has its own override dictionary
+        scaled._requirementOverrides = dict(scaled._requirementOverrides)
+
+        original_value = getattr(scaled, requirement)
+        if isinstance(original_value, (int, float)):
+            # This is something we actually can scale up and down
+            new_value = original_value * factor
+            if requirement in ('memory', 'disk'):
+                # Must round to an int
+                new_value = math.ceil(new_value)
+            setattr(scaled, requirement, new_value)
+            return scaled
+        else:
+            # We can't scale some requirements.
+            raise ValueError(f"Cannot scale {requirement} requirements!")
+
+    def requirements_string(self) -> str:
+        """
+        Get a nice human-readable string of our requirements.
+        """
+        parts = []
+        for k in REQUIREMENT_NAMES:
+            v = self._fetchRequirement(k)
+            if v is not None:
+                if isinstance(v, (int, float)) and v > 1000:
+                    # Make large numbers readable
+                    v = bytes2human(v)
+                parts.append(f'{k}: {v}')
+        if len(parts) == 0:
+            parts = ['no requirements']
+        return ', '.join(parts)
 
 
 class JobDescription(Requirer):
@@ -436,7 +710,7 @@ class JobDescription(Requirer):
 
         :param requirements: Dict from string to number, string, or bool
             describing the resource requirements of the job. 'cores', 'memory',
-            'disk', and 'preemptable' fields, if set, are parsed and broken out
+            'disk', and 'preemptible' fields, if set, are parsed and broken out
             into properties. If unset, the relevant property will be
             unspecified, and will be pulled from the assigned Config object if
             queried (see :meth:`toil.job.Requirer.assignConfig`).
@@ -668,11 +942,29 @@ class JobDescription(Requirer):
             if k not in toRemove
         }
 
-    def clearSuccessorsAndServiceHosts(self) -> None:
+    def clear_nonexistent_dependents(self, job_store: "AbstractJobStore") -> None:
+        """
+        Remove all references to child, follow-on, and associated service jobs
+        that do not exist (i.e. have been completed and removed) in the given
+        job store.
+        """
+        predicate = lambda j: job_store.job_exists(j)
+        self.filterSuccessors(predicate)
+        self.filterServiceHosts(predicate)
+
+    def clear_dependents(self) -> None:
         """Remove all references to child, follow-on, and associated service jobs."""
         self.childIDs = set()
         self.followOnIDs = set()
         self.serviceTree = {}
+
+    def is_subtree_done(self) -> bool:
+        """
+        Return True if the job appears to be done, and all related child,
+        follow-on, and service jobs appear to be finished and removed.
+        """
+
+        return self.command == None and next(self.successorsAndServiceHosts(), None) is None
 
     def replace(self, other: "JobDescription") -> None:
         """
@@ -759,7 +1051,7 @@ class JobDescription(Requirer):
         :param jobStore: The job store we are being placed into
         """
 
-    def setupJobAfterFailure(self, exitStatus=None):
+    def setupJobAfterFailure(self, exit_status: Optional[int] = None, exit_reason: Optional["BatchJobExitReason"] = None):
         """
         Reduce the remainingTryCount if greater than zero and set the memory
         to be at least as big as the default memory (in case of exhaustion of memory,
@@ -767,7 +1059,8 @@ class JobDescription(Requirer):
 
         Requires a configuration to have been assigned (see :meth:`toil.job.Requirer.assignConfig`).
 
-        :param toil.batchSystems.abstractBatchSystem.BatchJobExitReason exitReason: The configuration for the current workflow run.
+        :param exit_status: The exit code from the job.
+        :param exit_reason: The reason the job stopped, if available from the batch system.
 
         """
 
@@ -775,11 +1068,11 @@ class JobDescription(Requirer):
         from toil.batchSystems.abstractBatchSystem import BatchJobExitReason
 
         # Old version of this function used to take a config. Make sure that isn't happening.
-        assert not isinstance(exitStatus, Config), "Passing a Config as an exit reason"
+        assert not isinstance(exit_status, Config), "Passing a Config as an exit status"
         # Make sure we have an assigned config.
         assert self._config is not None
 
-        if self._config.enableUnlimitedPreemptableRetries and exitStatus == BatchJobExitReason.LOST:
+        if self._config.enableUnlimitedPreemptibleRetries and exit_reason == BatchJobExitReason.LOST:
             logger.info("*Not* reducing try count (%s) of job %s with ID %s",
                         self.remainingTryCount, self, self.jobStoreID)
         else:
@@ -789,7 +1082,7 @@ class JobDescription(Requirer):
         # Set the default memory to be at least as large as the default, in
         # case this was a malloc failure (we do this because of the combined
         # batch system)
-        if exitStatus == BatchJobExitReason.MEMLIMIT and self._config.doubleMem:
+        if exit_reason == BatchJobExitReason.MEMLIMIT and self._config.doubleMem:
             self.memory = self.memory * 2
             logger.warning("We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
                            self, self.memory)
@@ -874,6 +1167,23 @@ class JobDescription(Requirer):
 
         self._job_version += 1
         logger.debug("New job version: %s", self)
+
+    def get_job_kind(self) -> str:
+        """
+        Returns an identifier of the job for use with the message bus.
+        Either the unit name, job name, or display name, which identifies
+        the kind of job it is to toil.
+
+        Otherwise returns Unknown Job in case no identifier is available
+        """
+        if self.unitName:
+            return self.unitName
+        elif self.jobName:
+            return self.jobName
+        elif self.displayName:
+            return self.displayName
+        else:
+            return "Unknown Job"
 
 
 class ServiceJobDescription(JobDescription):
@@ -979,7 +1289,7 @@ class CheckpointJobDescription(JobDescription):
                 recursiveDelete(self)
 
                 # Cut links to the jobs we deleted.
-                self.clearSuccessorsAndServiceHosts()
+                self.clear_dependents()
 
                 # Update again to commit the removal of successors.
                 jobStore.update_job(self)
@@ -993,10 +1303,12 @@ class Job:
 
     def __init__(
         self,
-        memory: Optional[Union[int, str]] = None,
-        cores: Optional[Union[int, float, str]] = None,
-        disk: Optional[Union[int, str]] = None,
-        preemptable: Optional[Union[bool, int, str]] = None,
+        memory: Optional[ParseableIndivisibleResource] = None,
+        cores: Optional[ParseableDivisibleResource] = None,
+        disk: Optional[ParseableIndivisibleResource] = None,
+        accelerators: Optional[ParseableAcceleratorRequirement] = None,
+        preemptible: Optional[ParseableFlag] = None,
+        preemptable: Optional[ParseableFlag] = None,
         unitName: Optional[str] = "",
         checkpoint: Optional[bool] = False,
         displayName: Optional[str] = "",
@@ -1012,7 +1324,9 @@ class Job:
         :param memory: the maximum number of bytes of memory the job will require to run.
         :param cores: the number of CPU cores required.
         :param disk: the amount of local disk space required by the job, expressed in bytes.
-        :param preemptable: if the job can be run on a preemptable node.
+        :param accelerators: the computational accelerators required by the job. If a string, can be a string of a number, or a string specifying a model, brand, or API (with optional colon-delimited count).
+        :param preemptible: if the job can be run on a preemptible node.
+        :param preemptable: legacy preemptible parameter, for backwards compatibility with workflows not using the preemptible keyword
         :param unitName: Human-readable name for this instance of the job.
         :param checkpoint: if any of this job's successor jobs completely fails,
             exhausting all their retries, remove any successor jobs and rerun this job to restart the
@@ -1024,7 +1338,8 @@ class Job:
         :type memory: int or string convertible by toil.lib.conversions.human2bytes to an int
         :type cores: float, int, or string convertible by toil.lib.conversions.human2bytes to an int
         :type disk: int or string convertible by toil.lib.conversions.human2bytes to an int
-        :type preemptable: bool, int in {0, 1}, or string in {'false', 'true'} in any case
+        :type accelerators: int, string, dict, or list of those. Strings and dicts must be parseable by AcceleratorRequirement.parse.
+        :type preemptible: bool, int in {0, 1}, or string in {'false', 'true'} in any case
         :type unitName: str
         :type checkpoint: bool
         :type displayName: str
@@ -1034,9 +1349,14 @@ class Job:
         jobName = self.__class__.__name__
         displayName = displayName if displayName else jobName
 
+        #Some workflows use preemptable instead of preemptible
+        if preemptable and not preemptible:
+            logger.warning("Preemptable as a keyword has been deprecated, please use preemptible.")
+            preemptible = preemptable
         # Build a requirements dict for the description
         requirements = {'memory': memory, 'cores': cores, 'disk': disk,
-                        'preemptable': preemptable}
+                        'accelerators': accelerators,
+                        'preemptible': preemptible}
         if descriptionClass is None:
             if checkpoint:
                 # Actually describe as a checkpoint job
@@ -1068,7 +1388,7 @@ class Job:
         # Note that self.__module__ is not necessarily this module, i.e. job.py. It is the module
         # defining the class self is an instance of, which may be a subclass of Job that may be
         # defined in a different module.
-        self.userModule = ModuleDescriptor.forModule(self.__module__).globalize()
+        self.userModule: ModuleDescriptor = ModuleDescriptor.forModule(self.__module__).globalize()
         # Maps index paths into composite return values to lists of IDs of files containing
         # promised values for those return value items. An index path is a tuple of indices that
         # traverses a nested data structure of lists, dicts, tuples or any other type supporting
@@ -1149,16 +1469,32 @@ class Job:
          self.description.cores = val
 
     @property
-    def preemptable(self):
+    def accelerators(self):
         """
-        Whether the job can be run on a preemptable node.
+        Any accelerators, such as GPUs, that are needed.
+
+       :rtype: list
+        """
+        return self.description.accelerators
+    @accelerators.setter
+    def accelerators(self, val):
+         self.description.accelerators = val
+
+    @property
+    def preemptible(self):
+        """
+        Whether the job can be run on a preemptible node.
 
         :rtype: bool
         """
-        return self.description.preemptable
-    @preemptable.setter
-    def preemptable(self, val):
-         self.description.preemptable = val
+        return self.description.preemptible
+
+    @deprecated(new_function_name="preemptible")
+    def preemptable(self):
+        return self.description.preemptible
+    @preemptible.setter
+    def preemptible(self, val):
+         self.description.preemptible = val
 
     @property
     def checkpoint(self):
@@ -1516,15 +1852,17 @@ class Job:
         self._rvs[path].append(jobStoreFileID)
         return self._promiseJobStore.config.jobStore, jobStoreFileID
 
-    def prepareForPromiseRegistration(self, jobStore):
+    def prepareForPromiseRegistration(self, jobStore: "AbstractJobStore") -> None:
         """
-        Ensure that a promise by this job (the promissor) can register with the promissor when
-        another job referring to the promise (the promissee) is being serialized. The promissee
-        holds the reference to the promise (usually as part of the the job arguments) and when it
-        is being pickled, so will the promises it refers to. Pickling a promise triggers it to be
-        registered with the promissor.
+        Set up to allow this job's promises to register themselves.
 
-        :return:
+        Prepare this job (the promisor) so that its promises can register
+        themselves with it, when the jobs they are promised to (promisees) are
+        serialized.
+
+        The promissee holds the reference to the promise (usually as part of the
+        job arguments) and when it is being pickled, so will the promises it refers
+        to. Pickling a promise triggers it to be registered with the promissor.
         """
         self._promiseJobStore = jobStore
 
@@ -1815,14 +2153,21 @@ class Job:
         Is not executed as a job; runs within a ServiceHostJob.
         """
 
-        def __init__(self, memory=None, cores=None, disk=None, preemptable=None, unitName=None, use_preferred_partition=None, comment=None):
+        def __init__(self, memory=None, cores=None, disk=None, accelerators=None, preemptible=None, unitName=None, use_preferred_partition=None, comment=None):
             """
             Memory, core and disk requirements are specified identically to as in \
             :func:`toil.job.Job.__init__`.
             """
 
             # Save the requirements in ourselves so they are visible on `self` to user code.
-            super().__init__({'memory': memory, 'cores': cores, 'disk': disk, 'preemptable': preemptable, "comment": comment})
+            super().__init__({
+                'memory': memory,
+                'cores': cores,
+                'disk': disk,
+                'accelerators': accelerators,
+                'preemptible': preemptible,
+                "comment": comment
+            })
 
             # And the unit name
             self.unitName = unitName
@@ -1925,7 +2270,7 @@ class Job:
 
         return runnable
 
-    def getUserScript(self):
+    def getUserScript(self) -> ModuleDescriptor:
         return self.userModule
 
     def _fulfillPromises(self, returnValues, jobStore):
@@ -2243,11 +2588,10 @@ class Job:
                 if job != self or saveSelf:
                     jobStore.create_job(job.description)
 
-    def saveAsRootJob(self, jobStore):
+    def saveAsRootJob(self, jobStore: "AbstractJobStore") -> JobDescription:
         """
         Save this job to the given jobStore as the root job of the workflow.
 
-        :param toil.jobStores.abstractJobStore.AbstractJobStore jobStore:
         :return: the JobDescription describing this job.
         """
 
@@ -2291,12 +2635,12 @@ class Job:
         userModule = cls._loadUserModule(userModule)
         pickleFile = commandTokens[1]
 
-        #Loads context manager using file stream 
+        #Loads context manager using file stream
         if pickleFile == "firstJob":
             manager = jobStore.read_shared_file_stream(pickleFile)
         else:
             manager = jobStore.read_file_stream(pickleFile)
-        
+
         #Open and unpickle
         with manager as fileHandle:
 
@@ -2356,7 +2700,7 @@ class Job:
         if not self.checkpoint:
             for jobStoreFileID in Promise.filesToDelete:
                 # Make sure to wrap the job store ID in a FileID object so the file store will accept it
-                # TODO: talk directly to the job sotre here instead.
+                # TODO: talk directly to the job store here instead.
                 fileStore.deleteGlobalFile(FileID(jobStoreFileID, 0))
         else:
             # Else copy them to the job description to delete later
@@ -2375,7 +2719,8 @@ class Job:
                     time=str(time.time() - startTime),
                     clock=str(totalCpuTime - startClock),
                     class_name=self._jobName(),
-                    memory=str(totalMemoryUsage)
+                    memory=str(totalMemoryUsage),
+                    requested_cores=str(self.cores)
                 )
             )
 
@@ -2462,11 +2807,12 @@ class FunctionWrappingJob(Job):
         :param callable userFunction: The function to wrap. It will be called with ``*args`` and
                ``**kwargs`` as arguments.
 
-        The keywords ``memory``, ``cores``, ``disk``, ``preemptable`` and ``checkpoint`` are
-        reserved keyword arguments that if specified will be used to determine the resources
-        required for the job, as :func:`toil.job.Job.__init__`. If they are keyword arguments to
-        the function they will be extracted from the function definition, but may be overridden
-        by the user (as you would expect).
+        The keywords ``memory``, ``cores``, ``disk``, ``accelerators`,
+        ``preemptible`` and ``checkpoint`` are reserved keyword arguments that
+        if specified will be used to determine the resources required for the
+        job, as :func:`toil.job.Job.__init__`. If they are keyword arguments to
+        the function they will be extracted from the function definition, but
+        may be overridden by the user (as you would expect).
         """
         # Use the user-specified requirements, if specified, else grab the default argument
         # from the function, if specified, else default to None
@@ -2496,7 +2842,8 @@ class FunctionWrappingJob(Job):
         super().__init__(memory=resolve('memory', dehumanize=True),
                          cores=resolve('cores', dehumanize=True),
                          disk=resolve('disk', dehumanize=True),
-                         preemptable=resolve('preemptable'),
+                         accelerators=resolve('accelerators'),
+                         preemptible=resolve('preemptible'),
                          checkpoint=resolve('checkpoint', default=False),
                          unitName=resolve('name', default=None),
                          use_preferred_partition=resolve('use_preferred_partition', default=True),
@@ -2545,6 +2892,8 @@ class JobFunctionWrappingJob(FunctionWrappingJob):
         - memory
         - disk
         - cores
+        - accelerators
+        - preemptible
 
     For example to wrap a function into a job we would call::
 
@@ -2571,7 +2920,7 @@ class PromisedRequirementFunctionWrappingJob(FunctionWrappingJob):
     def __init__(self, userFunction, *args, **kwargs):
         self._promisedKwargs = kwargs.copy()
         # Replace resource requirements in intermediate job with small values.
-        kwargs.update(dict(disk='1M', memory='32M', cores=0.1))
+        kwargs.update(dict(disk='1M', memory='32M', cores=0.1, accelerators=[], preemptible=True, preemptable=True))
         super().__init__(userFunction, *args, **kwargs)
 
     @classmethod
@@ -2592,9 +2941,8 @@ class PromisedRequirementFunctionWrappingJob(FunctionWrappingJob):
         return self.addChildFn(userFunction, *self._args, **self._promisedKwargs).rv()
 
     def evaluatePromisedRequirements(self):
-        requirements = ["disk", "memory", "cores"]
         # Fulfill resource requirement promises
-        for requirement in requirements:
+        for requirement in REQUIREMENT_NAMES:
             try:
                 if isinstance(self._promisedKwargs[requirement], PromisedRequirement):
                     self._promisedKwargs[requirement] = self._promisedKwargs[requirement].getValue()
@@ -2989,7 +3337,7 @@ class PromisedRequirement:
 
         :param kwargs: function keyword arguments
         """
-        for r in ["disk", "memory", "cores"]:
+        for r in REQUIREMENT_NAMES:
             if isinstance(kwargs.get(r), Promise):
                 kwargs[r] = PromisedRequirement(kwargs[r])
                 return True

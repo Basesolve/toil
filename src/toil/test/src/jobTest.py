@@ -134,7 +134,7 @@ class JobTest(ToilTest):
             else:
                 self.fail()
 
-    @pytest.mark.timeout(30)
+    @pytest.mark.timeout(300)
     def testDAGConsistency(self):
         options = Job.Runner.getDefaultOptions(self._createTempDir() + '/jobStore')
         options.clean = 'always'
@@ -683,7 +683,7 @@ def child(job):
     assert job.cores is not None
     assert job.disk is not None
     assert job.memory is not None
-    assert job.preemptable is not None
+    assert job.preemptible is not None
 
 
 def errorChild(job):

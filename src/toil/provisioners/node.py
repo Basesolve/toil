@@ -29,14 +29,17 @@ logger = logging.getLogger(__name__)
 class Node:
     maxWaitTime = 7 * 60
 
-    def __init__(self, publicIP, privateIP, name, launchTime, nodeType, preemptable, tags=None):
+    def __init__(self, publicIP, privateIP, name, launchTime, nodeType, preemptible, tags=None, use_private_ip=None):
         self.publicIP = publicIP
         self.privateIP = privateIP
-        self.effectiveIP = self.publicIP or self.privateIP
+        if use_private_ip:
+            self.effectiveIP = self.privateIP #or self.publicIP?
+        else:
+            self.effectiveIP = self.publicIP or self.privateIP
         self.name = name
         self.launchTime = launchTime
         self.nodeType = nodeType
-        self.preemptable = preemptable
+        self.preemptible = preemptible
         self.tags = tags
 
     def __str__(self):
@@ -48,7 +51,7 @@ class Node:
     def __hash__(self):
         return hash(self.effectiveIP)
 
-    def remainingBillingInterval(self):
+    def remainingBillingInterval(self) -> float:
         """
         If the node has a launch time, this function returns a floating point value
         between 0 and 1.0 representing how far we are into the
@@ -131,7 +134,7 @@ class Node:
                                     "https://toil.readthedocs.io/en/latest/running/cloud/cloud.html."
                                     if last_error and 'Permission denied' in last_error else ""))
             try:
-                logger.info('Attempting to establish SSH connection...')
+                logger.info('Attempting to establish SSH connection to %s@%s...', keyName, self.effectiveIP)
                 self.sshInstance('ps', sshOptions=['-oBatchMode=yes'], user=keyName)
             except RuntimeError as err:
                 last_error = str(err)
@@ -252,7 +255,7 @@ class Node:
             commandTokens.extend(sshOptions)
         # specify host
         user = kwargs.pop('user', 'core')  # CHANGED: Is this needed?
-        commandTokens.append('{}@{}'.format(user, str(self.effectiveIP)))
+        commandTokens.append(f'{user}@{str(self.effectiveIP)}')
 
         inputString = kwargs.pop('input', None)
         if inputString is not None:

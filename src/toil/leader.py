@@ -23,22 +23,31 @@ import os
 import pickle
 import sys
 import time
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Union
 
 import enlighten
 
 from toil import resolveEntryPoint
 from toil.batchSystems import DeadlockException
-from toil.batchSystems.abstractBatchSystem import (
-    AbstractBatchSystem,
-    BatchJobExitReason,
-)
-from toil.bus import JobUpdatedMessage
+from toil.batchSystems.abstractBatchSystem import (AbstractBatchSystem,
+                                                   BatchJobExitReason)
+from toil.bus import (JobAnnotationMessage,
+                      JobCompletedMessage,
+                      JobFailedMessage,
+                      JobIssuedMessage,
+                      JobMissingMessage,
+                      JobUpdatedMessage,
+                      QueueSizeMessage)
 from toil.common import Config, Toil, ToilMetrics
-from toil.cwl.utils import CWL_INTERNAL_JOBS, CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE
-from toil.job import CheckpointJobDescription, JobDescription, ServiceJobDescription
-from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchJobException
-from toil.lib.conversions import bytes2human
+from toil.cwl.utils import (CWL_INTERNAL_JOBS,
+                            CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE)
+from toil.job import (CheckpointJobDescription,
+                      JobDescription,
+                      ServiceJobDescription,
+                      TemporaryID)
+from toil.jobStores.abstractJobStore import (AbstractJobStore,
+                                             NoSuchFileException,
+                                             NoSuchJobException)
 from toil.lib.throttle import LocalThrottle
 from toil.provisioners.abstractProvisioner import AbstractProvisioner
 from toil.provisioners.clusterScaler import ScalerThread
@@ -106,26 +115,34 @@ class FailedJobsException(Exception):
         return self.msg
 
 
-####################################################
-##Following class represents the leader
-####################################################
-
 class Leader:
-    """ Class that encapsulates the logic of the leader.
     """
-    def __init__(self, config: Config, batchSystem: AbstractBatchSystem,
-                 provisioner: AbstractProvisioner, jobStore: AbstractJobStore,
-                 rootJob: JobDescription, jobCache: Optional[Dict[str, JobDescription]] = None):
-        """
-        :param config:
-        :param batchSystem:
-        :param provisioner:
-        :param jobStore:
-        :param rootJob: Root job of the workflow that the leader will run
+    Represents the Toil leader.
 
+    Responsible for determining what jobs are ready to be scheduled, by
+    consulting the job store, and issuing them in the batch system.
+    """
+    def __init__(self,
+                 config: Config,
+                 batchSystem: AbstractBatchSystem,
+                 provisioner: Optional[AbstractProvisioner],
+                 jobStore: AbstractJobStore,
+                 rootJob: JobDescription,
+                 jobCache: Optional[Dict[Union[str, TemporaryID], JobDescription]] = None) -> None:
+        """
         If jobCache is passed, it must be a dict from job ID to pre-existing
         JobDescription objects. Jobs will be loaded from the cache (which can be
-        downloaded from the jobStore in a batch) during the construction of the ToilState object.
+        downloaded from the jobStore in a batch) when loading into the ToilState object.
+
+        :param config:      A Config object holding the original user options/settings/args.
+        :param batchSystem: The Batch System object containing functions to communicate with the
+                            specific batch system (run jobs, check jobs, etc.).
+        :param provisioner: Only for environments where we need to provision our own compute
+                            resources prior to launching jobs, for example, spin up an AWS instance.
+                            This is a Provisioner object with functions to create/remove resources.
+        :param jobStore:    The Jobstore object for storage, containing functions to talk to a
+                            central location where we store all of our files (jobs, inputs, etc.).
+        :param rootJob:     The first job of the workflow that the leader will run.
         """
         # Object containing parameters for the run
         self.config = config
@@ -134,10 +151,31 @@ class Leader:
         self.jobStore = jobStore
         self.jobStoreLocator = config.jobStore
 
-        # Get a snap shot of the current state of the jobs in the jobStore
-        self.toilState = ToilState(jobStore, rootJob, jobCache=jobCache)
+        # The ToilState will be the authority on the current state of the jobs
+        # in the jobStore, and its bus is the one true place to listen for
+        # state change information about jobs.
+        self.toilState = ToilState(self.jobStore)
+
+        if self.config.write_messages is not None:
+            # Message bus messages need to go to the given file.
+            # Keep a reference to the return value so the listener stays alive.
+            self._message_subscription = self.toilState.bus.connect_output_file(self.config.write_messages)
+
+        # Connect to the message bus, so we will get all the messages of these
+        # types in an inbox.
+        self._messages = self.toilState.bus.connect([JobUpdatedMessage])
+
+        # Connect the batch system to the bus so it can e.g. annotate jobs
+        batchSystem.set_message_bus(self.toilState.bus)
+
+        # Load the jobs into the ToilState, now that we are able to receive any
+        # resulting messages.
+        # TODO: Give other components a chance to connect to the bus before
+        # this, somehow, so they can also see messages from this?
+        self.toilState.load_workflow(rootJob, jobCache=jobCache)
+
         logger.debug("Found %s jobs to start and %i jobs with successors to run",
-                     self.toilState.bus.count(JobUpdatedMessage), len(self.toilState.successorCounts))
+                     self._messages.count(JobUpdatedMessage), len(self.toilState.successorCounts))
 
         # Batch system
         self.batchSystem = batchSystem
@@ -148,15 +186,15 @@ class Leader:
         self.issued_jobs_by_batch_system_id: Dict[int, str] = {}
 
         # Number of preemptible jobs currently being run by batch system
-        self.preemptableJobsIssued = 0
+        self.preemptibleJobsIssued = 0
 
         # Tracking the number service jobs issued,
         # this is used limit the number of services issued to the batch system
         self.serviceJobsIssued = 0
         self.serviceJobsToBeIssued: List[str] = [] # A queue of IDs of service jobs that await scheduling
-        #Equivalents for service jobs to be run on preemptible nodes
-        self.preemptableServiceJobsIssued = 0
-        self.preemptableServiceJobsToBeIssued: List[str] = []
+        # Equivalents for service jobs to be run on preemptible nodes
+        self.preemptibleServiceJobsIssued = 0
+        self.preemptibleServiceJobsToBeIssued: List[str] = []
 
         # Timing of the rescuing method
         self.timeSinceJobsLastRescued = None
@@ -187,7 +225,7 @@ class Leader:
 
         # A dashboard that runs on the leader node in AWS clusters to track the state
         # of the cluster
-        self.toilMetrics = None
+        self.toilMetrics: Optional[ToilMetrics] = None
 
         # internal jobs we should not expose at top level debugging
         self.debugJobNames = ("CWLJob", "CWLWorkflow", "CWLScatter", "CWLGather",
@@ -196,6 +234,9 @@ class Leader:
         self.deadlockThrottler = LocalThrottle(self.config.deadlockCheckInterval)
 
         self.statusThrottler = LocalThrottle(self.config.statusWait)
+
+        # Control how often to poll the job store to see if we have been killed
+        self.kill_throttler = LocalThrottle(self.config.kill_polling_interval)
 
         # For fancy console UI, we use an Enlighten counter that displays running / queued jobs
         # This gets filled in in run() and updated periodically.
@@ -215,15 +256,15 @@ class Leader:
         # report to its caller.
         self.recommended_fail_exit_code = 1
 
-    def run(self):
+    def run(self) -> Any:
         """
         This runs the leader process to issue and manage jobs.
 
         :raises: toil.leader.FailedJobsException if failed jobs remain after running.
 
         :return: The return value of the root job's run function.
-        :rtype: Any
         """
+        self.jobStore.write_kill_flag(kill=False)
 
         with enlighten.get_manager(stream=sys.stderr, enabled=not self.config.disableProgress) as manager:
             # Set up the fancy console UI if desirable
@@ -234,7 +275,7 @@ class Leader:
             # Start the stats/logging aggregation thread
             self.statsAndLogging.start()
             if self.config.metrics:
-                self.toilMetrics = ToilMetrics(provisioner=self.provisioner)
+                self.toilMetrics = ToilMetrics(self.toilState.bus, provisioner=self.provisioner)
 
             try:
 
@@ -329,7 +370,7 @@ class Leader:
             logger.debug("Job: %s has no successors to run "
                          "and some are failed, adding to list of jobs "
                          "with failed successors", self.toilState.get_job(predecessor_id))
-            self.toilState.bus.put(JobUpdatedMessage(predecessor_id, 0))
+            self._messages.publish(JobUpdatedMessage(predecessor_id, 0))
             # Report no successors are running
             return False
         else:
@@ -494,6 +535,9 @@ class Leader:
 
         logger.debug('Updating status of job %s with result status: %s',
                      readyJob, result_status)
+        
+        # TODO: Filter out nonexistent successors/services now, so we can tell
+        # if they are all done and the job needs deleting?
 
         if self.serviceManager.services_are_starting(readyJob.jobStoreID):
             # This stops a job with services being issued by the serviceManager
@@ -543,7 +587,7 @@ class Leader:
             # Use the service manager to start the services
             self.serviceManager.put_client(job_id)
         elif len(readyJob.stack) > 0:
-            # There are exist successors to run
+            # There are successors to run
             self._runJobSuccessors(job_id)
         elif readyJob.jobStoreID in self.toilState.servicesIssued:
             logger.debug("Telling job: %s to terminate its services due to the "
@@ -551,26 +595,51 @@ class Leader:
                          readyJob)
             self.serviceManager.kill_services(self.toilState.servicesIssued[readyJob.jobStoreID], error=False)
         else:
-            #There are no remaining tasks to schedule within the job, but
-            #we schedule it anyway to allow it to be deleted. Remove the job
+            # There are no remaining tasks to schedule within the job.
+            #
+            # We want it to go away. Usually the worker is responsible for
+            # deleting completed jobs. But when the job has a
+            # child/followOn/service dependents that have to finish first, it
+            # gets kicked back here when they are done.
+            #
+            # We don't want to just issueJob() again because then we will
+            # forget that this job is actually done and not a retry. A
+            # successful-subtree checkpoint job can't be distinguished from a
+            # being-retried one.
+            #
+            # So we do the cleanup here, to avoid reserving any real resources.
+            # See: https://github.com/DataBiosphere/toil/issues/4158 and
+            # https://github.com/DataBiosphere/toil/issues/3188
+            #
+            # TODO: Does this want to happen in another thread? What if we
+            # don't manage to do all the jobstore file deletes and need to
+            # retry them? What if there are 1000 of them?
 
-            # TODO: resize down here so it doesn't schedule at full original size just to delete itself!
-
-            #TODO: An alternative would be simple delete it here and add it to the
-            #list of jobs to process, or (better) to create an asynchronous
-            #process that deletes jobs and then feeds them back into the set
-            #of jobs to be processed
             if readyJob.remainingTryCount > 0:
-                self.issueJob(readyJob)
-                logger.debug("Job: %s is empty, we are scheduling to clean it up", readyJob.jobStoreID)
+                # add attribute to let issueJob know that this is an empty job and should be deleted
+                logger.debug("Job: %s is empty, we are cleaning it up", readyJob)
+                
+                try:
+                    self.toilState.delete_job(readyJob.jobStoreID)
+                except Exception as e:
+                    logger.exception("Re-processing success for job we could not remove: %s", readyJob)
+                    # Kick it back to being handled as succeeded again. We
+                    # don't want to have a failure here cause a Toil-level
+                    # retry which causes more actual jobs to try to run.
+                    # TODO: If there's some kind of permanent failure deleting
+                    # from the job store, we will loop on this job forever!
+                    self.process_finished_job_description(readyJob, 0)
+                else:
+                    # No exception during removal. Note that the job is removed.
+                    self.processRemovedJob(readyJob, 0)
             else:
                 self.processTotallyFailedJob(job_id)
-                logger.warning("Job: %s is empty but completely failed - something is very wrong", readyJob.jobStoreID)
+                logger.error("Job: %s is empty but completely failed - something is very wrong", readyJob.jobStoreID)
 
     def _processReadyJobs(self):
         """Process jobs that are ready to be scheduled/have successors to schedule"""
         logger.debug('Built the jobs list, currently have %i jobs to update and %i jobs issued',
-                     self.toilState.bus.count(JobUpdatedMessage), self.getNumberOfJobsIssued())
+                     self._messages.count(JobUpdatedMessage), self.getNumberOfJobsIssued())
 
         # Now go through and, for each job that has updated this tick, process it.
 
@@ -579,7 +648,7 @@ class Leader:
         # same tick, so we remember what we've done so far in this dict from
         # job ID to status.
         handled_with_status = {}
-        for message in self.toilState.bus.for_each(JobUpdatedMessage):
+        for message in self._messages.for_each(JobUpdatedMessage):
             # Handle all the job update messages that came in.
 
             if message.job_id in handled_with_status:
@@ -631,7 +700,7 @@ class Leader:
 
             # Drop all service relationships
             client.filterServiceHosts(lambda ignored: False)
-            self.toilState.bus.put(JobUpdatedMessage(client_id, 0))
+            self._messages.publish(JobUpdatedMessage(client_id, 0))
 
     def _processJobsWithFailedServices(self):
         """Get jobs whose services have failed to start"""
@@ -648,7 +717,7 @@ class Leader:
             assert next(client.serviceHostIDsInBatches(), None) is not None
 
             # Mark the service job updated so we don't stop here.
-            self.toilState.bus.put(JobUpdatedMessage(client_id, 1))
+            self._messages.publish(JobUpdatedMessage(client_id, 1))
 
     def _gatherUpdatedJobs(self, updatedJobTuple):
         """Gather any new, updated JobDescriptions from the batch system"""
@@ -673,9 +742,9 @@ class Leader:
                     # this exit code.
                     logger.warning("This indicates an unsupported CWL requirement!")
                     self.recommended_fail_exit_code = CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE
-            if self.toilMetrics:
-                self.toilMetrics.logCompletedJob(updatedJob)
-            self.processFinishedJob(bsID, exitStatus, wallTime=wallTime, exitReason=exitReason)
+            # Tell everyone it stopped running.
+            self._messages.publish(JobCompletedMessage(updatedJob.get_job_kind(), updatedJob.jobStoreID, exitStatus))
+            self.process_finished_job(bsID, exitStatus, wall_time=wallTime, exit_reason=exitReason)
 
     def _processLostJobs(self):
         """Process jobs that have gone awry"""
@@ -701,11 +770,11 @@ class Leader:
         """
         self.timeSinceJobsLastRescued = time.time()
 
-        while self.toilState.bus.count(JobUpdatedMessage) > 0 or \
+        while self._messages.count(JobUpdatedMessage) > 0 or \
               self.getNumberOfJobsIssued() or \
               self.serviceManager.get_job_count():
 
-            if self.toilState.bus.count(JobUpdatedMessage) > 0:
+            if self._messages.count(JobUpdatedMessage) > 0:
                 self._processReadyJobs()
 
             # deal with service-related jobs
@@ -741,13 +810,18 @@ class Leader:
                 # Time to tell the user how things are going
                 self._reportWorkflowStatus()
 
+            if self.kill_throttler.throttle(wait=False):
+                if self.jobStore.read_kill_flag():
+                    logger.warning("Received kill via job store. Shutting down.")
+                    raise KeyboardInterrupt("killed via job store")
+
             # Make sure to keep elapsed time and ETA up to date even when no jobs come in
             self.progress_overall.update(incr=0)
 
         logger.debug("Finished the main loop: no jobs left to run.")
 
         # Consistency check the toil state
-        assert self.toilState.bus.empty(), f"Pending messages at shutdown: {self.toilState.bus}"
+        assert self._messages.empty(), f"Pending messages at shutdown: {self._messages}"
         assert self.toilState.successorCounts == {}, f"Jobs waiting on successors at shutdown: {self.toilState.successorCounts}"
         assert self.toilState.successor_to_predecessors == {}, f"Successors pending for their predecessors at shutdown: {self.toilState.successor_to_predecessors}"
         assert self.toilState.service_to_client == {}, f"Services pending for their clients at shutdown: {self.toilState.service_to_client}"
@@ -761,7 +835,7 @@ class Leader:
         """
 
         totalRunningJobs = len(self.batchSystem.getRunningBatchJobIDs())
-        totalServicesIssued = self.serviceJobsIssued + self.preemptableServiceJobsIssued
+        totalServicesIssued = self.serviceJobsIssued + self.preemptibleServiceJobsIssued
 
         # If there are no updated jobs and at least some jobs running
         if totalServicesIssued >= totalRunningJobs and totalRunningJobs > 0:
@@ -831,8 +905,12 @@ class Leader:
         self.potentialDeadlockTime = 0
 
     def issueJob(self, jobNode: JobDescription) -> None:
-        """Add a job to the queue of jobs."""
-
+        """Add a job to the queue of jobs currently trying to run."""
+        
+        # Never issue the same job multiple times simultaneously
+        assert jobNode.jobStoreID not in self.toilState.jobs_issued, \
+            f"Attempted to issue {jobNode} multiple times simultaneously!"
+            
         workerCommand = [resolveEntryPoint('_toil_worker'),
                          jobNode.jobName,
                          self.jobStoreLocator,
@@ -844,6 +922,9 @@ class Leader:
             workerCommand.append('--context')
             workerCommand.append(base64.b64encode(pickle.dumps(context)).decode('utf-8'))
 
+        # We locally override the command. This shouldn't get persisted back to
+        # the job store, or we will detach the job body from the job
+        # description. TODO: Don't do it this way! It's weird!
         jobNode.command = ' '.join(workerCommand)
 
         omp_threads = os.environ.get('OMP_NUM_THREADS') \
@@ -854,28 +935,23 @@ class Leader:
             'OMP_NUM_THREADS': omp_threads,
         }
 
-        # Never issue the same job multiple times simultaneously
-        assert jobNode.jobStoreID not in self.toilState.jobs_issued, \
-            f"Attempted to issue {jobNode} multiple times simultaneously!"
-
         # jobBatchSystemID is an int for each job
         jobBatchSystemID = self.batchSystem.issueBatchJob(jobNode, job_environment=job_environment)
         # Record the job by the ID the batch system will use to talk about it with us
         self.issued_jobs_by_batch_system_id[jobBatchSystemID] = jobNode.jobStoreID
         # Record that this job is issued right now and shouldn't e.g. be issued again.
         self.toilState.jobs_issued.add(jobNode.jobStoreID)
-        if jobNode.preemptable:
-            # len(issued_jobs_by_batch_system_id) should always be greater than or equal to preemptableJobsIssued,
+        if jobNode.preemptible:
+            # len(issued_jobs_by_batch_system_id) should always be greater than or equal to preemptibleJobsIssued,
             # so increment this value after the job is added to the issuedJob dict
-            self.preemptableJobsIssued += 1
+            self.preemptibleJobsIssued += 1
         cur_logger = logger.debug if jobNode.jobName.startswith(CWL_INTERNAL_JOBS) else logger.info
         cur_logger("Issued job %s with job batch system ID: "
-                   "%s and cores: %s, disk: %s, and memory: %s with comment: %s",
-                   jobNode, str(jobBatchSystemID), int(jobNode.cores),
-                   bytes2human(jobNode.disk), bytes2human(jobNode.memory), jobNode.comment)
-        if self.toilMetrics:
-            self.toilMetrics.logIssuedJob(jobNode)
-            self.toilMetrics.logQueueSize(self.getNumberOfJobsIssued())
+                   "%s and %s",
+                   jobNode, str(jobBatchSystemID), jobNode.requirements_string())
+        # Tell everyone it is issued and the queue size changed
+        self._messages.publish(JobIssuedMessage(jobNode.get_job_kind(), jobNode.jobStoreID, jobBatchSystemID))
+        self._messages.publish(QueueSizeMessage(self.getNumberOfJobsIssued()))
         # Tell the user there's another job to do
         self.progress_overall.total += 1
         self.progress_overall.update(incr=0)
@@ -895,8 +971,8 @@ class Leader:
         service = self.toilState.get_job(service_id)
         assert isinstance(service, ServiceJobDescription)
 
-        if service.preemptable:
-            self.preemptableServiceJobsToBeIssued.append(service_id)
+        if service.preemptible:
+            self.preemptibleServiceJobsToBeIssued.append(service_id)
         else:
             self.serviceJobsToBeIssued.append(service_id)
         self.issueQueingServiceJobs()
@@ -906,26 +982,26 @@ class Leader:
         while len(self.serviceJobsToBeIssued) > 0 and self.serviceJobsIssued < self.config.maxServiceJobs:
             self.issueJob(self.toilState.get_job(self.serviceJobsToBeIssued.pop()))
             self.serviceJobsIssued += 1
-        while len(self.preemptableServiceJobsToBeIssued) > 0 and self.preemptableServiceJobsIssued < self.config.maxPreemptableServiceJobs:
-            self.issueJob(self.toilState.get_job(self.preemptableServiceJobsToBeIssued.pop()))
-            self.preemptableServiceJobsIssued += 1
+        while len(self.preemptibleServiceJobsToBeIssued) > 0 and self.preemptibleServiceJobsIssued < self.config.maxPreemptibleServiceJobs:
+            self.issueJob(self.toilState.get_job(self.preemptibleServiceJobsToBeIssued.pop()))
+            self.preemptibleServiceJobsIssued += 1
 
-    def getNumberOfJobsIssued(self, preemptable=None):
+    def getNumberOfJobsIssued(self, preemptible=None):
         """
         Gets number of jobs that have been added by issueJob(s) and not
         removed by removeJob
 
-        :param None or boolean preemptable: If none, return all types of jobs.
-          If true, return just the number of preemptable jobs. If false, return
-          just the number of non-preemptable jobs.
+        :param None or boolean preemptible: If none, return all types of jobs.
+          If true, return just the number of preemptible jobs. If false, return
+          just the number of non-preemptible jobs.
         """
-        if preemptable is None:
+        if preemptible is None:
             return len(self.issued_jobs_by_batch_system_id)
-        elif preemptable:
-            return self.preemptableJobsIssued
+        elif preemptible:
+            return self.preemptibleJobsIssued
         else:
-            assert len(self.issued_jobs_by_batch_system_id) >= self.preemptableJobsIssued
-            return len(self.issued_jobs_by_batch_system_id) - self.preemptableJobsIssued
+            assert len(self.issued_jobs_by_batch_system_id) >= self.preemptibleJobsIssued
+            return len(self.issued_jobs_by_batch_system_id) - self.preemptibleJobsIssued
 
     def _getStatusHint(self):
         """
@@ -947,13 +1023,13 @@ class Leader:
         # batch system, it will show up here as waiting to run.
         return f"{running_job_count} jobs are running, {issued_job_count - running_job_count} jobs are issued and waiting to run"
 
-    def _reportWorkflowStatus(self):
+    def _reportWorkflowStatus(self) -> None:
         """
         Report the current status of the workflow to the user.
         """
 
         # For now just log our scheduling status message to the log.
-        # TODO: make this update fast enought to put it in the progress
+        # TODO: make this update fast enough to put it in the progress
         # bar/status line.
         logger.info(self._getStatusHint())
 
@@ -965,11 +1041,11 @@ class Leader:
         """
         assert jobBatchSystemID in self.issued_jobs_by_batch_system_id
         issuedDesc = self.toilState.get_job(self.issued_jobs_by_batch_system_id[jobBatchSystemID])
-        if issuedDesc.preemptable:
-            # len(issued_jobs_by_batch_system_id) should always be greater than or equal to preemptableJobsIssued,
+        if issuedDesc.preemptible:
+            # len(issued_jobs_by_batch_system_id) should always be greater than or equal to preemptibleJobsIssued,
             # so decrement this value before removing the job from the issuedJob map
-            assert self.preemptableJobsIssued > 0
-            self.preemptableJobsIssued -= 1
+            assert self.preemptibleJobsIssued > 0
+            self.preemptibleJobsIssued -= 1
         # It's not issued anymore.
         del self.issued_jobs_by_batch_system_id[jobBatchSystemID]
         assert issuedDesc.jobStoreID in self.toilState.jobs_issued, f"Job {issuedDesc} came back without being issued"
@@ -977,8 +1053,8 @@ class Leader:
         # If service job
         if issuedDesc.jobStoreID in self.toilState.service_to_client:
             # Decrement the number of services
-            if issuedDesc.preemptable:
-                self.preemptableServiceJobsIssued -= 1
+            if issuedDesc.preemptible:
+                self.preemptibleServiceJobsIssued -= 1
             else:
                 self.serviceJobsIssued -= 1
 
@@ -987,16 +1063,16 @@ class Leader:
 
         return issuedDesc
 
-    def getJobs(self, preemptable: Optional[bool] = None) -> List[JobDescription]:
+    def getJobs(self, preemptible: Optional[bool] = None) -> List[JobDescription]:
         """
         Get all issued jobs.
 
-        :param preemptable: If specified, select only preemptable or only non-preemptable jobs.
+        :param preemptible: If specified, select only preemptible or only non-preemptible jobs.
         """
 
         jobs = [self.toilState.get_job(job_store_id) for job_store_id in self.issued_jobs_by_batch_system_id.values()]
-        if preemptable is not None:
-            jobs = [job for job in jobs if job.preemptable == preemptable]
+        if preemptible is not None:
+            jobs = [job for job in jobs if job.preemptible == preemptible]
         return jobs
 
     def killJobs(self, jobsToKill):
@@ -1014,7 +1090,7 @@ class Leader:
             self.batchSystem.killBatchJobs(jobsToKill)
             for jobBatchSystemID in jobsToKill:
                 # Reissue immediately, noting that we killed the job
-                willRerun = self.processFinishedJob(jobBatchSystemID, 1, exitReason=BatchJobExitReason.KILLED)
+                willRerun = self.process_finished_job(jobBatchSystemID, 1, exit_reason=BatchJobExitReason.KILLED)
 
                 if willRerun:
                     # Compose a list of all the jobs that will run again
@@ -1029,7 +1105,7 @@ class Leader:
         """
         Check each issued job - if it is running for longer than desirable
         issue a kill instruction.
-        Wait for the job to die then we pass the job to processFinishedJob.
+        Wait for the job to die then we pass the job to process_finished_job.
         """
         maxJobDuration = self.config.maxJobDuration
         jobsToKill = []
@@ -1053,7 +1129,7 @@ class Leader:
         Check all the current job ids are in the list of currently issued batch system jobs.
         If a job is missing, we mark it as so, if it is missing for a number of runs of
         this function (say 10).. then we try deleting the job (though its probably lost), we wait
-        then we pass the job to processFinishedJob.
+        then we pass the job to process_finished_job.
         """
         issuedJobs = set(self.batchSystem.getIssuedBatchJobIDs())
         jobBatchSystemIDsSet = set(list(self.issued_jobs_by_batch_system_id.keys()))
@@ -1074,8 +1150,8 @@ class Leader:
             timesMissing = self.reissueMissingJobs_missingHash[jobBatchSystemID]
             logger.warning("Job store ID %s with batch system id %s is missing for the %i time",
                         jobStoreID, str(jobBatchSystemID), timesMissing)
-            if self.toilMetrics:
-                self.toilMetrics.logMissingJob()
+            # Tell everyone it is missing
+            self._messages.publish(JobMissingMessage(jobStoreID))
             if timesMissing == killAfterNTimesMissing:
                 self.reissueMissingJobs_missingHash.pop(jobBatchSystemID)
                 jobsToKill.append(jobBatchSystemID)
@@ -1089,105 +1165,136 @@ class Leader:
                         "job %s seems to have finished and been removed", issuedJob)
         self._updatePredecessorStatus(issuedJob.jobStoreID)
 
-    def processFinishedJob(self, batchSystemID, result_status, wallTime=None, exitReason=None):
+    def process_finished_job(self, batch_system_id, result_status, wall_time=None, exit_reason=None):
         """
-        Function reads a processed JobDescription file and updates its state.
+        Called when an attempt to run a job finishes, either successfully or otherwise.
+        
+        Takes the job out of the issued state, and then works out what
+        to do about the fact that it succeeded or failed.
 
         Return True if the job is going to run again, and False if the job is
         fully done or completely failed.
         """
-        issuedJob = self.removeJob(batchSystemID)
-        jobStoreID = issuedJob.jobStoreID
-        if wallTime is not None and self.clusterScaler is not None:
-            self.clusterScaler.addCompletedJob(issuedJob, wallTime)
-        if self.toilState.job_exists(jobStoreID):
-            logger.debug("Job %s continues to exist (i.e. has more to do)", issuedJob)
+        
+        # De-issue the job.
+        issued_job = self.removeJob(batch_system_id)
+        
+        if result_status != 0:
+            # Show job as failed in progress (and take it from completed)
+            self.progress_overall.update(incr=-1)
+            self.progress_failed.update(incr=1)
+        
+        # Delegate to the vers
+        return self.process_finished_job_description(issued_job, result_status, wall_time, exit_reason, batch_system_id)
+    
+    def process_finished_job_description(self, finished_job: JobDescription, result_status: int,
+                                         wall_time: Optional[float] = None,
+                                         exit_reason: Optional[BatchJobExitReason] = None,
+                                         batch_system_id: Optional[int] = None) -> bool:
+        """
+        Takes a JobDescription and works out what to do about the fact that it
+        succeeded or failed.
+        
+        If wall-clock time is available, informs the cluster scaler about the
+        job finishing.
+        
+        If the job failed and a batch system ID is available, checks for and
+        reports batch system logs.
+        
+        Checks if it succeeded and was removed, or if it failed and needs to be
+        set up after failure, and dispatches to the appropriate function.
+
+        Return True if the job is going to run again, and False if the job is
+        fully done or completely failed.
+        """
+        job_store_id = finished_job.jobStoreID
+        if wall_time is not None and self.clusterScaler is not None:
+            # Tell the cluster scaler a job finished.
+            # TODO: Use message bus?
+            self.clusterScaler.addCompletedJob(finished_job, wall_time)
+        if self.toilState.job_exists(job_store_id):
+            logger.debug("Job %s continues to exist (i.e. has more to do)", finished_job)
             try:
                 # Reload the job as modified by the worker
-                self.toilState.reset_job(jobStoreID)
-                replacementJob = self.toilState.get_job(jobStoreID)
+                self.toilState.reset_job(job_store_id)
+                replacement_job = self.toilState.get_job(job_store_id)
             except NoSuchJobException:
-                # Avoid importing AWSJobStore as the corresponding extra might be missing
-                if self.jobStore.__class__.__name__ == 'AWSJobStore':
-                    # We have a ghost job - the job has been deleted but a stale read from
-                    # SDB gave us a false positive when we checked for its existence.
-                    # Process the job from here as any other job removed from the job store.
-                    # This is a temporary work around until https://github.com/BD2KGenomics/toil/issues/1091
-                    # is completed
-                    logger.warning('Got a stale read from SDB for job %s', issuedJob)
-                    self.processRemovedJob(issuedJob, result_status)
-                    return
-                else:
-                    raise
-            if replacementJob.logJobStoreFileID is not None:
-                with replacementJob.getLogFileHandle(self.jobStore) as logFileStream:
+                # We have a ghost job - the job has been deleted but a stale
+                # read from e.g. a non-POSIX-compliant filesystem gave us a
+                # false positive when we checked for its existence. Process the
+                # job from here as any other job removed from the job store.
+                # This is a hack until we can figure out how to actually always
+                # have a strongly-consistent communications channel. See
+                # https://github.com/BD2KGenomics/toil/issues/1091
+                logger.warning('Got a stale read for job %s; caught its '
+                'completion in time, but other jobs may try to run twice! Fix '
+                'the consistency of your job store storage!', finished_job)
+                self.processRemovedJob(finished_job, result_status)
+                return False
+            if replacement_job.logJobStoreFileID is not None:
+                with replacement_job.getLogFileHandle(self.jobStore) as log_stream:
                     # more memory efficient than read().striplines() while leaving off the
                     # trailing \n left when using readlines()
                     # http://stackoverflow.com/a/15233739
-                    StatsAndLogging.logWithFormatting(jobStoreID, logFileStream, method=logger.warning,
-                                                      message='The job seems to have left a log file, indicating failure: %s' % replacementJob)
+                    StatsAndLogging.logWithFormatting(job_store_id, log_stream, method=logger.warning,
+                                                      message='The job seems to have left a log file, indicating failure: %s' % replacement_job)
                 if self.config.writeLogs or self.config.writeLogsGzip:
-                    with replacementJob.getLogFileHandle(self.jobStore) as logFileStream:
-                        StatsAndLogging.writeLogFiles(replacementJob.chainedJobs, logFileStream, self.config, failed=True)
+                    with replacement_job.getLogFileHandle(self.jobStore) as log_stream:
+                        StatsAndLogging.writeLogFiles(replacement_job.chainedJobs, log_stream, self.config, failed=True)
             if result_status != 0:
                 # If the batch system returned a non-zero exit code then the worker
                 # is assumed not to have captured the failure of the job, so we
                 # reduce the try count here.
-                if replacementJob.logJobStoreFileID is None:
-                    logger.warning("No log file is present, despite job failing: %s", replacementJob)
+                if replacement_job.logJobStoreFileID is None:
+                    logger.warning("No log file is present, despite job failing: %s", replacement_job)
+                
+                if batch_system_id is not None:
+                    # Look for any standard output/error files created by the batch system.
+                    # They will only appear if the batch system actually supports
+                    # returning logs to the machine that submitted jobs, or if
+                    # --workDir / TOIL_WORKDIR is on a shared file system.
+                    # They live directly in the Toil work directory because that is
+                    # guaranteed to exist on the leader and workers.
+                    file_list = glob.glob(self.batchSystem.format_std_out_err_glob(batch_system_id))
+                    for log_file in file_list:
+                        try:
+                            log_stream = open(log_file, 'rb')
+                        except:
+                            logger.warning('The batch system left a file %s, but it could not be opened' % log_file)
+                        else:
+                            with log_stream:
+                                if os.path.getsize(log_file) > 0:
+                                    StatsAndLogging.logWithFormatting(job_store_id, log_stream, method=logger.warning,
+                                                                      message='The batch system left a non-empty file %s:' % log_file)
+                                    if self.config.writeLogs or self.config.writeLogsGzip:
+                                        file_root, _ = os.path.splitext(os.path.basename(log_file))
+                                        job_names = replacement_job.chainedJobs
+                                        if job_names is None:   # For jobs that fail this way, replacement_job.chainedJobs is not guaranteed to be set
+                                            job_names = [str(replacement_job)]
+                                        job_names = [j + '_' + file_root for j in job_names]
+                                        log_stream.seek(0)
+                                        StatsAndLogging.writeLogFiles(job_names, log_stream, self.config, failed=True)
+                                else:
+                                    logger.warning('The batch system left an empty file %s' % log_file)
 
-                # Look for any standard output/error files created by the batch system.
-                # They will only appear if the batch system actually supports
-                # returning logs to the machine that submitted jobs, or if
-                # --workDir / TOIL_WORKDIR is on a shared file system.
-                # They live directly in the Toil work directory because that is
-                # guaranteed to exist on the leader and workers.
-                workDir = Toil.getToilWorkDir(self.config.workDir)
-                # This must match the format in AbstractBatchSystem.formatStdOutErrPath()
-                batchSystemFilePrefix =  f'toil_{self.config.workflowID}.{batchSystemID}'
-                batchSystemFileGlob = os.path.join(workDir, batchSystemFilePrefix + '*.log')
-                batchSystemFiles = glob.glob(batchSystemFileGlob)
-                for batchSystemFile in batchSystemFiles:
-                    try:
-                        batchSystemFileStream = open(batchSystemFile, 'rb')
-                    except:
-                        logger.warning('The batch system left a file %s, but it could not be opened' % batchSystemFile)
-                    else:
-                        with batchSystemFileStream:
-                            if os.path.getsize(batchSystemFile) > 0:
-                                StatsAndLogging.logWithFormatting(jobStoreID, batchSystemFileStream, method=logger.warning,
-                                                                  message='The batch system left a non-empty file %s:' % batchSystemFile)
-                                if self.config.writeLogs or self.config.writeLogsGzip:
-                                    batchSystemFileRoot, _ = os.path.splitext(os.path.basename(batchSystemFile))
-                                    jobNames = replacementJob.chainedJobs
-                                    if jobNames is None:   # For jobs that fail this way, replacementJob.chainedJobs is not guaranteed to be set
-                                        jobNames = [str(replacementJob)]
-                                    jobNames = [jobName + '_' + batchSystemFileRoot for jobName in jobNames]
-                                    batchSystemFileStream.seek(0)
-                                    StatsAndLogging.writeLogFiles(jobNames, batchSystemFileStream, self.config, failed=True)
-                            else:
-                                logger.warning('The batch system left an empty file %s' % batchSystemFile)
+                # Tell the job to reset itself after a failure.
+                # It needs to know the failure reason if available; some are handled specially.
+                replacement_job.setupJobAfterFailure(exit_status=result_status, exit_reason=exit_reason)
+                self.toilState.commit_job(job_store_id)
 
-                replacementJob.setupJobAfterFailure(exitStatus=result_status)
-                self.toilState.commit_job(jobStoreID)
-
-                # Show job as failed in progress (and take it from completed)
-                self.progress_overall.update(incr=-1)
-                self.progress_failed.update(incr=1)
-
-            elif jobStoreID in self.toilState.hasFailedSuccessors:
+            elif job_store_id in self.toilState.hasFailedSuccessors:
                 # If the job has completed okay, we can remove it from the list of jobs with failed successors
-                self.toilState.hasFailedSuccessors.remove(jobStoreID)
+                self.toilState.hasFailedSuccessors.remove(job_store_id)
 
             # Now that we know the job is done we can add it to the list of updated jobs
-            self.toilState.bus.put(JobUpdatedMessage(replacementJob.jobStoreID, result_status))
-            logger.debug("Added job: %s to updated jobs", replacementJob)
+            self._messages.publish(JobUpdatedMessage(replacement_job.jobStoreID, result_status))
+            logger.debug("Added job: %s to updated jobs", replacement_job)
 
             # Return True if it will rerun (still has retries) and false if it
             # is completely failed.
-            return replacementJob.remainingTryCount > 0
+            return replacement_job.remainingTryCount > 0
         else:  #The job is done
-            self.processRemovedJob(issuedJob, result_status)
+            self.processRemovedJob(finished_job, result_status)
             # Being done, it won't run again.
             return False
 
@@ -1233,8 +1340,9 @@ class Leader:
 
         job_desc = self.toilState.get_job(job_id)
 
-        if self.toilMetrics:
-            self.toilMetrics.logFailedJob(job_desc)
+        # Tell everyone it failed
+
+        self._messages.publish(JobFailedMessage(job_desc.get_job_kind(), job_id))
 
         if job_id in self.toilState.service_to_client:
             # Is a service job
@@ -1310,7 +1418,7 @@ class Leader:
 
                         # If the predecessor has no remaining successors, add to list of updated jobs
                         if self.toilState.count_pending_successors(predecessor_id) == 0:
-                            self.toilState.bus.put(JobUpdatedMessage(predecessor_id, 0))
+                            self._messages.publish(JobUpdatedMessage(predecessor_id, 0))
 
             # If the job has predecessor(s)
             if job_id in self.toilState.successor_to_predecessors:
@@ -1341,14 +1449,14 @@ class Leader:
 
                 # Now we know the job is done we can add it to the list of
                 # updated job files
-                self.toilState.bus.put(JobUpdatedMessage(client_id, 0))
+                self._messages.publish(JobUpdatedMessage(client_id, 0))
             else:
                 logger.debug('Job %s is still waiting on %d services',
                              self.toilState.get_job(client_id),
                              len(self.toilState.servicesIssued[client_id]))
         elif jobStoreID not in self.toilState.successor_to_predecessors:
             #We have reach the root job
-            assert self.toilState.bus.count(JobUpdatedMessage) == 0, "Root job is done but other jobs are still updated"
+            assert self._messages.count(JobUpdatedMessage) == 0, "Root job is done but other jobs are still updated"
             assert len(self.toilState.successor_to_predecessors) == 0, \
                 ("Job {} is finished and had no predecessor, but we have other outstanding jobs "
                  "with predecessors: {}".format(jobStoreID, self.toilState.successor_to_predecessors.keys()))
@@ -1375,4 +1483,4 @@ class Leader:
                 # If the predecessor job is done and all the successors are complete
                 if self.toilState.count_pending_successors(predecessor_id) == 0:
                     # Now we know the job is done we can add it to the list of updated job files
-                    self.toilState.bus.put(JobUpdatedMessage(predecessor_id, 0))
+                    self._messages.publish(JobUpdatedMessage(predecessor_id, 0))

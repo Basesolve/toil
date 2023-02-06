@@ -28,11 +28,11 @@ pip = f'{python} -m pip'
 dependencies = ' '.join(['libffi-dev',  # For client side encryption for extras with PyNACL
                          python,
                          f'{python}-dev',
+                         'python3.7-distutils' if python == 'python3.7' else '',
                          'python3.8-distutils' if python == 'python3.8' else '',
                          'python3.9-distutils' if python == 'python3.9' else '',
-                         # 'python3.9-venv' if python == 'python3.9' else '',
+                         'python3.10-distutils' if python == 'python3.10' else '',
                          'python3-pip',
-                         'libcurl4-openssl-dev',
                          'libssl-dev',
                          'wget',
                          'curl',
@@ -40,7 +40,6 @@ dependencies = ' '.join(['libffi-dev',  # For client side encryption for extras 
                          "nodejs",  # CWL support for javascript expressions
                          'rsync',
                          'screen',
-                         'build-essential',  # We need a build environment to build Singularity 3.
                          'libarchive13',
                          'libc6',
                          'libseccomp2',
@@ -53,7 +52,15 @@ dependencies = ' '.join(['libffi-dev',  # For client side encryption for extras 
                          'cryptsetup',
                          'less',
                          'vim',
-                         'git'])
+                         'git',
+                         'docker.io',
+                         'time',
+                         # Dependencies for Mesos which the deb doesn't actually list
+                         'libsvn1',
+                         'libcurl4-nss-dev',
+                         'libapr1',
+                         # Dependencies for singularity
+                         'containernetworking-plugins'])
 
 
 def heredoc(s):
@@ -67,7 +74,7 @@ motd = heredoc('''
     Run toil <workflow>.py --help to see all options for running your workflow.
     For more information see http://toil.readthedocs.io/en/latest/
 
-    Copyright (C) 2015-2020 Regents of the University of California
+    Copyright (C) 2015-2022 Regents of the University of California
 
     Version: {applianceSelf}
 
@@ -77,39 +84,69 @@ motd = heredoc('''
 motd = ''.join(l + '\\n\\\n' for l in motd.splitlines())
 
 print(heredoc('''
-    # We can't use a newer Ubuntu until we no longer need Mesos
-    FROM ubuntu:16.04
+    FROM ubuntu:22.04
 
     ARG TARGETARCH
+
+    RUN if [ -z "$TARGETARCH" ] ; then echo "Specify a TARGETARCH argument to build this container"; exit 1; fi
 
     # make sure we don't use too new a version of setuptools (which can get out of sync with poetry and break things)
     ENV SETUPTOOLS_USE_DISTUTILS=stdlib
 
-    RUN apt-get -y update --fix-missing && apt-get -y upgrade && apt-get -y install apt-transport-https ca-certificates software-properties-common && apt-get clean && rm -rf /var/lib/apt/lists/*
+    # Try to avoid "Failed to fetch ...  Undetermined Error" from apt
+    # See <https://stackoverflow.com/a/66523384>
+    RUN printf 'Acquire::http::Pipeline-Depth "0";\\nAcquire::http::No-Cache=True;\\nAcquire::BrokenProxy=true;\\n' >/etc/apt/apt.conf.d/99fixbadproxy
 
-    RUN echo "deb http://repos.mesosphere.io/ubuntu/ xenial main" \
-        > /etc/apt/sources.list.d/mesosphere.list \
-        && apt-key adv --keyserver keyserver.ubuntu.com --recv E56151BF \
-        && echo "deb http://deb.nodesource.com/node_6.x xenial main" \
-        > /etc/apt/sources.list.d/nodesource.list \
-        && apt-key adv --keyserver keyserver.ubuntu.com --recv 68576280
+    RUN apt-get -y update --fix-missing && apt-get -y upgrade && apt-get -y install apt-transport-https ca-certificates software-properties-common curl && apt-get clean && rm -rf /var/lib/apt/lists/*
 
     RUN add-apt-repository -y ppa:deadsnakes/ppa
+
+    # Find a repo with a Mesos build.
+    # See https://rpm.aventer.biz/README.txt
+    # A working snapshot is https://ipfs.io/ipfs/QmfTy9sXhHsgyWwosCJDfYR4fChTosA8HhoaMgmeJ5LSmS/ for https://rpm.aventer.biz/Ubuntu
+    # And one that works with https://rpm.aventer.biz/Ubuntu/focal (the new URL) is at https://ipfs.io/ipfs/Qmcrmx7T1YkEnyexMXdd7QjoBZxf7DMDrQ5ErUKi9mDRw6/
+    # As archived with:
+    # mkdir mesos-repo && cd mesos-repo
+    # wget --recursive --restrict-file-names=windows -k --convert-links --no-parent --page-requisites https://rpm.aventer.biz/Ubuntu/ https://www.aventer.biz/assets/support_aventer.asc https://rpm.aventer.biz/README.txt
+    # ipfs add -r .
+    RUN echo "deb https://rpm.aventer.biz/Ubuntu/focal focal main" \
+        > /etc/apt/sources.list.d/mesos.list \
+        && curl https://www.aventer.biz/assets/support_aventer.asc | apt-key add -
 
     RUN apt-get -y update --fix-missing && \
         DEBIAN_FRONTEND=noninteractive apt-get -y upgrade && \
         DEBIAN_FRONTEND=noninteractive apt-get -y install {dependencies} && \
-        if [ $TARGETARCH = amd64 ] ; then DEBIAN_FRONTEND=noninteractive apt-get -y install mesos=1.0.1-2.0.94.ubuntu1604 ; fi && \
+        if [ $TARGETARCH = amd64 ] ; then DEBIAN_FRONTEND=noninteractive apt-get -y install mesos ; mesos-agent --help >/dev/null ; fi && \
         apt-get clean && \
         rm -rf /var/lib/apt/lists/*
-
-    # Install Singularity from a newer Debian.
-    # The dependencies it thinks it needs aren't really needed and aren't
-    # available here.
-    RUN wget https://debian.osuosl.org/debian/pool/main/s/singularity-container/$(curl -sSL 'https://debian.osuosl.org/debian/pool/main/s/singularity-container/' | grep -o "singularity-container_3[^\\"]*$(if [ $TARGETARCH = amd64 ] ; then echo amd64 ; else echo arm64 ; fi).deb" | head -n1) && \
-        (dpkg -i singularity-container_3*.deb || true) && \
-        dpkg --force-depends --configure -a && \
-        sed -i 's/containernetworking-plugins, //' /var/lib/dpkg/status && \
+    
+    # Install a particular old Debian Sid Singularity from somewhere.
+    # It's 3.10, which is new enough to use cgroups2, but it needs a newer libc
+    # than Ubuntu 20.04 ships. So we need a 22.04+ base.
+    #
+    # But 22.04 ships squashfs-tools 4.4 or 4.5 or so, which is new enough that
+    # errors encountered during extraction produce a nonzero exit code, without
+    # a special option:
+    # <https://github.com/plougher/squashfs-tools/commit/1dd7f32e79b7600d379a4f26fb8d138ebdfc70be>.
+    # If unsquashfs thinks it is root, but it can't change UIDs and GIDs freely, it
+    # will continue but fail the whole command instead of returning success. It complains:
+    #
+    # set_attributes: failed to change uid and gids on /image/rootfs/etc/gshadow, because Invalid argument
+    #
+    # But inside a Kubernetes container we can be root but not actually be
+    # allowed to set UIDs and GIDs arbitrarily. Singularity can't handle this,
+    # and can't pass the flag to ignore these errors, and we can't wrap
+    # unsquashfs with a shell script because of how it gets mounted into the
+    # container under construction along with its libraries (see
+    # <https://github.com/apptainer/singularity/issues/6113#issuecomment-901897566>).
+    #
+    # So we need to make sure to install a downgraded squashfs first.
+    ADD extra-debs.tsv /etc/singularity/extra-debs.tsv
+    RUN wget -q "$(cat /etc/singularity/extra-debs.tsv | grep "^squashfs-tools.$TARGETARCH" | cut -f4)" && \
+        dpkg -i squashfs-tools_*.deb && \
+        wget -q "$(cat /etc/singularity/extra-debs.tsv | grep "^singularity-container.$TARGETARCH" | cut -f4)" && \
+        dpkg -i singularity-container_*.deb && \
+        rm singularity-container_*.deb && \
         sed -i 's!bind path = /etc/localtime!#bind path = /etc/localtime!g' /etc/singularity/singularity.conf && \
         mkdir -p /usr/local/libexec/toil && \
         mv /usr/bin/singularity /usr/local/libexec/toil/singularity-real \
@@ -122,15 +159,14 @@ print(heredoc('''
 
     ADD customDockerInit.sh /usr/bin/customDockerInit.sh
 
-    ADD singularity-wrapper.sh /usr/local/bin/singularity
+    # Wrap Singularity to use a Docker mirror instead of always Docker Hub
+    # We need to put it where the installed singularity expects singularity to actually be.
+    ADD singularity-wrapper.sh /usr/bin/singularity
 
-    RUN chmod 777 /usr/bin/waitForKey.sh && chmod 777 /usr/bin/customDockerInit.sh && chmod 777 /usr/local/bin/singularity
-
-    # fixes an incompatibility updating pip on Ubuntu 16 w/ python3.8
-    RUN sed -i "s/platform.linux_distribution()/('Ubuntu', '16.04', 'xenial')/g" /usr/lib/python3/dist-packages/pip/download.py
+    RUN chmod 777 /usr/bin/waitForKey.sh && chmod 777 /usr/bin/customDockerInit.sh && chmod 777 /usr/bin/singularity
 
     # The stock pip is too old and can't install from sdist with extras
-    RUN {pip} install --upgrade pip==21.3.1
+    RUN curl -sS https://bootstrap.pypa.io/get-pip.py | {python}
 
     # Default setuptools is too old
     RUN {pip} install --upgrade setuptools==59.7.0
@@ -142,15 +178,6 @@ print(heredoc('''
     RUN virtualenv --python {python} --never-download /home/s3am \
         && /home/s3am/bin/pip install s3am==2.0 \
         && ln -s /home/s3am/bin/s3am /usr/local/bin/
-
-    # Install statically linked version of docker client
-    RUN curl https://download.docker.com/linux/static/stable/$(if [ $TARGETARCH = amd64 ] ; then echo x86_64 ; else echo aarch64 ; fi)/docker-18.06.1-ce.tgz \
-        | tar -xvzf - --transform='s,[^/]*/,,g' -C /usr/local/bin/ \
-        && chmod u+x /usr/local/bin/docker \
-        && /usr/local/bin/docker -v
-
-    # Fix for Mesos interface dependency missing on ubuntu
-    RUN {pip} install protobuf==3.0.0
 
     # Fix for https://issues.apache.org/jira/browse/MESOS-3793
     ENV MESOS_LAUNCHER=posix
@@ -173,7 +200,7 @@ print(heredoc('''
     env PATH /opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     # We want to pick the right Python when the user runs it
-    RUN rm /usr/bin/python3 && rm /usr/bin/python && \
+    RUN rm -f /usr/bin/python3 && rm -f /usr/bin/python && \
         ln -s /usr/bin/{python} /usr/bin/python3 && \
         ln -s /usr/bin/python3 /usr/bin/python
 

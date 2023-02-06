@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
+
 from gunicorn.app.base import BaseApplication  # type: ignore
 
 
@@ -35,7 +36,12 @@ class GunicornApplication(BaseApplication):  # type: ignore
         pass
 
     def load_config(self) -> None:
-        for key, value in self.options.items():
+        parser = self.cfg.parser()
+        env_args = parser.parse_args(self.cfg.get_cmd_args_from_env())
+
+        # TODO: also read from the Gunicorn config file?
+
+        for key, value in {**self.options, **vars(env_args)}.items():
             if key in self.cfg.settings and value is not None:
                 self.cfg.set(key.lower(), value)
 

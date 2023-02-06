@@ -137,11 +137,7 @@ def visit_cwl_class_and_reduce(
     return results
 
 
-# Define a recursive type to represent a directory structure.
-# The only problem is that MyPy can't yet type check recursive types like this.
-# See: https://github.com/python/mypy/issues/731
-# So we have to tell MyPy to ignore it.
-DirectoryStructure = Dict[str, Union[str, "DirectoryStructure"]]  # type: ignore
+DirectoryStructure = Dict[str, Union[str, "DirectoryStructure"]]
 
 
 def download_structure(
@@ -175,7 +171,7 @@ def download_structure(
         if isinstance(value, dict):
             # This is a subdirectory, so make it and download
             # its contents
-            logger.debug("Downloading subdirectory %s", name)
+            logger.debug("Downloading subdirectory '%s'", name)
             subdir = os.path.join(into_dir, name)
             os.mkdir(subdir)
             download_structure(file_store, index, existing, value, subdir)
@@ -183,7 +179,7 @@ def download_structure(
             # This must be a file path uploaded to Toil.
             assert isinstance(value, str)
             assert value.startswith("toilfile:")
-            logger.debug("Downloading contained file %s", name)
+            logger.debug("Downloading contained file '%s'", name)
             dest_path = os.path.join(into_dir, name)
             # So download the file into place
             file_store.readGlobalFile(

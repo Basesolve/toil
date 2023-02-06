@@ -15,15 +15,19 @@ import logging
 import math
 import os
 from argparse import ArgumentParser, _ArgumentGroup
-from pipes import quote
+from shlex import quote
+from typing import Callable, Dict, List, Optional, Set, Tuple, TypeVar, Union
+
+#=======
 import time
-from typing import Callable, Dict, List, Optional, TypeVar, Union
 import configparser
 import pandas as pd
-from toil import job
-from toil.batchSystems.abstractGridEngineBatchSystem import (
-    AbstractGridEngineBatchSystem,
-)
+from toil.batchSystems.abstractBatchSystem import InsufficientSystemResources
+#=======
+from toil.batchSystems.abstractGridEngineBatchSystem import \
+    AbstractGridEngineBatchSystem
+from toil.batchSystems.options import OptionSetter
+from toil.job import AcceleratorRequirement, Requirer
 from toil.lib.misc import CalledProcessErrorStderr, call_command
 
 logger = logging.getLogger(__name__)
@@ -95,6 +99,53 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 exit_codes.append(self._get_job_return_code(status))
             return exit_codes
 
+        # def _check_accelerator_request(self, requirer: Requirer) -> None:
+        #     _, problem = self._identify_sufficient_accelerators(requirer.accelerators, set(range(len(self.accelerator_identities))))
+        #     if problem is not None:
+        #         # We can't get the accelerators
+        #         raise InsufficientSystemResources(requirer, 'accelerators', self.accelerator_identities, details=[
+        #             f'The accelerator {problem} could not be provided.'
+        #         ])
+            
+        # def _identify_sufficient_accelerators(self, needed_accelerators: List[AcceleratorRequirement], available_accelerator_ids: Set[int]) -> Tuple[Optional[Set[int]], Optional[AcceleratorRequirement]]:
+        #     """
+        #     Given the accelerator requirements of a job, and the set of available
+        #     accelerators out of our associated collection of accelerators, find a
+        #     set of the available accelerators that satisfies the job's
+        #     requirements.
+
+        #     Returns that set and None if the set exists, or None and an unsatisfied
+        #     AcceleratorRequirement if it does not.
+
+        #     TODO: Uses a simple greedy algorithm and not a smart matching
+        #     algorithm, so if the job requires different kinds of accelerators, and
+        #     some accelerators available can match multiple requirements, then it is
+        #     possible that a solution will not be found.
+        #     """
+        #     accelerators_needed: Set[int] = set()
+        #     accelerators_still_available = set(available_accelerator_ids)
+        #     for requirement in needed_accelerators:
+        #         for i in range(requirement['count']):
+        #             # For each individual accelerator we need
+        #             satisfied = False
+        #             for candidate_index in accelerators_still_available:
+        #                 # Check all the ones we haven't grabbed yet
+        #                 # TODO: We'll re-check early ones against this requirement if it has a count of more than one.
+        #                 candidate = self.accelerator_identities[candidate_index]
+        #                 if AcceleratorRequirement.satisfies(candidate, requirement):
+        #                     # If this accelerator can satisfy one unit of this requirement
+        #                     # Say we want it
+        #                     accelerators_needed.add(candidate_index)
+        #                     accelerators_still_available.remove(candidate_index)
+        #                     # And move on to the next required unit
+        #                     satisfied = True
+        #                     break
+        #             if not satisfied:
+        #                 # We can't get the resources we need to run right now.
+        #                 return None, requirement
+        #     # If we get here we satisfied everything
+        #     return accelerators_needed, None
+        
         def getJobExitCode(self, batchJobID: str) -> int:
             """
             Get job exit code for given batch job ID.
@@ -254,7 +305,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if len(job_id_parts) > 1:
                     continue
                 job_id = int(job_id_parts[0])
-                status, signal = [int(n) for n in exitcode.split(':')]
+                status, signal = (int(n) for n in exitcode.split(':'))
                 if state == 'PENDING':
                     # sacct does not report the job pending reason in realtime. but scontrol does.
                     job_details = os.popen(
@@ -357,7 +408,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 try:
                     exitcode = job['ExitCode']
                     if exitcode is not None:
-                        status, signal = [int(n) for n in exitcode.split(':')]
+                        status, signal = (int(n) for n in exitcode.split(':'))
                         if signal > 0:
                             # A non-zero signal may indicate e.g. an out-of-memory killed job
                             status = 128 + signal
@@ -455,6 +506,23 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if job_environment:
                 environment.update(job_environment)
 
+            # "Native extensions" for SLURM (see DRMAA or SAGA)
+            nativeConfig = os.getenv('TOIL_SLURM_ARGS')
+
+            # --export=[ALL,]<environment_toil_variables>
+            set_exports = "--export=ALL"
+
+            if nativeConfig is not None:
+                logger.debug("Native SLURM options appended to sbatch from TOIL_SLURM_ARGS env. variable: %s", nativeConfig)
+
+                for arg in nativeConfig.split():
+                    if arg.startswith("--mem") or arg.startswith("--cpus-per-task"):
+                        raise ValueError(f"Some resource arguments are incompatible: {nativeConfig}")
+                    # repleace default behaviour by the one stated at TOIL_SLURM_ARGS
+                    if arg.startswith("--export"):
+                        set_exports = arg
+                sbatch_line.extend(nativeConfig.split())
+
             if environment:
                 argList = []
 
@@ -462,7 +530,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     quoted_value = quote(os.environ[k] if v is None else v)
                     argList.append(f'{k}={quoted_value}')
 
-                sbatch_line.append('--export=' + ','.join(argList))
+                set_exports += ',' + ','.join(argList)
+
+            # add --export to the sbatch
+            sbatch_line.append(set_exports)
+
+            parallel_env = os.getenv('TOIL_SLURM_PE')
+            if cpu and cpu > 1 and parallel_env:
+                sbatch_line.append(f'--partition={parallel_env}')
+
             if mem is not None and self.boss.config.allocate_mem:
                 # memory passed in is in bytes, but slurm expects megabytes
                 slurm_mem = math.ceil(mem / 2 ** 20)
@@ -502,15 +578,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             stdoutfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'out')
             stderrfile: str = self.boss.formatStdOutErrPath(jobID, '%j', 'err')
             sbatch_line.extend(['-o', stdoutfile, '-e', stderrfile])
-
-            # "Native extensions" for SLURM (see DRMAA or SAGA)
-            nativeConfig = os.getenv('TOIL_SLURM_ARGS')
-            if nativeConfig is not None:
-                logger.debug("Native SLURM options appended to sbatch from TOIL_SLURM_ARGS env. variable: %s", nativeConfig)
-                if ("--mem" in nativeConfig) or ("--cpus-per-task" in nativeConfig):
-                    raise ValueError(f"Some resource arguments are incompatible: {nativeConfig}")
-
-                sbatch_line.extend(nativeConfig.split())
 
             return sbatch_line
 
@@ -609,6 +676,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
     OptionType = TypeVar('OptionType')
     @classmethod
-    def setOptions(cls, setOption: Callable[[str, Optional[Callable[[str], OptionType]], Optional[Callable[[OptionType], None]], Optional[OptionType]], None]) -> None:
+    def setOptions(cls, setOption: OptionSetter) -> None:
         setOption("allocate_mem", bool, default=False)
 

@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 
-os.environ['MYPYPATH'] = 'contrib/typeshed'
+os.environ['MYPYPATH'] = 'contrib/mypy-stubs'
 pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))  # noqa
 sys.path.insert(0, pkg_root)  # noqa
 
@@ -28,7 +28,6 @@ def main():
         'docs/vendor/sphinxcontrib/__init__.py',
         'src/toil/job.py',
         'src/toil/leader.py',
-        'src/toil/common.py',
         'src/toil/__init__.py',
         'src/toil/resource.py',
         'src/toil/deferred.py',
@@ -41,7 +40,6 @@ def main():
         'src/toil/wdl/versions/draft2.py',
         'src/toil/wdl/versions/v1.py',
         'src/toil/wdl/versions/dev.py',
-        'src/toil/provisioners/clusterScaler.py',
         'src/toil/provisioners/abstractProvisioner.py',
         'src/toil/provisioners/gceProvisioner.py',
         'src/toil/provisioners/__init__.py',
@@ -53,7 +51,6 @@ def main():
         'src/toil/batchSystems/gridengine.py',
         'src/toil/batchSystems/singleMachine.py',
         'src/toil/batchSystems/parasol.py',
-        'src/toil/batchSystems/kubernetes.py',
         'src/toil/batchSystems/torque.py',
         'src/toil/batchSystems/options.py',
         'src/toil/batchSystems/registry.py',
@@ -94,7 +91,6 @@ def main():
         'src/toil/lib/encryption/__init__.py',
         'src/toil/lib/aws/__init__.py',
         'src/toil/server/utils.py',
-        'src/toil/server/wes/tasks.py',
         'src/toil/utils/toilStats.py'
     ]]
 
@@ -102,7 +98,7 @@ def main():
     for file_path in all_files_to_check:
         if file_path not in ignore_paths and 'src/toil/test' not in file_path:
             filtered_files_to_check.append(file_path)
-    args = ['mypy', '--color-output'] + filtered_files_to_check
+    args = ['mypy', '--color-output', '--show-traceback'] + filtered_files_to_check
     p = subprocess.run(args=args)
     exit(p.returncode)
 

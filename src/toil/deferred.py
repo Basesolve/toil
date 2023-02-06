@@ -131,7 +131,7 @@ class DeferredFunctionManager:
             fcntl.lockf(self.stateFD, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as e:
             # Someone else might have locked it even though they should not have.
-            raise RuntimeError("Could not lock deferred function state file {}: {}".format(self.stateFileName, str(e)))
+            raise RuntimeError(f"Could not lock deferred function state file {self.stateFileName}: {str(e)}")
 
         # Rename it to remove the suffix
         os.rename(self.stateFileName, self.stateFileName[:-len(self.WIP_SUFFIX)])
@@ -142,7 +142,7 @@ class DeferredFunctionManager:
         self.stateFileOut = os.fdopen(self.stateFD, 'wb')
         self.stateFileIn = open(self.stateFileName, 'rb')
 
-        logger.debug("Running for file %s" % self.stateFileName)
+        logger.debug("Opened with own state file %s" % self.stateFileName)
 
     def __del__(self):
         """
@@ -150,7 +150,7 @@ class DeferredFunctionManager:
         manage have all been executed, and none are currently recorded.
         """
 
-        logger.debug("Deleting %s" % self.stateFileName)
+        logger.debug("Removing own state file %s" % self.stateFileName)
 
         # Hide the state from other processes
         if os.path.exists(self.stateFileName):
@@ -272,6 +272,7 @@ class DeferredFunctionManager:
         """
 
         logger.debug("Running orphaned deferred functions")
+        states_handled = 0
 
         # Track whether we found any work to do.
         # We will keep looping as long as there is work to do.
@@ -327,6 +328,7 @@ class DeferredFunctionManager:
                 # Actually run all the stored deferred functions
                 fileObj = os.fdopen(fd, 'rb')
                 self._runAllDeferredFunctions(fileObj)
+                states_handled += 1
 
                 try:
                     # Ok we are done with this file. Get rid of it so nobody else does it.
@@ -341,3 +343,5 @@ class DeferredFunctionManager:
                 # Now close it. This closes the backing file descriptor. See
                 # <https://stackoverflow.com/a/24984929>
                 fileObj.close()
+
+        logger.debug("Ran orphaned deferred functions from %d abandoned state files", states_handled)

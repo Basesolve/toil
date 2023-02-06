@@ -18,23 +18,24 @@ import shutil
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, _ArgumentGroup
 from contextlib import contextmanager
-from typing import (
-    Any,
-    Callable,
-    ContextManager,
-    Dict,
-    Iterator,
-    List,
-    NamedTuple,
-    Optional,
-    TypeVar,
-    Union,
-)
+from typing import (Any,
+                    Callable,
+                    ContextManager,
+                    Dict,
+                    Iterator,
+                    List,
+                    NamedTuple,
+                    Optional,
+                    TypeVar,
+                    Union,
+                    cast)
 
+from toil.batchSystems.options import OptionSetter
+from toil.bus import MessageBus, MessageOutbox
 from toil.common import Config, Toil, cacheDirName
 from toil.deferred import DeferredFunctionManager
 from toil.fileStores.abstractFileStore import AbstractFileStore
-from toil.job import JobDescription
+from toil.job import JobDescription, ParsedRequirement, Requirer
 from toil.resource import Resource
 
 logger = logging.getLogger(__name__)
@@ -42,10 +43,10 @@ logger = logging.getLogger(__name__)
 # Value to use as exitStatus in UpdatedBatchJobInfo.exitStatus when status is not available.
 EXIT_STATUS_UNAVAILABLE_VALUE = 255
 
-class BatchJobExitReason(enum.Enum):
+class BatchJobExitReason(enum.IntEnum):
     FINISHED: int = 1  # Successfully finished.
     FAILED: int = 2  # Job finished, but failed.
-    LOST: int = 3  # Preemptable failure (job's executing host went away).
+    LOST: int = 3  # Preemptible failure (job's executing host went away).
     KILLED: int = 4  # Job killed before finishing.
     ERROR: int = 5  # Internal error.
     MEMLIMIT: int = 6  # Job hit batch system imposed memory limit
@@ -64,27 +65,31 @@ class UpdatedBatchJobInfo(NamedTuple):
 
 # Information required for worker cleanup on shutdown of the batch system.
 class WorkerCleanupInfo(NamedTuple):
-    workDir: str
-    """workdir path (where the cache would go)"""
+    work_dir: Optional[str]
+    """Work directory path (where the cache would go) if specified by user"""
 
-    workflowID: str
-    """used to identify files specific to this workflow"""
+    coordination_dir: Optional[str]
+    """Coordination directory path (where lock files would go) if specified by user"""
 
-    cleanWorkDir: str
+    workflow_id: str
+    """Used to identify files specific to this workflow"""
+
+    clean_work_dir: str
+    """
+    When to clean up the work and coordination directories for a job ('always',
+    'onSuccess', 'onError', 'never')
+    """
 
 class AbstractBatchSystem(ABC):
-    """
-    An abstract (as far as Python currently allows) base class to represent the interface the batch
-    system must provide to Toil.
-    """
-
+    """An abstract base class to represent the interface the batch system must provide to Toil."""
     @classmethod
     @abstractmethod
     def supportsAutoDeployment(cls) -> bool:
         """
-        Whether this batch system supports auto-deployment of the user script itself. If it does,
-        the :meth:`.setUserScript` can be invoked to set the resource object representing the user
-        script.
+        Whether this batch system supports auto-deployment of the user script itself.
+
+        If it does, the :meth:`.setUserScript` can be invoked to set the resource
+        object representing the user script.
 
         Note to implementors: If your implementation returns True here, it should also override
         """
@@ -116,16 +121,26 @@ class AbstractBatchSystem(ABC):
         """
         raise NotImplementedError()
 
+    def set_message_bus(self, message_bus: MessageBus) -> None:
+        """
+        Give the batch system an opportunity to connect directly to the message
+        bus, so that it can send informational messages about the jobs it is
+        running to other Toil components.
+        """
+        pass
+
     @abstractmethod
     def issueBatchJob(self, jobDesc: JobDescription, job_environment: Optional[Dict[str, str]] = None) -> int:
         """
-        Issues a job with the specified command to the batch system and returns a unique jobID.
+        Issues a job with the specified command to the batch system and returns
+        a unique jobID.
 
-        :param jobDesc a toil.job.JobDescription
-        :param job_environment: a collection of job-specific environment variables
-                                to be set on the worker.
+        :param jobDesc: a toil.job.JobDescription
+        :param job_environment: a collection of job-specific environment
+                                variables to be set on the worker.
 
-        :return: a unique jobID that can be used to reference the newly issued job
+        :return: a unique jobID that can be used to reference the newly issued
+                 job
         """
         raise NotImplementedError()
 
@@ -230,9 +245,8 @@ class AbstractBatchSystem(ABC):
         If this batch system provides any command line options, add them to the given parser.
         """
 
-    OptionType = TypeVar('OptionType')
     @classmethod
-    def setOptions(cls, setOption: Callable[[str, Optional[Callable[[Any], OptionType]], Optional[Callable[[OptionType], None]], Optional[OptionType], Optional[List[str]]], None]) -> None:
+    def setOptions(cls, setOption: OptionSetter) -> None:
         """
         Process command line or configuration options relevant to this batch system.
 
@@ -240,8 +254,7 @@ class AbstractBatchSystem(ABC):
             setOption(option_name, parsing_function=None, check_function=None, default=None, env=None)
             returning nothing, used to update run configuration as a side effect.
         """
-        # TODO: change type to a Protocol to express kwarg names, or else use a
-        # different interface (generator?)
+        pass
 
     def getWorkerContexts(self) -> List[ContextManager[Any]]:
         """
@@ -286,20 +299,18 @@ class BatchSystemSupport(AbstractBatchSystem):
             raise Exception("config.workflowID must be set")
         else:
             self.workerCleanupInfo = WorkerCleanupInfo(
-                workDir=config.workDir,
-                workflowID=config.workflowID,
-                cleanWorkDir=config.cleanWorkDir,
+                work_dir=config.workDir,
+                coordination_dir=config.coordination_dir,
+                workflow_id=config.workflowID,
+                clean_work_dir=config.cleanWorkDir,
             )
+        self._outbox: Optional[MessageOutbox] = None
 
-    def checkResourceRequest(self, memory: int, cores: float, disk: int, job_name: str = '', detail: str = '') -> None:
+    def check_resource_request(self, requirer: Requirer) -> None:
         """
         Check resource request is not greater than that available or allowed.
 
-        :param int memory: amount of memory being requested, in bytes
-
-        :param float cores: number of cores being requested
-
-        :param int disk: amount of disk space being requested, in bytes
+        :param requirer: Object whose requirements are being checked
 
         :param str job_name: Name of the job being checked, for generating a useful error report.
 
@@ -308,28 +319,34 @@ class BatchSystemSupport(AbstractBatchSystem):
         :raise InsufficientSystemResources: raised when a resource is requested in an amount
                greater than allowed
         """
-        batch_system = self.__class__.__name__ or 'this batch system'
-        for resource, requested, available in [('cores', cores, self.maxCores),
-                                               ('memory', memory, self.maxMemory),
-                                               ('disk', disk, self.maxDisk)]:
-            assert requested is not None
-            if requested > available:
-                unit = 'bytes of ' if resource in ('disk', 'memory') else ''
-                R = f'The job {job_name} is r' if job_name else 'R'
-                if resource == 'disk':
-                    msg = (f'{R}equesting {requested} {unit}{resource} for temporary space, '
-                           f'more than the maximum of {available} {unit}{resource} of free space on '
-                           f'{self.config.workDir} that {batch_system} was configured with, or enforced '
-                           f'by --max{resource.capitalize()}.  Try setting/changing the toil option '
-                           f'"--workDir" or changing the base temporary directory by setting TMPDIR.')
-                else:
-                    msg = (f'{R}equesting {requested} {unit}{resource}, more than the maximum of '
-                           f'{available} {unit}{resource} that {batch_system} was configured with, '
-                           f'or enforced by --max{resource.capitalize()}.')
-                if detail:
-                    msg += detail
+        try:
+            for resource, requested, available in [('cores', requirer.cores, self.maxCores),
+                                                   ('memory', requirer.memory, self.maxMemory),
+                                                   ('disk', requirer.disk, self.maxDisk)]:
+                assert requested is not None
+                if requested > available:
+                    raise InsufficientSystemResources(requirer, resource, available)
+            # Handle accelerators in another method that can be overridden separately
+            self._check_accelerator_request(requirer)
+        except InsufficientSystemResources as e:
+            # Add more annotation info to the error
+            e.batch_system = self.__class__.__name__ or None
+            e.source = self.config.workDir if e.resource == 'disk' else None
+            raise e
 
-                raise InsufficientSystemResources(msg)
+    def _check_accelerator_request(self, requirer: Requirer) -> None:
+        """
+        Raise an InsufficientSystemResources error if the batch system can't
+        provide the accelerators that are required.
+
+        If a batch system *can* provide accelerators, it should override this
+        to say so.
+        """
+        if len(requirer.accelerators) > 0:
+            # By default we assume we can't fulfill any of these
+            raise InsufficientSystemResources(requirer, 'accelerators', [], details=[
+                'The batch system does not support any accelerators.'
+            ])
 
     def setEnv(self, name: str, value: Optional[str] = None) -> None:
         """
@@ -357,6 +374,15 @@ class BatchSystemSupport(AbstractBatchSystem):
                 raise RuntimeError(f"{name} does not exist in current environment")
         self.environment[name] = value
 
+    def set_message_bus(self, message_bus: MessageBus) -> None:
+        """
+        Give the batch system an opportunity to connect directly to the message
+        bus, so that it can send informational messages about the jobs it is
+        running to other Toil components.
+        """
+        # We do in fact send messages to the message bus.
+        self._outbox = message_bus.outbox()
+
     def formatStdOutErrPath(self, toil_job_id: int, cluster_job_id: str, std: str) -> str:
         """
         Format path for batch system standard output/error and other files
@@ -379,7 +405,15 @@ class BatchSystemSupport(AbstractBatchSystem):
         fileName: str = f'toil_{self.config.workflowID}.{toil_job_id}.{cluster_job_id}.{std}.log'
         workDir: str = Toil.getToilWorkDir(self.config.workDir)
         return os.path.join(workDir, fileName)
-
+    
+    def format_std_out_err_glob(self, toil_job_id: int) -> str:
+        """
+        Get a glob string that will match all file paths generated by formatStdOutErrPath for a job.
+        """
+        file_glob: str = f'toil_{self.config.workflowID}.{toil_job_id}.*.log'
+        work_dir: str = Toil.getToilWorkDir(self.config.workDir)
+        return os.path.join(work_dir, file_glob)
+        
     @staticmethod
     def workerCleanup(info: WorkerCleanupInfo) -> None:
         """
@@ -389,14 +423,18 @@ class BatchSystemSupport(AbstractBatchSystem):
                for cleaning up the worker.
         """
         assert isinstance(info, WorkerCleanupInfo)
-        workflowDir = Toil.getLocalWorkflowDir(info.workflowID, info.workDir)
-        DeferredFunctionManager.cleanupWorker(workflowDir)
+        assert info.workflow_id is not None
+        workflowDir = Toil.getLocalWorkflowDir(info.workflow_id, info.work_dir)
+        coordination_dir = Toil.get_local_workflow_coordination_dir(info.workflow_id, info.work_dir, info.coordination_dir)
+        DeferredFunctionManager.cleanupWorker(coordination_dir)
         workflowDirContents = os.listdir(workflowDir)
-        AbstractFileStore.shutdownFileStore(workflowDir, info.workflowID)
-        if (info.cleanWorkDir == 'always'
-            or info.cleanWorkDir in ('onSuccess', 'onError')
-            and workflowDirContents in ([], [cacheDirName(info.workflowID)])):
-            shutil.rmtree(workflowDir, ignore_errors=True)
+        AbstractFileStore.shutdownFileStore(info.workflow_id, info.work_dir, info.coordination_dir)
+        if info.clean_work_dir in ('always', 'onSuccess', 'onError'):
+            if workflowDirContents in ([], [cacheDirName(info.workflow_id)]):
+                shutil.rmtree(workflowDir, ignore_errors=True)
+            if coordination_dir != workflowDir:
+                # No more coordination to do here either.
+                shutil.rmtree(coordination_dir, ignore_errors=True)
 
 class NodeInfo:
     """
@@ -438,12 +476,12 @@ class AbstractScalableBatchSystem(AbstractBatchSystem):
     """
 
     @abstractmethod
-    def getNodes(self, preemptable: Optional[bool] = None) -> Dict[str, NodeInfo]:
+    def getNodes(self, preemptible: Optional[bool] = None, timeout: int = 600) -> Dict[str, NodeInfo]:
         """
-        Returns a dictionary mapping node identifiers of preemptable or non-preemptable nodes to
+        Returns a dictionary mapping node identifiers of preemptible or non-preemptible nodes to
         NodeInfo objects, one for each node.
 
-        :param preemptable: If True (False) only (non-)preemptable nodes will be returned.
+        :param preemptible: If True (False) only (non-)preemptible nodes will be returned.
                If None, all nodes will be returned.
         """
         raise NotImplementedError()
@@ -457,25 +495,6 @@ class AbstractScalableBatchSystem(AbstractBatchSystem):
         :param nodeIP: The worker nodes private IP address
 
         :return: True if the worker node has been issued any tasks, else False
-        """
-        raise NotImplementedError()
-
-    # TODO: May be unused!
-    @abstractmethod
-    @contextmanager
-    def nodeFiltering(self, filter: Optional[Callable[[NodeInfo], bool]]) -> Iterator[None]:
-        """
-        Used to prevent races in autoscaling where
-        1) nodes have reported to the autoscaler as having no jobs
-        2) scaler decides to terminate these nodes. In parallel the batch system assigns jobs to the same nodes
-        3) scaler terminates nodes, resulting in job failures for all jobs on that node.
-
-        Call this method prior to node termination to ensure that nodes being considered for termination are not
-        assigned new jobs. Call the method again passing None as the filter to disable the filtering
-        after node termination is done.
-
-        :param method: This will be used as a filter on nodes considered when assigning new jobs.
-            After this context manager exits the filter should be removed
         """
         raise NotImplementedError()
 
@@ -502,4 +521,61 @@ class AbstractScalableBatchSystem(AbstractBatchSystem):
 
 
 class InsufficientSystemResources(Exception):
-    pass
+    def __init__(self, requirer: Requirer, resource: str, available: Optional[ParsedRequirement] = None, batch_system: Optional[str] = None, source: Optional[str] = None, details: List[str] = []) -> None:
+        """
+        Make a new exception about how we couldn't get enough of something.
+
+        :param requirer: What needed the resources. May have a .jobName string.
+        :param resource: The kind of resource requested (cores, memory, disk, accelerators).
+        :param requested: The amount requested.
+        :param available: The amount actually available.
+        :param batch_system: The batch system that could not provide the resource.
+        :param source: The place where the resource was to be gotten from. For disk, should be a path.
+        :param details: Any extra details about the problem that can be attached to the error.
+        """
+
+        self.job_name : Optional[str] = None
+        if hasattr(requirer, 'jobName') and isinstance(getattr(requirer, 'jobName'), str):
+            # Keep the job name if any
+            self.job_name = cast(str, getattr(requirer, 'jobName'))
+
+        self.resource = resource
+        self.requested = cast(ParsedRequirement, getattr(requirer, resource))
+        self.available = available
+        self.batch_system = batch_system
+        self.source = source
+        self.details = details
+
+    def __str__(self) -> str:
+        """
+        Explain the exception.
+        """
+
+        unit = 'bytes of ' if self.resource in ('disk', 'memory') else ''
+        purpose = ' for temporary space' if self.resource == 'disk' else ''
+        qualifier = ' free on {self.source}' if self.resource == 'disk' and self.source is not None else ''
+
+        msg = []
+        if self.job_name is not None:
+            msg.append(f'The job {self.job_name} is requesting ')
+        else:
+            msg.append(f'Requesting ')
+        msg.append(f'{self.requested} {unit}{self.resource}')
+        msg.append(purpose)
+        if self.available is not None:
+            msg.append(f', more than the maximum of {self.available} {unit}{self.resource}{qualifier} that {self.batch_system or "this batch system"} was configured with')
+            if self.resource in ('cores', 'memory', 'disk'):
+                msg.append(f', or enforced by --max{self.resource.capitalize()}')
+        else:
+            msg.append(', but that is not available')
+        msg.append('.')
+
+        if self.resource == 'disk':
+            msg.append(' Try setting/changing the toil option "--workDir" or changing the base temporary directory by setting TMPDIR.')
+
+        for detail in self.details:
+            msg.append(' ')
+            msg.append(detail)
+
+        return ''.join(msg)
+

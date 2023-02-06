@@ -20,6 +20,8 @@ import uuid
 from contextlib import contextmanager
 from functools import wraps
 from io import BytesIO
+from typing import List
+from urllib.parse import ParseResult
 
 from google.api_core.exceptions import (GoogleAPICallError,
                                         InternalServerError,
@@ -85,7 +87,7 @@ def google_retry(f):
 class GoogleJobStore(AbstractJobStore):
 
     nodeServiceAccountJson = '/root/service_account.json'
-    def __init__(self, locator):
+    def __init__(self, locator: str) -> None:
         super().__init__(locator)
 
         try:
@@ -158,12 +160,12 @@ class GoogleJobStore(AbstractJobStore):
         except exceptions.NotFound:
             # just return if not connect to physical storage. Needed for idempotency
             return
-        
+
         try:
             self.bucket.delete(force=True)
             # throws ValueError if bucket has more than 256 objects. Then we must delete manually
         except ValueError:
-            # use google batching to delete. Improved efficiency compared to deleting sequentially 
+            # use google batching to delete. Improved efficiency compared to deleting sequentially
             blobs_to_delete = self.bucket.list_blobs()
             count = 0
             while count < len(blobs_to_delete):
@@ -376,12 +378,23 @@ class GoogleJobStore(AbstractJobStore):
         blob = cls._get_blob_from_url(url)
         blob.upload_from_file(readable)
 
+    @classmethod
+    def _list_url(cls, url: ParseResult) -> List[str]:
+        raise NotImplementedError("Listing files in Google buckets is not yet implemented!")
+
+    @classmethod
+    def _get_is_directory(cls, url: ParseResult) -> bool:
+        raise NotImplementedError("Checking directory status in Google buckets is not yet implemented!")
+
     @google_retry
     def write_logs(self, msg: bytes) -> None:
         statsID = self.statsBaseID + str(uuid.uuid4())
         log.debug("Writing stats file: %s", statsID)
         with self._upload_stream(statsID, encrypt=False, update=False) as f:
-            f.write(msg)
+            if isinstance(msg, str):
+                f.write(msg.encode("utf-8"))
+            else:
+                f.write(msg)
 
     @google_retry
     def read_logs(self, callback, read_all=False):
@@ -505,7 +518,10 @@ class GoogleJobStore(AbstractJobStore):
             def readFrom(self, readable):
                 if not update:
                     assert not blob.exists()
-                blob.upload_from_file(readable)
+                if readable.seekable():
+                    blob.upload_from_file(readable)
+                else:
+                    blob.upload_from_string(readable.read())
 
         with UploadPipe(encoding=encoding, errors=errors) as writable:
             yield writable

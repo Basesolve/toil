@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from abc import ABCMeta, abstractmethod
 from fractions import Fraction
@@ -31,24 +32,24 @@ from toil.batchSystems.abstractBatchSystem import (AbstractBatchSystem,
 # protected by annotations.
 from toil.batchSystems.mesos.test import MesosTestSupport
 from toil.batchSystems.parasol import ParasolBatchSystem
-from toil.batchSystems.registry import (
-    BATCH_SYSTEM_FACTORY_REGISTRY,
-    BATCH_SYSTEMS,
-    addBatchSystemFactory,
-    restore_batch_system_plugin_state,
-    save_batch_system_plugin_state,
-)
+from toil.batchSystems.registry import (BATCH_SYSTEM_FACTORY_REGISTRY,
+                                        BATCH_SYSTEMS,
+                                        addBatchSystemFactory,
+                                        restore_batch_system_plugin_state,
+                                        save_batch_system_plugin_state)
 from toil.batchSystems.singleMachine import SingleMachineBatchSystem
 from toil.common import Config, Toil
-from toil.job import Job, JobDescription
+from toil.job import Job, JobDescription, Requirer
 from toil.lib.retry import retry_flaky_test
 from toil.lib.threading import cpu_count
 from toil.test import (ToilTest,
+                       needs_aws_batch,
                        needs_aws_s3,
                        needs_fetchable_appliance,
                        needs_gridengine,
                        needs_htcondor,
                        needs_kubernetes,
+                       needs_kubernetes_installed,
                        needs_lsf,
                        needs_mesos,
                        needs_parasol,
@@ -65,9 +66,11 @@ logger = logging.getLogger(__name__)
 
 numCores = 2
 
-preemptable = False
+preemptible = False
 
-defaultRequirements = dict(memory=int(100e6), cores=1, disk=1000, preemptable=preemptable)
+# Since we aren't always attaching the config to the jobs for these tests, we
+# need to use fully specified requirements.
+defaultRequirements = dict(memory=int(100e6), cores=1, disk=1000, preemptible=preemptible, accelerators=[])
 
 class BatchSystemPluginTest(ToilTest):
     """
@@ -161,18 +164,25 @@ class hidden:
 
         @classmethod
         def setUpClass(cls):
-            super(hidden.AbstractBatchSystemTest, cls).setUpClass()
+            super().setUpClass()
             logging.basicConfig(level=logging.DEBUG)
 
         def setUp(self):
-            super(hidden.AbstractBatchSystemTest, self).setUp()
+            super().setUp()
             self.config = self._createConfig()
             self.batchSystem = self.createBatchSystem()
             self.tempDir = self._createTempDir('testFiles')
 
         def tearDown(self):
             self.batchSystem.shutdown()
-            super(hidden.AbstractBatchSystemTest, self).tearDown()
+            super().tearDown()
+
+        def get_max_startup_seconds(self) -> int:
+            """
+            Get the number of seconds this test ought to wait for the first job to run.
+            Some batch systems may need time to scale up.
+            """
+            return 120
 
         def test_available_cores(self):
             self.assertTrue(cpu_count() >= numCores)
@@ -199,7 +209,7 @@ class hidden:
             # getUpdatedBatchJob, and the sleep time is longer than the time we
             # should spend waiting for both to start, so if our cluster can
             # only run one job at a time, we will fail the test.
-            runningJobIDs = self._waitForJobsToStart(2, tries=120)
+            runningJobIDs = self._waitForJobsToStart(2, tries=self.get_max_startup_seconds())
             self.assertEqual(set(runningJobIDs), {job1, job2})
 
             # Killing the jobs instead of allowing them to complete means this test can run very
@@ -290,20 +300,36 @@ class hidden:
 
         def testCheckResourceRequest(self):
             if isinstance(self.batchSystem, BatchSystemSupport):
-                checkResourceRequest = self.batchSystem.checkResourceRequest
-                self.assertRaises(InsufficientSystemResources, checkResourceRequest,
-                                  memory=1000, cores=200, disk=1e9)
-                self.assertRaises(InsufficientSystemResources, checkResourceRequest,
-                                  memory=5, cores=200, disk=1e9)
-                self.assertRaises(InsufficientSystemResources, checkResourceRequest,
-                                  memory=1001e9, cores=1, disk=1e9)
-                self.assertRaises(InsufficientSystemResources, checkResourceRequest,
-                                  memory=5, cores=1, disk=2e9)
-                self.assertRaises(AssertionError, checkResourceRequest,
-                                  memory=None, cores=1, disk=1000)
-                self.assertRaises(AssertionError, checkResourceRequest,
-                                  memory=10, cores=None, disk=1000)
-                checkResourceRequest(memory=10, cores=1, disk=100)
+                check_resource_request = self.batchSystem.check_resource_request
+                # Assuming we have <2000 cores, this should be too many cores
+                self.assertRaises(InsufficientSystemResources, check_resource_request,
+                                  Requirer(dict(memory=1000, cores=2000, disk='1G', accelerators=[])))
+                self.assertRaises(InsufficientSystemResources, check_resource_request,
+                                  Requirer(dict(memory=5, cores=2000, disk='1G', accelerators=[])))
+
+                # This should be too much memory
+                self.assertRaises(InsufficientSystemResources, check_resource_request,
+                                  Requirer(dict(memory='5000G', cores=1, disk='1G', accelerators=[])))
+
+                # This should be too much disk
+                self.assertRaises(InsufficientSystemResources, check_resource_request,
+                                  Requirer(dict(memory=5, cores=1, disk='2G', accelerators=[])))
+
+                # This should be an accelerator we don't have.
+                # All the batch systems need code to know they don't have these accelerators.
+                self.assertRaises(InsufficientSystemResources, check_resource_request,
+                                  Requirer(dict(memory=5, cores=1, disk=100, accelerators=[{'kind': 'turbo-encabulator', 'count': 1}])))
+
+                # These should be missing attributes
+                self.assertRaises(AttributeError, check_resource_request,
+                                  Requirer(dict(memory=5, cores=1, disk=1000)))
+                self.assertRaises(AttributeError, check_resource_request,
+                                  Requirer(dict(cores=1, disk=1000, accelerators=[])))
+                self.assertRaises(AttributeError, check_resource_request,
+                                  Requirer(dict(memory=10, disk=1000, accelerators=[])))
+
+                # This should actually work
+                check_resource_request(Requirer(dict(memory=10, cores=1, disk=100, accelerators=[])))
 
         def testScalableBatchSystem(self):
             # If instance of scalable batch system
@@ -369,10 +395,10 @@ class hidden:
 
         def setUp(self):
             self.batchSystemName = self.getBatchSystemName()
-            super(hidden.AbstractBatchSystemJobTest, self).setUp()
+            super().setUp()
 
         def tearDown(self):
-            super(hidden.AbstractBatchSystemJobTest, self).tearDown()
+            super().tearDown()
 
         @slow
         def testJobConcurrency(self):
@@ -426,7 +452,8 @@ class hidden:
         """
 
         def _createConfig(self):
-            config = super(hidden.AbstractGridEngineBatchSystemTest, self)._createConfig()
+            config = super()._createConfig()
+            config.statePollingWait = 0.5  # Reduce polling wait so tests run faster
             # can't use _getTestJobStorePath since that method removes the directory
             config.jobStore = 'file:' + self._createTempDir('jobStore')
             return config
@@ -448,6 +475,106 @@ class KubernetesBatchSystemTest(hidden.AbstractBatchSystemTest):
         return KubernetesBatchSystem(config=self.config,
                                      maxCores=numCores, maxMemory=1e9, maxDisk=2001)
 
+@needs_kubernetes_installed
+class KubernetesBatchSystemBenchTest(ToilTest):
+    """
+    Kubernetes batch system unit tests that don't need to actually talk to a cluster.
+    """
+
+    def test_preemptability_constraints(self):
+        """
+        Make sure we generate the right preemptability constraints.
+        """
+
+        # Make sure we can print diffs of these long strings
+        self.maxDiff = 10000
+
+        from kubernetes.client import V1PodSpec
+
+        from toil.batchSystems.kubernetes import KubernetesBatchSystem
+
+        normal_spec = V1PodSpec(containers=[])
+        constraints = KubernetesBatchSystem.Placement()
+        constraints.set_preemptible(False)
+        constraints.apply(normal_spec)
+        self.assertEqual(textwrap.dedent("""
+        {'node_affinity': {'preferred_during_scheduling_ignored_during_execution': None,
+                           'required_during_scheduling_ignored_during_execution': {'node_selector_terms': [{'match_expressions': [{'key': 'eks.amazonaws.com/capacityType',
+                                                                                                                                   'operator': 'NotIn',
+                                                                                                                                   'values': ['SPOT']},
+                                                                                                                                  {'key': 'cloud.google.com/gke-preemptible',
+                                                                                                                                   'operator': 'NotIn',
+                                                                                                                                   'values': ['true']}],
+                                                                                                            'match_fields': None}]}},
+         'pod_affinity': None,
+         'pod_anti_affinity': None}
+        """).strip(), str(normal_spec.affinity))
+        self.assertEqual(str(normal_spec.tolerations), "None")
+
+        spot_spec = V1PodSpec(containers=[])
+        constraints = KubernetesBatchSystem.Placement()
+        constraints.set_preemptible(True)
+        constraints.apply(spot_spec)
+        self.assertEqual(textwrap.dedent("""
+        {'node_affinity': {'preferred_during_scheduling_ignored_during_execution': [{'preference': {'match_expressions': [{'key': 'eks.amazonaws.com/capacityType',
+                                                                                                                           'operator': 'In',
+                                                                                                                           'values': ['SPOT']}],
+                                                                                                    'match_fields': None},
+                                                                                     'weight': 1},
+                                                                                    {'preference': {'match_expressions': [{'key': 'cloud.google.com/gke-preemptible',
+                                                                                                                           'operator': 'In',
+                                                                                                                           'values': ['true']}],
+                                                                                                    'match_fields': None},
+                                                                                     'weight': 1}],
+                           'required_during_scheduling_ignored_during_execution': None},
+         'pod_affinity': None,
+         'pod_anti_affinity': None}
+        """).strip(), str(spot_spec.affinity), )
+        self.assertEqual(textwrap.dedent("""
+        [{'effect': None,
+         'key': 'cloud.google.com/gke-preemptible',
+         'operator': None,
+         'toleration_seconds': None,
+         'value': 'true'}]
+        """).strip(), str(spot_spec.tolerations))
+        
+    def test_label_constraints(self):
+        """
+        Make sure we generate the right preemptability constraints.
+        """
+
+        # Make sure we can print diffs of these long strings
+        self.maxDiff = 10000
+
+        from kubernetes.client import V1PodSpec
+
+        from toil.batchSystems.kubernetes import KubernetesBatchSystem
+
+        spec = V1PodSpec(containers=[])
+        constraints = KubernetesBatchSystem.Placement()
+        constraints.required_labels = [('GottaBeSetTo', ['This'])]
+        constraints.desired_labels = [('OutghtToBeSetTo', ['That'])]
+        constraints.prohibited_labels = [('CannotBe', ['ABadThing'])]
+        constraints.apply(spec)
+        self.assertEqual(textwrap.dedent("""
+        {'node_affinity': {'preferred_during_scheduling_ignored_during_execution': [{'preference': {'match_expressions': [{'key': 'OutghtToBeSetTo',
+                                                                                                                           'operator': 'In',
+                                                                                                                           'values': ['That']}],
+                                                                                                    'match_fields': None},
+                                                                                     'weight': 1}],
+                           'required_during_scheduling_ignored_during_execution': {'node_selector_terms': [{'match_expressions': [{'key': 'GottaBeSetTo',
+                                                                                                                                   'operator': 'In',
+                                                                                                                                   'values': ['This']},
+                                                                                                                                  {'key': 'CannotBe',
+                                                                                                                                   'operator': 'NotIn',
+                                                                                                                                   'values': ['ABadThing']}],
+                                                                                                            'match_fields': None}]}},
+         'pod_affinity': None,
+         'pod_anti_affinity': None}
+        """).strip(), str(spec.affinity),)
+        self.assertEqual(str(spec.tolerations), "None")
+
+
 @needs_tes
 @needs_fetchable_appliance
 class TESBatchSystemTest(hidden.AbstractBatchSystemTest):
@@ -465,6 +592,24 @@ class TESBatchSystemTest(hidden.AbstractBatchSystemTest):
         return TESBatchSystem(config=self.config,
                               maxCores=numCores, maxMemory=1e9, maxDisk=2001)
 
+@needs_aws_batch
+@needs_fetchable_appliance
+class AWSBatchBatchSystemTest(hidden.AbstractBatchSystemTest):
+    """
+    Tests against the AWS Batch batch system
+    """
+
+    def supportsWallTime(self):
+        return True
+
+    def createBatchSystem(self):
+        from toil.batchSystems.awsBatch import AWSBatchBatchSystem
+        return AWSBatchBatchSystem(config=self.config,
+                                   maxCores=numCores, maxMemory=1e9, maxDisk=2001)
+
+    def get_max_startup_seconds(self) -> int:
+        # AWS Batch may need to scale out the compute environment.
+        return 300
 
 @slow
 @needs_mesos
@@ -693,7 +838,7 @@ class MaxCoresSingleMachineBatchSystemTest(ToilTest):
                         if value > maxValue: maxValue = value
                         os.lseek(fd, 0, 0)
                         os.ftruncate(fd, 0)
-                        os.write(fd, f'{value},{maxValue}'.encode('utf-8'))
+                        os.write(fd, f'{value},{maxValue}'.encode())
                     finally:
                         fcntl.flock(fd, fcntl.LOCK_UN)
                 finally:
@@ -747,7 +892,8 @@ class MaxCoresSingleMachineBatchSystemTest(ToilTest):
                                                                            requirements=dict(
                                                                                cores=float(coresPerJob),
                                                                                memory=1, disk=1,
-                                                                               preemptable=preemptable),
+                                                                               accelerators=[],
+                                                                               preemptible=preemptible),
                                                                            jobName=str(i), unitName='')))
                             self.assertEqual(len(jobIds), jobs)
                             while jobIds:
@@ -761,9 +907,9 @@ class MaxCoresSingleMachineBatchSystemTest(ToilTest):
                             bs.shutdown()
                         concurrentTasks, maxConcurrentTasks = getCounters(self.counterPath)
                         self.assertEqual(concurrentTasks, 0)
-                        logger.info('maxCores: {maxCores}, '
-                                 'coresPerJob: {coresPerJob}, '
-                                 'load: {load}'.format(**locals()))
+                        logger.info(f'maxCores: {maxCores}, '
+                                 f'coresPerJob: {coresPerJob}, '
+                                 f'load: {load}')
                         # This is the key assertion:
                         expectedMaxConcurrentTasks = min(maxCores // coresPerJob, jobs)
                         self.assertEqual(maxConcurrentTasks, expectedMaxConcurrentTasks)
@@ -851,13 +997,15 @@ class ParasolBatchSystemTest(hidden.AbstractBatchSystemTest, ParasolTestSupport)
     def testBatchResourceLimits(self):
         jobDesc1 = JobDescription(command="sleep 1000",
                                   requirements=dict(memory=1 << 30, cores=1,
-                                                    disk=1000, preemptable=preemptable),
+                                                    disk=1000, accelerators=[],
+                                                    preemptible=preemptible),
                                   jobName='testResourceLimits')
         job1 = self.batchSystem.issueBatchJob(jobDesc1)
         self.assertIsNotNone(job1)
         jobDesc2 = JobDescription(command="sleep 1000",
                                   requirements=dict(memory=2 << 30, cores=1,
-                                                    disk=1000, preemptable=preemptable),
+                                                    disk=1000, accelerators=[],
+                                                    preemptible=preemptible),
                                   jobName='testResourceLimits')
         job2 = self.batchSystem.issueBatchJob(jobDesc2)
         self.assertIsNotNone(job2)
@@ -1040,7 +1188,7 @@ class SingleMachineBatchSystemJobTest(hidden.AbstractBatchSystemJobTest):
     def testNestedResourcesDoNotBlock(self):
         """
         Resources are requested in the order Memory > Cpu > Disk.
-        Test that inavailability of cpus for one job that is scheduled does not block another job
+        Test that unavailability of cpus for one job that is scheduled does not block another job
         that can run.
         """
         tempDir = self._createTempDir('testFiles')
@@ -1105,7 +1253,7 @@ class SingleMachineBatchSystemJobTest(hidden.AbstractBatchSystemJobTest):
             outString = oFH.read()
         # The ordering of b, fJ and sJ is non-deterministic since they are scheduled at the same
         # time. We look for all possible permutations.
-        possibleStarts = tuple([''.join(x) for x in itertools.permutations(['b', 'fJ', 'sJ'])])
+        possibleStarts = tuple(''.join(x) for x in itertools.permutations(['b', 'fJ', 'sJ']))
         assert outString.startswith(possibleStarts)
         assert outString.endswith('sJCsJGCfJC')
 
@@ -1142,7 +1290,7 @@ class MesosBatchSystemJobTest(hidden.AbstractBatchSystemJobTest, MesosTestSuppor
         self._stopMesos()
 
 
-def measureConcurrency(filepath, sleep_time=3):
+def measureConcurrency(filepath, sleep_time=10):
     """
     Run in parallel to determine the number of concurrent tasks.
     This code was copied from toil.batchSystemTestMaxCoresSingleMachineBatchSystemTest
@@ -1172,12 +1320,12 @@ def count(delta, file_path):
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             s = os.read(fd, 10)
-            value, maxValue = [int(i) for i in s.decode('utf-8').split(',')]
+            value, maxValue = (int(i) for i in s.decode('utf-8').split(','))
             value += delta
             if value > maxValue: maxValue = value
             os.lseek(fd, 0, 0)
             os.ftruncate(fd, 0)
-            os.write(fd, f'{value},{maxValue}'.encode('utf-8'))
+            os.write(fd, f'{value},{maxValue}'.encode())
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
@@ -1187,7 +1335,7 @@ def count(delta, file_path):
 
 def getCounters(path):
     with open(path, 'r+') as f:
-        concurrentTasks, maxConcurrentTasks = [int(i) for i in f.read().split(',')]
+        concurrentTasks, maxConcurrentTasks = (int(i) for i in f.read().split(','))
     return concurrentTasks, maxConcurrentTasks
 
 

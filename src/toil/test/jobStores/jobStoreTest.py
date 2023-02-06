@@ -40,8 +40,9 @@ from toil.job import Job, JobDescription, TemporaryID
 from toil.jobStores.abstractJobStore import (NoSuchFileException,
                                              NoSuchJobException)
 from toil.jobStores.fileJobStore import FileJobStore
-from toil.lib.aws.utils import create_s3_bucket
+from toil.lib.aws.utils import create_s3_bucket, get_object_for_url
 from toil.lib.memoize import memoize
+from toil.lib.retry import retry
 from toil.statsAndLogging import StatsAndLogging
 from toil.test import (ToilTest,
                        make_tests,
@@ -80,7 +81,7 @@ class AbstractJobStoreTest:
     class Test(ToilTest, metaclass=ABCMeta):
         @classmethod
         def setUpClass(cls):
-            super(AbstractJobStoreTest.Test, cls).setUpClass()
+            super().setUpClass()
             logging.basicConfig(level=logging.DEBUG)
             logging.getLogger('boto').setLevel(logging.CRITICAL)
             logging.getLogger('boto').setLevel(logging.WARNING)
@@ -98,7 +99,7 @@ class AbstractJobStoreTest:
         @classmethod
         @memoize
         def __new__(cls, *args):
-            return super(AbstractJobStoreTest.Test, cls).__new__(cls)
+            return super().__new__(cls)
 
         def _createConfig(self):
             return Config()
@@ -111,7 +112,7 @@ class AbstractJobStoreTest:
             raise NotImplementedError()
 
         def setUp(self):
-            super(AbstractJobStoreTest.Test, self).setUp()
+            super().setUp()
             self.namePrefix = 'jobstore-test-' + str(uuid.uuid4())
             self.config = self._createConfig()
 
@@ -126,20 +127,20 @@ class AbstractJobStoreTest:
             self.jobstore_resumed_noconfig.resume()
 
             # Requirements for jobs to be created.
-            self.arbitraryRequirements = {'memory': 1, 'disk': 2, 'cores': 1, 'preemptable': False}
+            self.arbitraryRequirements = {'memory': 1, 'disk': 2, 'cores': 1, 'preemptible': False}
             # Function to make an arbitrary new job
             self.arbitraryJob = lambda: JobDescription(command='command',
                                                        jobName='arbitrary',
                                                        requirements=self.arbitraryRequirements)
 
-            self.parentJobReqs = dict(memory=12, cores=34, disk=35, preemptable=True)
-            self.childJobReqs1 = dict(memory=23, cores=45, disk=46, preemptable=True)
-            self.childJobReqs2 = dict(memory=34, cores=56, disk=57, preemptable=False)
+            self.parentJobReqs = dict(memory=12, cores=34, disk=35, preemptible=True)
+            self.childJobReqs1 = dict(memory=23, cores=45, disk=46, preemptible=True)
+            self.childJobReqs2 = dict(memory=34, cores=56, disk=57, preemptible=False)
 
         def tearDown(self):
             self.jobstore_initialized.destroy()
             self.jobstore_resumed_noconfig.destroy()
-            super(AbstractJobStoreTest.Test, self).tearDown()
+            super().tearDown()
 
         def testInitialState(self):
             """Ensure proper handling of nonexistant files."""
@@ -172,7 +173,7 @@ class AbstractJobStoreTest:
             self.assertEqual(job.memory, self.parentJobReqs['memory'])
             self.assertEqual(job.cores, self.parentJobReqs['cores'])
             self.assertEqual(job.disk, self.parentJobReqs['disk'])
-            self.assertEqual(job.preemptable, self.parentJobReqs['preemptable'])
+            self.assertEqual(job.preemptible, self.parentJobReqs['preemptible'])
             self.assertEqual(job.jobName, 'test1')
             self.assertEqual(job.unitName, 'onParent')
 
@@ -555,7 +556,7 @@ class AbstractJobStoreTest:
         def testBatchCreate(self):
             """Test creation of many jobs."""
             jobstore = self.jobstore_initialized
-            jobRequirements = dict(memory=12, cores=34, disk=35, preemptable=True)
+            jobRequirements = dict(memory=12, cores=34, disk=35, preemptible=True)
             jobs = []
             with jobstore.batch():
                 for i in range(100):
@@ -928,6 +929,14 @@ class AbstractJobStoreTest:
                     hashOut.update(buf)
             self.assertEqual(hashIn.digest(), hashOut.digest())
 
+        @retry(errors=[ConnectionError])
+        def fetch_url(self, url: str) -> None:
+            """
+            Fetch the given URL. Throw an error if it cannot be fetched in a
+            reasonable number of attempts.
+            """
+            urlopen(Request(url))
+
         def assertUrl(self, url):
 
             prefix, path = url.split(':', 1)
@@ -935,7 +944,7 @@ class AbstractJobStoreTest:
                 self.assertTrue(os.path.exists(path))
             else:
                 try:
-                    urlopen(Request(url))
+                    self.fetch_url(url)
                 except:
                     self.fail()
 
@@ -1064,14 +1073,14 @@ class AbstractEncryptedJobStoreTest:
         def setUp(self):
             # noinspection PyAttributeOutsideInit
             self.sseKeyDir = tempfile.mkdtemp()
-            super(AbstractEncryptedJobStoreTest.Test, self).setUp()
+            super().setUp()
 
         def tearDown(self):
-            super(AbstractEncryptedJobStoreTest.Test, self).tearDown()
+            super().tearDown()
             shutil.rmtree(self.sseKeyDir)
 
         def _createConfig(self):
-            config = super(AbstractEncryptedJobStoreTest.Test, self)._createConfig()
+            config = super()._createConfig()
             sseKeyFile = os.path.join(self.sseKeyDir, 'keyFile')
             with open(sseKeyFile, 'w') as f:
                 f.write('01234567890123456789012345678901')
@@ -1274,11 +1283,9 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
         from boto.sdb import connect_to_region
         from botocore.exceptions import ClientError
 
-        from toil.jobStores.aws.jobStore import (
-            BucketLocationConflictException,
-            establish_boto3_session,
-        )
-        from toil.jobStores.aws.utils import retry_s3
+        from toil.jobStores.aws.jobStore import BucketLocationConflictException
+        from toil.lib.aws.session import establish_boto3_session
+        from toil.lib.aws.utils import retry_s3
 
         externalAWSLocation = 'us-west-1'
         for testRegion in 'us-east-1', 'us-west-2':
@@ -1354,7 +1361,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
 
     def testOverlargeJob(self):
         jobstore = self.jobstore_initialized
-        jobRequirements = dict(memory=12, cores=34, disk=35, preemptable=True)
+        jobRequirements = dict(memory=12, cores=34, disk=35, preemptible=True)
         overlargeJob = JobDescription(command='overlarge',
                                       requirements=jobRequirements,
                                       jobName='test-overlarge', unitName='onJobStore')
@@ -1411,7 +1418,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
                         self.assertEqual(hashlib.md5(f.read()).hexdigest(), expected_md5)
 
     def _prepareTestFile(self, bucket, size=None):
-        from toil.jobStores.aws.utils import retry_s3
+        from toil.lib.aws.utils import retry_s3
 
         file_name = 'testfile_%s' % uuid.uuid4()
         url = f's3://{bucket.name}/{file_name}'
@@ -1425,14 +1432,14 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
 
     def _hashTestFile(self, url: str) -> str:
         from toil.jobStores.aws.jobStore import AWSJobStore
-        key = AWSJobStore._get_object_for_url(urlparse.urlparse(url), existing=True)
+        key = get_object_for_url(urlparse.urlparse(url), existing=True)
         contents = key.get().get('Body').read()
         return hashlib.md5(contents).hexdigest()
 
     def _createExternalStore(self):
         """A S3.Bucket instance is returned"""
         from toil.jobStores.aws.jobStore import establish_boto3_session
-        from toil.jobStores.aws.utils import retry_s3
+        from toil.lib.aws.utils import retry_s3
 
         resource = establish_boto3_session().resource(
             "s3", region_name=self.awsRegion()

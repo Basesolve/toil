@@ -1,17 +1,21 @@
 # Modified from: https://github.com/common-workflow-language/workflow-service
 import functools
 import json
-import os
 import logging
+import os
 import tempfile
 from abc import abstractmethod
-from typing import Optional, List, Dict, Any, Tuple, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urldefrag
 
 import connexion  # type: ignore
-from werkzeug.utils import secure_filename  # type: ignore
+from werkzeug.utils import secure_filename
 
 logger = logging.getLogger(__name__)
+
+# Define a type for WES task log entries in responses
+# TODO: make this a typed dict with all the WES task log field names and their types.
+TaskLog = Dict[str, Union[str, int, None]]
 
 
 class VersionNotImplementedException(Exception):
@@ -26,7 +30,7 @@ class VersionNotImplementedException(Exception):
         else:
             message = f"workflow_type '{wf_type}' is not supported."
 
-        super(VersionNotImplementedException, self).__init__(message)
+        super().__init__(message)
 
 
 class MalformedRequestException(Exception):
@@ -34,7 +38,7 @@ class MalformedRequestException(Exception):
     Raised when the request is malformed.
     """
     def __init__(self, message: str) -> None:
-        super(MalformedRequestException, self).__init__(message)
+        super().__init__(message)
 
 
 class WorkflowNotFoundException(Exception):
@@ -42,7 +46,7 @@ class WorkflowNotFoundException(Exception):
     Raised when the requested run ID is not found.
     """
     def __init__(self) -> None:
-        super(WorkflowNotFoundException, self).__init__("The requested workflow run wasn't found.")
+        super().__init__("The requested workflow run wasn't found.")
 
 
 class WorkflowConflictException(Exception):
@@ -50,7 +54,7 @@ class WorkflowConflictException(Exception):
     Raised when the requested workflow is not in the expected state.
     """
     def __init__(self, run_id: str):
-        super(WorkflowConflictException, self).__init__(f"Workflow {run_id} exists when it shouldn't.")
+        super().__init__(f"Workflow {run_id} exists when it shouldn't.")
 
 
 class OperationForbidden(Exception):
@@ -58,7 +62,7 @@ class OperationForbidden(Exception):
     Raised when the request is forbidden.
     """
     def __init__(self, message: str) -> None:
-        super(OperationForbidden, self).__init__(message)
+        super().__init__(message)
 
 
 class WorkflowExecutionException(Exception):
@@ -66,7 +70,7 @@ class WorkflowExecutionException(Exception):
     Raised when an internal error occurred during the execution of the workflow.
     """
     def __init__(self, message: str) -> None:
-        super(WorkflowExecutionException, self).__init__(message)
+        super().__init__(message)
 
 
 def handle_errors(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -207,7 +211,7 @@ class WESBackend:
         """
         if not temp_dir:
             temp_dir = tempfile.mkdtemp()
-        body = {}
+        body: Dict[str, Any] = {}
         has_attachments = False
         for key, ls in connexion.request.files.lists():
             try:
@@ -255,7 +259,9 @@ class WESBackend:
             self.log_for_run(run_id, "Using workflow_url '%s'" % body.get("workflow_url"))
         else:
             raise MalformedRequestException("Missing 'workflow_url' in submission")
-        if "workflow_params" not in body:
-            raise MalformedRequestException("Missing 'workflow_params' in submission")
+
+        if "workflow_params" in body and not isinstance(body["workflow_params"], dict):
+            # They sent us something silly like "workflow_params": "5"
+            raise MalformedRequestException("Got a 'workflow_params' which does not decode to a JSON object")
 
         return temp_dir, body

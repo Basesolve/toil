@@ -20,9 +20,8 @@ from typing import Any, Dict, Optional
 
 import htcondor
 
-from toil.batchSystems.abstractGridEngineBatchSystem import (
-    AbstractGridEngineBatchSystem,
-)
+from toil.batchSystems.abstractGridEngineBatchSystem import \
+    AbstractGridEngineBatchSystem
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +45,7 @@ class HTCondorBatchSystem(AbstractGridEngineBatchSystem):
                 jobID, cpu, memory, disk, jobName, command = self.waitingJobs.pop(0)
 
                 # Prepare the htcondor.Submit object
-                submitObj: htcondor.Submit = self.prepareHTSubmission(cpu, memory, disk, jobID, jobName, command)
+                submitObj: htcondor.Submit = self.prepareSubmission(cpu, memory, disk, jobID, jobName, command)
                 logger.debug("Submitting %r", submitObj)
 
                 # Submit job and get batch system ID (i.e. the ClusterId)
@@ -64,7 +63,7 @@ class HTCondorBatchSystem(AbstractGridEngineBatchSystem):
 
             return activity
 
-        def prepareHTSubmission(self, cpu: int, memory: int, disk: int, jobID: int, jobName: str, command: str) -> htcondor.Submit:
+        def prepareSubmission(self, cpu: int, memory: int, disk: int, jobID: int, jobName: str, command: str) -> htcondor.Submit:
 
             # Convert resource requests
             cpu = int(math.ceil(cpu)) # integer CPUs
@@ -85,7 +84,7 @@ class HTCondorBatchSystem(AbstractGridEngineBatchSystem):
             submit_parameters = {
                 'executable': '/bin/sh',
                 'transfer_executable': 'False',
-                'arguments': f'''"-c '{command}'"'''.encode('utf-8'),    # Workaround for HTCondor Python bindings Unicode conversion bug
+                'arguments': f'''"-c '{command}'"'''.encode(),    # Workaround for HTCondor Python bindings Unicode conversion bug
                 'environment': self.getEnvString(),
                 'getenv': 'True',
                 'should_transfer_files': 'Yes',   # See note above for stdoutfile, stderrfile
@@ -310,7 +309,7 @@ class HTCondorBatchSystem(AbstractGridEngineBatchSystem):
         if localID:
             return localID
         else:
-            self.checkResourceRequest(jobNode.memory, jobNode.cores, jobNode.disk)
+            self.check_resource_request(jobNode)
             jobID = self.getNextJobID()
             self.currentJobs.add(jobID)
 

@@ -1,6 +1,8 @@
 import os
 import shutil
 import subprocess
+import tempfile
+from typing import List
 import unittest
 import uuid
 import zipfile
@@ -9,18 +11,16 @@ from urllib.request import urlretrieve
 from toil.test import ToilTest, needs_docker, needs_java, slow
 from toil.version import exactPython
 from toil.wdl.utils import get_analyzer
-from toil.wdl.wdl_functions import (
-    basename,
-    glob,
-    parse_cores,
-    parse_disk,
-    parse_memory,
-    process_infile,
-    read_csv,
-    read_tsv,
-    select_first,
-    size,
-)
+from toil.wdl.wdl_functions import (basename,
+                                    glob,
+                                    parse_cores,
+                                    parse_disk,
+                                    parse_memory,
+                                    process_infile,
+                                    read_csv,
+                                    read_tsv,
+                                    select_first,
+                                    size)
 
 
 class ToilWdlIntegrationTest(ToilTest):
@@ -41,6 +41,7 @@ class ToilWdlIntegrationTest(ToilTest):
     @classmethod
     def setUpClass(cls) -> None:
         """Runs once for all tests."""
+        super(ToilWdlIntegrationTest, cls).setUpClass()
         cls.program = os.path.abspath("src/toil/wdl/toilwdl.py")
 
         cls.test_directory = os.path.abspath("src/toil/test/wdl/")
@@ -73,7 +74,6 @@ class ToilWdlIntegrationTest(ToilTest):
     @classmethod
     def tearDownClass(cls) -> None:
         """We generate a lot of cruft."""
-        jobstores = ['./toilWorkflowRun', '/mnt/ephemeral/workspace/toil-pull-requests/toilWorkflowRun']
         data_dirs = [cls.gatk_data_dir, cls.wdl_data_dir, cls.encode_data_dir]
         data_zips = [cls.gatk_data, cls.wdl_data, cls.encode_data]
         encode_outputs = ['ENCFF000VOL_chr21.fq.gz',
@@ -104,11 +104,12 @@ class ToilWdlIntegrationTest(ToilTest):
                           'toilwdl_compiled.py',
                           'post_processing.log',
                           'md5.log']
-        for cleanup in jobstores + data_dirs + data_zips + encode_outputs:
+        for cleanup in data_dirs + data_zips + encode_outputs:
             if os.path.isdir(cleanup):
                 shutil.rmtree(cleanup)
             elif os.path.exists(cleanup):
                 os.remove(cleanup)
+        super(ToilWdlIntegrationTest, cls).tearDownClass()
 
     @needs_docker
     def testMD5sum(self):
@@ -139,7 +140,7 @@ class ToilWdlIntegrationTest(ToilTest):
         from toil.common import Toil
         from toil.job import Job
         from toil.wdl.wdl_types import WDLFile
-        options = Job.Runner.getDefaultOptions('./toilWorkflowRun')
+        options = Job.Runner.getDefaultOptions(self._getTestJobStorePath())
         options.clean = 'always'
         with Toil(options) as toil:
             small = process_infile(WDLFile(file_path=os.path.abspath('src/toil/test/wdl/testfiles/vocab.wdl')), toil)
@@ -171,9 +172,9 @@ class ToilWdlIntegrationTest(ToilTest):
                                  os.path.abspath('src/toil/wdl/wdl_functions.py')]
         # make sure the files match the expected files
         for location in wdl_that_should_exist:
-            assert location in wdl_locations, '{} not in {}!'.format(str(location), str(wdl_locations))
+            assert location in wdl_locations, f'{str(location)} not in {str(wdl_locations)}!'
         # make sure the same number of files were found as expected
-        assert len(wdl_that_should_exist) == len(wdl_locations), '{} != {}'.format(str(len(wdl_locations)), str(len(wdl_that_should_exist)))
+        assert len(wdl_that_should_exist) == len(wdl_locations), f'{str(len(wdl_locations))} != {str(len(wdl_that_should_exist))}'
 
     # estimated run time <1 sec
     def testFn_ParseMemory(self):
