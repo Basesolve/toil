@@ -69,8 +69,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                               jobName: str,
                               job_environment: Optional[Dict[str, str]] = None,
                               use_preferred_partition: Optional[bool] = True,
+                              accelerators: Optional[List[AcceleratorRequirement]] = None,
                               comment: Optional[str] = None,) -> List[str]:
-            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, use_preferred_partition, comment) + [f'--wrap={command}']
+            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, use_preferred_partition, accelerators, comment) + [f'--wrap={command}']
 
         def submitJob(self, subLine):
             try:
@@ -438,16 +439,21 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :return: suitable partition for the requirements
             :rtype: str
             '''
+            gpu = False
+            if self.batchSystemResources['accelerators']:
+                gpu = True
             if 'preference' in self.batchSystemResources.columns:
                 possible_partitions = self.batchSystemResources.partitions[
                     (self.batchSystemResources['cputot'] >= cpus) &
                     (self.batchSystemResources['realmemory'] >= mem) &
+                    (self.batchSystemResources['gpu'] == gpu) &
                     (self.batchSystemResources['preference'] == preferred)
                 ].values
             else:
                 possible_partitions = self.batchSystemResources.partitions[
                     (self.batchSystemResources['cputot'] >= cpus) &
-                    (self.batchSystemResources['realmemory'] >= mem)
+                    (self.batchSystemResources['realmemory'] >= mem) &
+                    (self.batchSystemResources['gpu'] == gpu)
                 ].values
             if len(possible_partitions) != 0:
                 usable_partitions = []
@@ -496,6 +502,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                           jobName: str,
                           job_environment: Optional[Dict[str, str]],
                           use_preferred_partition: Optional[bool],
+                          accelerators: Optional[List[AcceleratorRequirement]],
                           comment: Optional[str]) -> List[str]:
 
             #  Returns the sbatch command line before the script to run
@@ -559,7 +566,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 partition = self.select_partition(
                     slurm_cpu,
                     slurm_mem,
-                    preferred=use_preferred_partition
+                    preferred=use_preferred_partition,
+                    accelerators=accelerators
                 )
                 logger.info(
                     "Selected partition: %s based on cpus: %s and memory: %s of preferred type: %s",
@@ -610,6 +618,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             sed 's/NodeName=/\[/' |
             sed 's/ /\] /' |
             sed 's/ \+/\n/g' |
+            sed 's/(null)//g' | 
             egrep "=|\["
             """
         ).read().strip()
@@ -627,10 +636,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         # print(config_data)
         req_configs = config_data[
             [
-                'partitions', 'cputot', 'realmemory'
+                'partitions', 'cputot', 'realmemory', "gres",
             ]
         ]
         slurm_resources = req_configs.groupby("partitions").max().reset_index()
+        slurm_resources['gpu'] = slurm_resources.gres.isnull()
+        slurm_resources.drop(columns='gres', inplace=True)
         preference = os.getenv("TOIL_SLURM_PARTITON_PREFERED")
         if preference:
             logger.info(
