@@ -380,7 +380,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ###
         ### Implementation-specific helper methods
         ###
-        def select_partition(self, cpus, mem, preferred=True):
+        def select_partition(self, cpus, mem, accelerators, preferred=True):
             '''Select suitable slurm partition based on requirements. Checks state of partition.
 
             :param cpus: required cps
@@ -439,7 +439,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     preferred
                 )
                 logger.info("Trying with preferred type: %s", not preferred)
-                return self.select_partition(cpus, mem, not preferred)
+                return self.select_partition(cpus, mem, accelerators, not preferred)
             else:
                 logger.error(
                     "Could not find a partition to suffice cpus: %s, memory: %s",
@@ -571,11 +571,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     f'The accelerator {accelerator} could not be provided.',
                     'Slurm can only provide gpu accelerators.'
                 ])
-            if not any(self.batchSystemResources['gputot'] >= accelerator['count']):
-                raise InsufficientSystemResources(requirer, 'accelerators', details=[
-                    f'The requested number of accelerators {accelerator} could not be provided.',
-                    f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
-                ])
+            # if not any(self.batchSystemResources['gputot'] >= accelerator['count']):
+            #     raise InsufficientSystemResources(requirer, 'accelerators', details=[
+            #         f'The requested number of accelerators {accelerator} could not be provided.',
+            #         f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
+            #     ])
     
     @classmethod
     def assessBatchResources(cls):
