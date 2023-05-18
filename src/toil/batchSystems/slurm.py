@@ -99,20 +99,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             for _, status in status_dict.items():
                 exit_codes.append(self._get_job_return_code(status))
             return exit_codes
-
-        def _check_accelerator_request(self, requirer: Requirer) -> None:
-            for accelerator in requirer.accelerators:
-                if accelerator['kind'] != 'gpu':
-                    # We can only provide GPUs, and of those only nvidia ones.
-                    raise InsufficientSystemResources(requirer, 'accelerators', details=[
-                        f'The accelerator {accelerator} could not be provided.',
-                        'Slurm can only provide gpu accelerators.'
-                    ])
-                if not any(self.batchSystemResources['gputot'] >= accelerator['count']):
-                    raise InsufficientSystemResources(requirer, 'accelerators', details=[
-                        f'The requested number of accelerators {accelerator} could not be provided.',
-                        f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
-                    ])
         
         def getJobExitCode(self, batchJobID: str) -> int:
             """
@@ -576,6 +562,21 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     ###
     ### The interface for SLURM
     ###
+    @classmethod
+    def _check_accelerator_request(self, requirer: Requirer) -> None:
+        for accelerator in requirer.accelerators:
+            if accelerator['kind'] != 'gpu':
+                # We can only provide GPUs, and of those only nvidia ones.
+                raise InsufficientSystemResources(requirer, 'accelerators', details=[
+                    f'The accelerator {accelerator} could not be provided.',
+                    'Slurm can only provide gpu accelerators.'
+                ])
+            if not any(self.batchSystemResources['gputot'] >= accelerator['count']):
+                raise InsufficientSystemResources(requirer, 'accelerators', details=[
+                    f'The requested number of accelerators {accelerator} could not be provided.',
+                    f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
+                ])
+    
     @classmethod
     def assessBatchResources(cls):
         slurm_partition_configs = os.popen(
