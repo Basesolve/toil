@@ -23,6 +23,7 @@ from toil.batchSystems.abstractBatchSystem import (BatchJobExitReason,
                                                    UpdatedBatchJobInfo)
 from toil.batchSystems.cleanup_support import BatchSystemCleanupSupport
 from toil.bus import ExternalBatchIdMessage
+from toil.job import AcceleratorRequirement
 from toil.lib.misc import CalledProcessErrorStderr
 
 logger = logging.getLogger(__name__)
@@ -115,10 +116,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             while len(self.waitingJobs) > 0 and \
                     len(self.runningJobs) < int(self.boss.config.maxLocalJobs):
                 activity = True
-                jobID, cpu, memory, command, jobName, environment, use_preferred_partition, comment = self.waitingJobs.pop(0)
+                jobID, cpu, memory, command, jobName, environment, use_preferred_partition, accelerators, comment = self.waitingJobs.pop(0)
 
                 # prepare job submission command
-                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, use_preferred_partition, comment)
+                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, use_preferred_partition, accelerators, comment)
                 logger.debug("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 if self.boss._outbox is not None:
@@ -285,6 +286,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                               jobName: str,
                               job_environment: Optional[Dict[str, str]] = None,
                               use_preferred_partition: Optional[bool] = True,
+                              accelerators: Optional[List[AcceleratorRequirement]] = None,
                               comment: Optional[str] = None) -> List[str]:
             """
             Preparation in putting together a command-line string
