@@ -100,52 +100,19 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 exit_codes.append(self._get_job_return_code(status))
             return exit_codes
 
-        # def _check_accelerator_request(self, requirer: Requirer) -> None:
-        #     _, problem = self._identify_sufficient_accelerators(requirer.accelerators, set(range(len(self.accelerator_identities))))
-        #     if problem is not None:
-        #         # We can't get the accelerators
-        #         raise InsufficientSystemResources(requirer, 'accelerators', self.accelerator_identities, details=[
-        #             f'The accelerator {problem} could not be provided.'
-        #         ])
-            
-        # def _identify_sufficient_accelerators(self, needed_accelerators: List[AcceleratorRequirement], available_accelerator_ids: Set[int]) -> Tuple[Optional[Set[int]], Optional[AcceleratorRequirement]]:
-        #     """
-        #     Given the accelerator requirements of a job, and the set of available
-        #     accelerators out of our associated collection of accelerators, find a
-        #     set of the available accelerators that satisfies the job's
-        #     requirements.
-
-        #     Returns that set and None if the set exists, or None and an unsatisfied
-        #     AcceleratorRequirement if it does not.
-
-        #     TODO: Uses a simple greedy algorithm and not a smart matching
-        #     algorithm, so if the job requires different kinds of accelerators, and
-        #     some accelerators available can match multiple requirements, then it is
-        #     possible that a solution will not be found.
-        #     """
-        #     accelerators_needed: Set[int] = set()
-        #     accelerators_still_available = set(available_accelerator_ids)
-        #     for requirement in needed_accelerators:
-        #         for i in range(requirement['count']):
-        #             # For each individual accelerator we need
-        #             satisfied = False
-        #             for candidate_index in accelerators_still_available:
-        #                 # Check all the ones we haven't grabbed yet
-        #                 # TODO: We'll re-check early ones against this requirement if it has a count of more than one.
-        #                 candidate = self.accelerator_identities[candidate_index]
-        #                 if AcceleratorRequirement.satisfies(candidate, requirement):
-        #                     # If this accelerator can satisfy one unit of this requirement
-        #                     # Say we want it
-        #                     accelerators_needed.add(candidate_index)
-        #                     accelerators_still_available.remove(candidate_index)
-        #                     # And move on to the next required unit
-        #                     satisfied = True
-        #                     break
-        #             if not satisfied:
-        #                 # We can't get the resources we need to run right now.
-        #                 return None, requirement
-        #     # If we get here we satisfied everything
-        #     return accelerators_needed, None
+        def _check_accelerator_request(self, requirer: Requirer) -> None:
+            for accelerator in requirer.accelerators:
+                if accelerator['kind'] != 'gpu':
+                    # We can only provide GPUs, and of those only nvidia ones.
+                    raise InsufficientSystemResources(requirer, 'accelerators', details=[
+                        f'The accelerator {accelerator} could not be provided.',
+                        'Slurm can only provide gpu accelerators.'
+                    ])
+                if not any(self.batchSystemResources['gputot'] >= accelerator['count']):
+                    raise InsufficientSystemResources(requirer, 'accelerators', details=[
+                        f'The requested number of accelerators {accelerator} could not be provided.',
+                        f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
+                    ])
         
         def getJobExitCode(self, batchJobID: str) -> int:
             """
@@ -641,6 +608,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ]
         slurm_resources = req_configs.groupby("partitions").max().reset_index()
         slurm_resources['gpu'] = slurm_resources.gres.isnull()
+        slurm_resources['gputot'] = slurm_resources.gres.apply(lambda x: x.split(":")[1] if x else None)
         slurm_resources.drop(columns='gres', inplace=True)
         preference = os.getenv("TOIL_SLURM_PARTITON_PREFERED")
         if preference:
