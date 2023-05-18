@@ -393,18 +393,25 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :rtype: str
             '''
             gpu = True if accelerators else False
+            # Intentionally we check here if gpu nodes exist and choose them if required.
+            # This is because we need an approach to ignore accelerator specification if gpu partition not found.
+            if any(self.batchSystemResources['gpu']) and gpu:
+                usable_resources = self.batchSystemResources[self.batchSystemResources['gpu'] == gpu]
+            else:
+                logger.warning("""
+                Ignoring specified accelerator requirements, as there are no gpu nodes available in the cluster.
+                """)
+                usable_resources = self.batchSystemResources
             if 'preference' in self.batchSystemResources.columns:
-                possible_partitions = self.batchSystemResources.partitions[
+                possible_partitions = usable_resources.partitions[
                     (self.batchSystemResources['cputot'] >= cpus) &
                     (self.batchSystemResources['realmemory'] >= mem) &
-                    (self.batchSystemResources['gpu'] == gpu) &
                     (self.batchSystemResources['preference'] == preferred)
                 ].values
             else:
-                possible_partitions = self.batchSystemResources.partitions[
+                possible_partitions = usable_resources.partitions[
                     (self.batchSystemResources['cputot'] >= cpus) &
-                    (self.batchSystemResources['realmemory'] >= mem) &
-                    (self.batchSystemResources['gpu'] == gpu)
+                    (self.batchSystemResources['realmemory'] >= mem)
                 ].values
             if len(possible_partitions) != 0:
                 usable_partitions = []
@@ -431,18 +438,20 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             
             if 'preference' in self.batchSystemResources.columns:
                 logger.warning(
-                    "Could not find a partition to suffice cpus: %s, memory: %s and preferred type: %s",
+                    "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s and preferred type: %s",
                     cpus,
                     mem,
+                    accelerators,
                     preferred
                 )
                 logger.info("Trying with preferred type: %s", not preferred)
                 return self.select_partition(cpus, mem, accelerators, not preferred)
             else:
                 logger.error(
-                    "Could not find a partition to suffice cpus: %s, memory: %s",
+                    "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s",
                     cpus,
-                    mem
+                    mem,
+                    accelerators
                 )
                 return
 
