@@ -64,14 +64,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         def prepareSubmission(self,
                               cpu: int,
                               memory: int,
+                              accelerators: Optional[List[AcceleratorRequirement]],
                               jobID: int,
                               command: str,
                               jobName: str,
                               job_environment: Optional[Dict[str, str]] = None,
                               use_preferred_partition: Optional[bool] = True,
-                              accelerators: Optional[List[AcceleratorRequirement]] = None,
                               comment: Optional[str] = None,) -> List[str]:
-            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, use_preferred_partition, accelerators, comment) + [f'--wrap={command}']
+            return self.prepareSbatch(cpu, memory, accelerators, jobID, jobName, job_environment, use_preferred_partition, comment) + [f'--wrap={command}']
 
         def submitJob(self, subLine):
             try:
@@ -449,11 +449,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         def prepareSbatch(self,
                           cpu: int,
                           mem: int,
+                          accelerators: Optional[List[AcceleratorRequirement]],
                           jobID: int,
                           jobName: str,
                           job_environment: Optional[Dict[str, str]],
                           use_preferred_partition: Optional[bool],
-                          accelerators: Optional[List[AcceleratorRequirement]],
                           comment: Optional[str]) -> List[str]:
 
             #  Returns the sbatch command line before the script to run

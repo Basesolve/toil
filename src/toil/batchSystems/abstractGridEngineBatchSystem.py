@@ -116,10 +116,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             while len(self.waitingJobs) > 0 and \
                     len(self.runningJobs) < int(self.boss.config.maxLocalJobs):
                 activity = True
-                jobID, cpu, memory, command, jobName, environment, use_preferred_partition, accelerators, comment = self.waitingJobs.pop(0)
+                jobID, cpu, memory, accelerators, command, jobName, environment, use_preferred_partition, comment = self.waitingJobs.pop(0)
 
                 # prepare job submission command
-                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, use_preferred_partition, accelerators, comment)
+                subLine = self.prepareSubmission(cpu, memory, accelerators, jobID, command, jobName, environment, use_preferred_partition, comment)
                 logger.debug("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 if self.boss._outbox is not None:
@@ -281,12 +281,12 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
         def prepareSubmission(self,
                               cpu: int,
                               memory: int,
+                              accelerators: Optional[List[AcceleratorRequirement]],
                               jobID: int,
                               command: str,
                               jobName: str,
                               job_environment: Optional[Dict[str, str]] = None,
                               use_preferred_partition: Optional[bool] = True,
-                              accelerators: Optional[List[AcceleratorRequirement]] = None,
                               comment: Optional[str] = None) -> List[str]:
             """
             Preparation in putting together a command-line string
@@ -387,7 +387,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             self.check_resource_request(jobDesc)
             jobID = self.getNextJobID()
             self.currentJobs.add(jobID)
-            self.newJobsQueue.put((jobID, jobDesc.cores, jobDesc.memory, jobDesc.command, jobDesc.unitName,
+            self.newJobsQueue.put((jobID, jobDesc.cores, jobDesc.memory, jobDesc.accelerators, jobDesc.command, jobDesc.unitName,
                                    job_environment, jobDesc.use_preferred_partition, jobDesc.comment))
             logger.debug("Issued the job command: %s with job id: %s and job name %s on spot capacity: %s with comment %s", jobDesc.command, str(jobID),
                          jobDesc.unitName, jobDesc.use_preferred_partition, jobDesc.comment)
