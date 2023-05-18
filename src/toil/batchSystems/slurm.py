@@ -393,7 +393,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :rtype: str
             '''
             gpu = False
-            if self.batchSystemResources['accelerators']:
+            if accelerators:
                 gpu = True
             if 'preference' in self.batchSystemResources.columns:
                 possible_partitions = self.batchSystemResources.partitions[
@@ -608,8 +608,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             ]
         ]
         slurm_resources = req_configs.groupby("partitions").max().reset_index()
-        slurm_resources['gpu'] = slurm_resources.gres.isnull()
-        slurm_resources['gputot'] = slurm_resources.gres.apply(lambda x: x.split(":")[1] if x else None)
+        slurm_resources['gputot'] = slurm_resources.gres.apply(lambda x: int(x.split(":")[2]) if x else None)
+        slurm_resources['gpu'] = slurm_resources.gputot.isnull()
         slurm_resources.drop(columns='gres', inplace=True)
         preference = os.getenv("TOIL_SLURM_PARTITON_PREFERED")
         if preference:
