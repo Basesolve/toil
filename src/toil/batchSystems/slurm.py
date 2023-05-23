@@ -395,13 +395,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             gpu = True if accelerators else False
             # Intentionally we check here if gpu nodes exist and choose them if required.
             # This is because we need an approach to ignore accelerator specification if gpu partition not found.
-            if any(self.batchSystemResources['gpu']) and gpu:
+            usable_resources = self.batchSystemResources
+            if gpu:
+                if not any(self.batchSystemResources['gpu']):
+                    logger.warning("""
+                    Ignoring specified accelerator requirements, as there are no gpu nodes available in the cluster.
+                    """)
                 usable_resources = self.batchSystemResources[self.batchSystemResources['gpu'] == gpu]
-            else:
-                logger.warning("""
-                Ignoring specified accelerator requirements, as there are no gpu nodes available in the cluster.
-                """)
-                usable_resources = self.batchSystemResources
             if 'preference' in self.batchSystemResources.columns:
                 possible_partitions = usable_resources.partitions[
                     (self.batchSystemResources['cputot'] >= cpus) &
