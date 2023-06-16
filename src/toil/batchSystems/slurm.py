@@ -410,15 +410,20 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :rtype: str
             '''
             gpu = True if accelerators else False
+            logger.info("GPU Required: %s", gpu)
             # Intentionally we check here if gpu nodes exist and choose them if required.
             # This is because we need an approach to ignore accelerator specification if gpu partition not found.
             usable_resources = self.batchSystemResources
+            logger.info("Detected Cluster Partitions: %s", usable_resources.partitions)
             if gpu:
                 if not any(self.batchSystemResources['gpu']):
                     logger.warning("""
                     Ignoring specified accelerator requirements, as there are no gpu nodes available in the cluster.
                     """)
-                usable_resources = self.batchSystemResources[self.batchSystemResources['gpu'] == gpu]
+                else:
+                    usable_resources = self.batchSystemResources[self.batchSystemResources['gpu']]
+            else:
+                usable_resources = self.batchSystemResources[~self.batchSystemResources['gpu']]
             if 'preference' in self.batchSystemResources.columns:
                 possible_partitions = usable_resources.partitions[
                     (self.batchSystemResources['cputot'] >= cpus) &
@@ -432,7 +437,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 ].values
             if len(possible_partitions) != 0:
                 usable_partitions = []
-                logger.info("Available Partitions: %s", possible_partitions)
+                logger.info("Feasible Partitions: %s", possible_partitions)
                 for partition in possible_partitions:
                     partition_state = os.popen(
                         f"""
@@ -450,7 +455,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                             partition,
                             partition_state
                         )
-                logger.info("Usable Partitions: %s", usable_partitions)
+                logger.info("Selectable Partitions: %s", usable_partitions)
                 return usable_partitions[0]
             
             if 'preference' in self.batchSystemResources.columns:

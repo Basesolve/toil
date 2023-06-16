@@ -124,7 +124,7 @@ class AbstractBatchSystem(ABC):
         otherwise it will raise an exception.
 
         :param userScript: the resource object representing the user script
-               or module and the modules it depends on.
+            or module and the modules it depends on.
         """
         raise NotImplementedError()
 
@@ -147,7 +147,7 @@ class AbstractBatchSystem(ABC):
                                 variables to be set on the worker.
 
         :return: a unique jobID that can be used to reference the newly issued
-                 job
+                job
         """
         raise NotImplementedError()
 
@@ -170,8 +170,8 @@ class AbstractBatchSystem(ABC):
         Gets all currently issued jobs
 
         :return: A list of jobs (as jobIDs) currently issued (may be running, or may be
-                 waiting to be run). Despite the result being a list, the ordering should not
-                 be depended upon.
+                waiting to be run). Despite the result being a list, the ordering should not
+                be depended upon.
         """
         raise NotImplementedError()
 
@@ -182,7 +182,7 @@ class AbstractBatchSystem(ABC):
         and how long they have been running, in seconds.
 
         :return: dictionary with currently running jobID keys and how many seconds they have
-                 been running as the value
+                been running as the value
         """
         raise NotImplementedError()
 
@@ -199,9 +199,9 @@ class AbstractBatchSystem(ABC):
         :param maxWait: the number of seconds to block, waiting for a result
 
         :return: If a result is available, returns UpdatedBatchJobInfo.
-                 Otherwise it returns None. wallTime is the number of seconds (a strictly
-                 positive float) in wall-clock time the job ran for, or None if this
-                 batch system does not support tracking wall time.
+                Otherwise it returns None. wallTime is the number of seconds (a strictly
+                positive float) in wall-clock time the job ran for, or None if this
+                batch system does not support tracking wall time.
         """
         raise NotImplementedError()
 
@@ -286,17 +286,17 @@ class BatchSystemSupport(AbstractBatchSystem):
         Initialize initial state of the object.
 
         :param toil.common.Config config: object is setup by the toilSetup script and
-          has configuration parameters for the jobtree. You can add code
-          to that script to get parameters for your batch system.
+        has configuration parameters for the jobtree. You can add code
+        to that script to get parameters for your batch system.
 
         :param float maxCores: the maximum number of cores the batch system can
-          request for any one job
+        request for any one job
 
         :param int maxMemory: the maximum amount of memory the batch system can
-          request for any one job, in bytes
+        request for any one job, in bytes
 
         :param int maxDisk: the maximum amount of disk space the batch system can
-          request for any one job, in bytes
+        request for any one job, in bytes
         """
         super().__init__()
         self.config = config
@@ -326,12 +326,12 @@ class BatchSystemSupport(AbstractBatchSystem):
         :param str detail: Batch-system-specific message to include in the error.
 
         :raise InsufficientSystemResources: raised when a resource is requested in an amount
-               greater than allowed
+            greater than allowed
         """
         try:
             for resource, requested, available in [('cores', requirer.cores, self.maxCores),
-                                                   ('memory', requirer.memory, self.maxMemory),
-                                                   ('disk', requirer.disk, self.maxDisk)]:
+                                                ('memory', requirer.memory, self.maxMemory),
+                                                ('disk', requirer.disk, self.maxDisk)]:
                 assert requested is not None
                 if requested > available:
                     raise InsufficientSystemResources(requirer, resource, available)

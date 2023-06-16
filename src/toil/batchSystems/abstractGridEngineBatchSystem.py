@@ -123,10 +123,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             while len(self.waitingJobs) > 0 and \
                     len(self.runningJobs) < int(self.boss.config.max_jobs):
                 activity = True
-                jobID, cpu, memory, command, jobName, environment, gpus = self.waitingJobs.pop(0)
+                jobID, cpu, memory, command, jobName, environment, gpus, use_preferred_partition, comment = self.waitingJobs.pop(0)
 
                 # prepare job submission command
-                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, gpus)
+                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, gpus, use_preferred_partition, comment)
                 logger.debug("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 if self.boss._outbox is not None:
