@@ -72,7 +72,7 @@ from toil.statsAndLogging import set_logging_from_options
 if TYPE_CHECKING:
     from toil.batchSystems.abstractBatchSystem import BatchJobExitReason
     from toil.fileStores.abstractFileStore import AbstractFileStore
-    from toil.jobStores.abstractJobStore import AbstractJobStore
+    from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchFileException
     from optparse import OptionParser
 
 logger = logging.getLogger(__name__)
@@ -125,10 +125,10 @@ class TemporaryID:
     Needs to be held:
         * By JobDescription objects to record normal relationships.
         * By Jobs to key their connected-component registries and to record
-          predecessor relationships to facilitate EncapsulatedJob adding
-          itself as a child.
+            predecessor relationships to facilitate EncapsulatedJob adding
+            itself as a child.
         * By Services to tie back to their hosting jobs, so the service
-          tree can be built up from Service objects.
+            tree can be built up from Service objects.
     """
 
     def __init__(self) -> None:
@@ -731,7 +731,9 @@ class JobDescription(Requirer):
         unitName: Optional[str] = "",
         displayName: Optional[str] = "",
         command: Optional[str] = None,
-        local: Optional[bool] = None
+        local: Optional[bool] = None,
+        use_preferred_partition: Optional[str] = True,
+        comment: Optional[str] = None,
     ) -> None:
         """
         Create a new JobDescription.
@@ -771,6 +773,8 @@ class JobDescription(Requirer):
         self.jobName = makeString(jobName)
         self.unitName = makeString(unitName)
         self.displayName = makeString(displayName)
+        self.use_preferred_partition: Optional[bool] = use_preferred_partition
+        self.comment = makeString(comment)
 
         # Set properties that are not fully filled in on creation.
 
@@ -1325,7 +1329,7 @@ class CheckpointJobDescription(JobDescription):
             if len(all_successors) > 0 or self.serviceTree:
                 # If the subtree of successors is not complete restart everything
                 logger.debug("Checkpoint job has unfinished successor jobs, deleting successors: %s, services: %s " %
-                             (all_successors, self.serviceTree.keys()))
+                            (all_successors, self.serviceTree.keys()))
 
                 # Delete everything on the stack, as these represent successors to clean
                 # up as we restart the queue
@@ -1369,6 +1373,8 @@ class Job:
         displayName: Optional[str] = "",
         descriptionClass: Optional[type] = None,
         local: Optional[bool] = None,
+        use_preferred_partition: Optional[bool] = True,
+        comment: Optional[str] = None,
     ) -> None:
         """
         Job initializer.
@@ -1427,7 +1433,9 @@ class Job:
             jobName,
             unitName=unitName,
             displayName=displayName,
-            local=local
+            local=local,
+            use_preferred_partition=use_preferred_partition,
+            comment=comment
         )
 
         # Private class variables needed to actually execute a job, in the worker.
@@ -1869,6 +1877,12 @@ class Job:
             promise = UnfulfilledPromiseSentinel(str(self.description), jobStoreFileID, False)
             logger.debug('Issuing promise %s for result of %s', jobStoreFileID, self.description)
             pickle.dump(promise, fileHandle, pickle.HIGHEST_PROTOCOL)
+        try:
+            self._promiseJobStore._check_job_store_file_id(jobStoreFileID)
+            logger.info("[MOD] Dumped promise to pickle for %s to %s", self.description, jobStoreFileID)
+        except NoSuchFileException as nfe:
+            logger.info("Dumped stream file seems missing. retrying promise dump %s", nfe)
+            self.registerPromise(path)
         self._rvs[path].append(jobStoreFileID)
         return self._promiseJobStore.config.jobStore, jobStoreFileID
 
@@ -2171,7 +2185,7 @@ class Job:
         Is not executed as a job; runs within a ServiceHostJob.
         """
 
-        def __init__(self, memory=None, cores=None, disk=None, accelerators=None, preemptible=None, unitName=None):
+        def __init__(self, memory=None, cores=None, disk=None, accelerators=None, preemptible=None, unitName=None, use_preferred_partition=None, comment=None):
             """
             Memory, core and disk requirements are specified identically to as in \
             :func:`toil.job.Job.__init__`.
@@ -2182,7 +2196,8 @@ class Job:
                 'cores': cores,
                 'disk': disk,
                 'accelerators': accelerators,
-                'preemptible': preemptible
+                'preemptible': preemptible,
+                "comment": comment
             })
 
             # And the unit name
@@ -2478,6 +2493,12 @@ class Job:
                 # Save the body of the job
                 with jobStore.write_file_stream(description.jobStoreID, cleanup=True) as (fileHandle, fileStoreID):
                     pickle.dump(self, fileHandle, pickle.HIGHEST_PROTOCOL)
+                try:
+                    jobStore._check_job_store_file_id(fileStoreID)
+                    logger.info("[MOD] Dumped job body to pickle for %s to %s", description.jobStoreID, fileStoreID)
+                except NoSuchFileException as nfe:
+                    logger.info("Dumped stream file seems missing. retrying dump %s", nfe)
+                    self.saveBody(jobStore)
             finally:
                 # Restore important fields (before handling errors)
                 self._directPredecessors = directPredecessors
@@ -2857,7 +2878,10 @@ class FunctionWrappingJob(Job):
                          accelerators=resolve('accelerators'),
                          preemptible=resolve('preemptible'),
                          checkpoint=resolve('checkpoint', default=False),
-                         unitName=resolve('name', default=None))
+                         unitName=resolve('name', default=None),
+                         use_preferred_partition=resolve('use_preferred_partition', default=True),
+                         comment=resolve('comment', default=None)
+                        )
 
         self.userFunctionModule = ModuleDescriptor.forModule(userFunction.__module__).globalize()
         self.userFunctionName = str(userFunction.__name__)

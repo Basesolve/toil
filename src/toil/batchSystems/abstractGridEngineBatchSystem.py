@@ -19,8 +19,7 @@ from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from toil.batchSystems.abstractBatchSystem import (BatchJobExitReason,
-                                                   UpdatedBatchJobInfo)
+from toil.batchSystems.abstractBatchSystem import (BatchJobExitReason,UpdatedBatchJobInfo)
 from toil.batchSystems.cleanup_support import BatchSystemCleanupSupport
 from toil.bus import ExternalBatchIdMessage
 from toil.job import JobDescription, AcceleratorRequirement
@@ -57,13 +56,20 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             :param killQueue: a Queue of active jobs that need to be killed
             :param killedJobsQueue: Queue of killed jobs for this worker
             :param boss: the AbstractGridEngineBatchSystem instance that
-                         controls this AbstractGridEngineWorker
+                        controls this AbstractGridEngineWorker
 
             """
             Thread.__init__(self)
             self.boss = boss
             self.boss.config.statePollingWait = \
                 self.boss.config.statePollingWait or self.boss.getWaitDuration()
+            try:
+                self.batchSystemResources = self.boss.assessBatchResources()
+            except NotImplementedError as err:
+                logger.warning(
+                    "Cannot assess batch system resources. Possibly running on non-slurm batcg system. Error: %s",
+                    err
+                )
             self.newJobsQueue = newJobsQueue
             self.updatedJobsQueue = updatedJobsQueue
             self.killQueue = killQueue
@@ -295,13 +301,16 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
 
         @abstractmethod
         def prepareSubmission(self,
-                              cpu: int,
-                              memory: int,
-                              jobID: int,
-                              command: str,
-                              jobName: str,
-                              job_environment: Optional[Dict[str, str]] = None,
-                              gpus: Optional[int] = None) -> List[str]:
+            cpu: int,
+            memory: int,
+            accelerators: Optional[List[AcceleratorRequirement]],
+            jobID: int,
+            command: str,
+            jobName: str,
+            job_environment: Optional[Dict[str, str]] = None,
+            gpus: Optional[int] = None,
+            use_preferred_partition: Optional[bool] = True,
+            comment: Optional[str] = None) -> List[str]:
             """
             Preparation in putting together a command-line string
             for submitting to batch system (via submitJob().)
@@ -312,7 +321,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             :param: string subLine: the command line string to be called
             :param: string jobName: the name of the Toil job, to provide metadata to batch systems if desired
             :param: dict job_environment: the environment variables to be set on the worker
-
+            :param: bool use_preferred_partition: override prefferred partition selection for the job
+            :param: string comment: set a job comment
+            
             :rtype: List[str]
             """
             raise NotImplementedError()
@@ -377,7 +388,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
         self.killedJobsQueue = Queue()
         # get the associated worker class here
         self.worker = self.Worker(self.newJobsQueue, self.updatedJobsQueue,
-                                  self.killQueue, self.killedJobsQueue, self)
+                                self.killQueue, self.killedJobsQueue, self)
         self.worker.start()
         self._getRunningBatchJobIDsTimestamp = None
         self._getRunningBatchJobIDsCache = {}
@@ -407,10 +418,24 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             else:
                 gpus = jobDesc.accelerators
 
-            self.newJobsQueue.put((jobID, jobDesc.cores, jobDesc.memory, jobDesc.command, jobDesc.get_job_kind(),
-                                   job_environment, gpus))
-            logger.debug("Issued the job command: %s with job id: %s and job name %s", jobDesc.command, str(jobID),
-                         jobDesc.get_job_kind())
+            self.newJobsQueue.put((
+                jobID, 
+                jobDesc.cores, 
+                jobDesc.memory, 
+                jobDesc.command, 
+                jobDesc.get_job_kind(),
+                job_environment,
+                gpus,
+                jobDesc.use_preferred_partition,
+                jobDesc.comment)
+            )
+            logger.debug("Issued the job command: %s with job id: %s and job name %s on spot capacity: %s with comment %s",
+                jobDesc.command,
+                str(jobID),
+                jobDesc.get_job_kind(),
+                jobDesc.use_preferred_partition,
+                jobDesc.comment
+            )
         return jobID
 
     def killBatchJobs(self, jobIDs):
@@ -435,7 +460,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 self.currentJobs.remove(killedJobId)
             if jobIDs:
                 logger.debug('Some kills (%s) still pending, sleeping %is', len(jobIDs),
-                             self.sleepSeconds())
+                            self.sleepSeconds())
 
     def getIssuedBatchJobIDs(self):
         """
@@ -494,6 +519,12 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
     @classmethod
     def getWaitDuration(self):
         return 1
+    
+    @classmethod
+    def assessBatchResources(self):
+        '''Profile batch system resources for deeper job submission control
+        '''
+        raise NotImplementedError()
 
     def sleepSeconds(self, sleeptime=1):
         """ Helper function to drop on all state-querying functions to avoid over-querying.
@@ -515,9 +546,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             except CalledProcessErrorStderr as err:
                 if tries < maxTries:
                     logger.error("Will retry errored operation %s, code %d: %s",
-                                 operation.__name__, err.returncode, err.stderr)
+                                operation.__name__, err.returncode, err.stderr)
                     time.sleep(self.config.statePollingWait)
                 else:
                     logger.error("Failed operation %s, code %d: %s",
-                                 operation.__name__, err.returncode, err.stderr)
+                                operation.__name__, err.returncode, err.stderr)
                     raise err
