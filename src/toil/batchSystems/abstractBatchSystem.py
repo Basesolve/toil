@@ -57,6 +57,8 @@ class BatchJobExitReason(enum.IntEnum):
     """Internal error."""
     MEMLIMIT: int = 6
     """Job hit batch system imposed memory limit."""
+    BADCONSTRAINTS: int = 7
+    """Job landed on a node with incompatible resources"""
 
 class UpdatedBatchJobInfo(NamedTuple):
     jobID: int

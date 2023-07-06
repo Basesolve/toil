@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, TypeVar, Union
 import time
 import configparser
 import pandas as pd
-from toil.batchSystems.abstractBatchSystem import InsufficientSystemResources
+from toil.batchSystems.abstractBatchSystem import BatchJobExitReason, InsufficientSystemResources
 #=======
 from toil.batchSystems.abstractGridEngineBatchSystem import \
     AbstractGridEngineBatchSystem
@@ -152,10 +152,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param status: tuple containing the job's state and it's return code.
             :return: the job's return code if it's completed, otherwise None.
             """
-            state, rc = status
+            state, rc, reason = status
             # If job is in a running state, set return code to None to indicate we don't have
             # an update.
             if isinstance(state, str):
+                if state == 'PENDING' and reason == "BadConstraints":
+                    return BatchJobExitReason(value=rc)
                 if state in ('PENDING', 'RUNNING', 'CONFIGURING', 'COMPLETING', 'RESIZING', 'SUSPENDED'):
                     rc = None
                 if state == "NODE_FAIL":
@@ -288,6 +290,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     continue
                 job_id = int(job_id_parts[0])
                 status, signal = (int(n) for n in exitcode.split(':'))
+                reason = ''
                 if state == 'PENDING':
                     # sacct does not report the job pending reason in realtime. but scontrol does.
                     job_details = os.popen(
@@ -306,6 +309,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                             key = bits[0]
                             jdict[key] = bits[1]
                     reason = jdict.get('Reason')
+                    if reason == 'BadConstraints':
+                        status = 7
                     if reason == "BeginTime":
                         logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, state)
                         user_slurm_restart_thresh = int(os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5))
@@ -316,7 +321,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     status = 128 + signal
                 logger.debug("%s exit code of job %d is %s, return status %d",
                             args[0], job_id, exitcode, status)
-                job_statuses[job_id] = state, status
+                job_statuses[job_id] = state, status, reason
             logger.debug("%s returning job statuses: %s", args[0], job_statuses)
             return job_statuses
 
@@ -378,8 +383,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if job_id not in job_id_list:
                     continue
                 state = job['JobState']
+                reason = ''
                 if state == 'PENDING':
-                    reason = job['Reason']
+                    reason = job.get('Reason')
+                    if reason == 'BadConstraints':
+                        job['ExitCode'] = 7
                     if reason == 'BeginTime':
                         logger.debug("Job: %s is in %s state. Checking if alternate partition to be used.", job_id, state)
                         user_slurm_restart_thresh = int(os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5))
@@ -400,7 +408,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         rc = None
                 except KeyError:
                     rc = None
-                job_statuses[job_id] = (state, rc)
+                job_statuses[job_id] = (state, rc, reason)
             logger.debug("%s returning job statuses: %s", args[0], job_statuses)
             return job_statuses
 

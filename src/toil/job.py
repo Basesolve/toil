@@ -1146,6 +1146,10 @@ class JobDescription(Requirer):
             self.memory = self.memory * 2
             logger.warning("We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
                            self, self.memory)
+        if exit_reason == BatchJobExitReason.BADCONSTRAINTS and self.accelerators:
+            self.accelerators = None
+            logger.warning("We have removed accelerator of the failed job %s to incompatibility",
+                           self)
         if self.memory < self._config.defaultMemory:
             self.memory = self._config.defaultMemory
             logger.warning("We have increased the default memory of the failed job %s to %s bytes",
