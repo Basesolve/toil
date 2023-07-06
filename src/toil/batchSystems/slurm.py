@@ -163,9 +163,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if state == "NODE_FAIL":
                     logger.warning('NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
                     rc = None
-            if state is None:
-                logger.debug('Could not retrive node state, possibly a NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
-                rc = None
+            # if state is None:
+            #     logger.debug('Could not retrive node state, possibly a NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
+            #     rc = None
             return rc
         
         def get_last_partition_switch_details(self, comment):
@@ -276,7 +276,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # job state and exit status. Initialize dict before processing output of `sacct`.
             job_statuses = {}
             for job_id in job_id_list:
-                job_statuses[job_id] = (None, None)
+                job_statuses[job_id] = (None, None, None)
 
             for line in stdout.splitlines():
                 values = line.strip().split('|')
@@ -352,7 +352,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # job state and exit status. Initialize dict before processing output of `scontrol`.
             job_statuses = {}
             for job_id in job_id_list:
-                job_statuses[job_id] = (None, None)
+                job_statuses[job_id] = (None, None, None)
 
             # `scontrol` will report "No jobs in the system", if there are no jobs in the system,
             # and if no job-id was passed as argument to `scontrol`.
