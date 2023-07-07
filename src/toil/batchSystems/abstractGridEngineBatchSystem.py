@@ -237,14 +237,6 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             """
             Helper method for checkOnJobs to handle job statuses
             """
-            if status is not None:
-                self.updatedJobsQueue.put(
-                    UpdatedBatchJobInfo(
-                        jobID=job_id, exitStatus=status, exitReason=None, wallTime=None
-                    )
-                )
-                self.forgetJob(job_id)
-                return True
             if status is not None and isinstance(status, BatchJobExitReason):
                 self.updatedJobsQueue.put(
                     UpdatedBatchJobInfo(

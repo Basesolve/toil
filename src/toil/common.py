@@ -191,6 +191,7 @@ class Config:
         self.retryCount: int = 1
         self.enableUnlimitedPreemptibleRetries: bool = False
         self.doubleMem: bool = False
+        self.enableBadConstraintGpuHandling: bool = False
         self.maxJobDuration: int = sys.maxsize
         self.rescueJobsFrequency: int = 60
 
@@ -239,7 +240,7 @@ class Config:
         # auto-generated and point to a temp directory that could no longer
         # exist and that can't safely be re-made.
         self.write_messages = None
-        
+
 
     def setOptions(self, options: Namespace) -> None:
         """Creates a config object from the options object."""
@@ -415,6 +416,7 @@ class Config:
         set_option("retryCount", int, iC(1))
         set_option("enableUnlimitedPreemptibleRetries")
         set_option("doubleMem")
+        set_option("enableBadConstraintGpuHandling")
         set_option("maxJobDuration", int, iC(1))
         set_option("rescueJobsFrequency", int, iC(1))
 
@@ -763,6 +765,10 @@ def addOptions(parser: ArgumentParser, config: Optional[Config] = None, jobstore
                              help="If set, batch jobs which die to reaching memory limit on batch schedulers "
                                   "will have their memory doubled and they will be retried. The remaining "
                                   "retry count will be reduced by 1. Currently supported by LSF.")
+    job_options.add_argument("--enableBadConstraintGpuHandling", dest="enableBadConstraintGpuHandling", action='store_true', default=False,
+                             help="If set, batch jobs which die due to bad constraint on batch schedulers "
+                                  "will have the accelerators requirement removed and they will be retried. The remaining "
+                                  "retry count will be reduced by 1. Currently supported by Slurm.")
     job_options.add_argument("--maxJobDuration", dest="maxJobDuration", default=None,
                              help=f"Maximum runtime of a job (in seconds) before we kill it (this is a lower bound, "
                                   f"and the actual time before killing the job may be longer).  "
@@ -1005,6 +1011,9 @@ class Toil(ContextManager["Toil"]):
                     if self.config.restart and not self._inRestart:
                         pass
                     else:
+                        # if self.config.batchSystem == "slurm":
+                        #     self._batchSystem.killBatchJobs(self._batchSystem.getIssuedBatchJobIDs())
+                        #     logger.info("Succesfully cancelled all orphan slurm jobs")
                         self._jobStore.destroy()
                         logger.info("Successfully deleted the job store: %s" % str(self._jobStore))
                 except:
