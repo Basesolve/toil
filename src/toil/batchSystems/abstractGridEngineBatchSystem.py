@@ -67,7 +67,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 self.batchSystemResources = self.boss.assessBatchResources()
             except NotImplementedError as err:
                 logger.warning(
-                    "Cannot assess batch system resources. Possibly running on non-slurm batcg system. Error: %s",
+                    "Cannot assess batch system resources. Possibly running on non-slurm batch system. Error: %s",
                     err
                 )
             self.newJobsQueue = newJobsQueue
@@ -107,6 +107,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             """
             with self.runningJobsLock:
                 self.runningJobs.remove(jobID)
+                self.killJob(jobID)
             del self.batchJobIDs[jobID]
 
         def createJobs(self, newJob: JobTuple) -> bool:
@@ -323,7 +324,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             :param: dict job_environment: the environment variables to be set on the worker
             :param: bool use_preferred_partition: override prefferred partition selection for the job
             :param: string comment: set a job comment
-            
+
             :rtype: List[str]
             """
             raise NotImplementedError()
@@ -419,10 +420,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 gpus = jobDesc.accelerators
 
             self.newJobsQueue.put((
-                jobID, 
-                jobDesc.cores, 
-                jobDesc.memory, 
-                jobDesc.command, 
+                jobID,
+                jobDesc.cores,
+                jobDesc.memory,
+                jobDesc.command,
                 jobDesc.get_job_kind(),
                 job_environment,
                 gpus,
@@ -519,7 +520,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
     @classmethod
     def getWaitDuration(self):
         return 1
-    
+
     @classmethod
     def assessBatchResources(self):
         '''Profile batch system resources for deeper job submission control

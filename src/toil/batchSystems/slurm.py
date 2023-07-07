@@ -15,6 +15,7 @@ import logging
 import math
 import os
 from argparse import ArgumentParser, _ArgumentGroup
+from queue import Empty
 from shlex import quote
 from typing import Dict, List, Optional, TypeVar, Union
 
@@ -22,7 +23,7 @@ from typing import Dict, List, Optional, TypeVar, Union
 import time
 import configparser
 import pandas as pd
-from toil.batchSystems.abstractBatchSystem import BatchJobExitReason, InsufficientSystemResources
+from toil.batchSystems.abstractBatchSystem import BatchJobExitReason, InsufficientSystemResources, UpdatedBatchJobInfo
 #=======
 from toil.batchSystems.abstractGridEngineBatchSystem import \
     AbstractGridEngineBatchSystem
@@ -118,7 +119,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             for _, status in status_dict.items():
                 exit_codes.append(self._get_job_return_code(status))
             return exit_codes
-        
+
         def getJobExitCode(self, batchJobID: str) -> int:
             """
             Get job exit code for given batch job ID.
@@ -131,6 +132,18 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             status_dict = self._get_job_details([job_id])
             status = status_dict[job_id]
             return self._get_job_return_code(status)
+
+        def getUpdatedBatchJob(self, maxWait):
+            try:
+                logger.debug("getUpdatedBatchJob: Job updates")
+                item = self.updatedJobsQueue.get(timeout=maxWait)
+                self.updatedJobsQueue.task_done()
+                jobID, retcode, exit_reason = (self.jobIDs[item.jobID], item.exitStatus, item.exit_reason)
+                self.currentjobs -= {self.jobIDs[item.jobID]}
+            except Empty:
+                logger.debug("getUpdatedBatchJob: Job queue is empty")
+            else:
+                return UpdatedBatchJobInfo(jobID=jobID, exitStatus=retcode, wallTime=None, exitReason=exit_reason)
 
         def _get_job_details(self, job_id_list: list) -> dict:
             """
@@ -157,17 +170,18 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # an update.
             if isinstance(state, str):
                 if state == 'PENDING' and reason == "BadConstraints":
-                    return BatchJobExitReason(value=rc)
+                    logger.warning('[SlurmJobHandler] Bad Constrains reason detected.')
+                    return BatchJobExitReason.BADCONSTRAINTS
                 if state in ('PENDING', 'RUNNING', 'CONFIGURING', 'COMPLETING', 'RESIZING', 'SUSPENDED'):
                     rc = None
                 if state == "NODE_FAIL":
-                    logger.warning('NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
+                    logger.warning('[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
                     rc = None
             # if state is None:
             #     logger.debug('Could not retrive node state, possibly a NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
             #     rc = None
             return rc
-        
+
         def get_last_partition_switch_details(self, comment):
             '''Get last partition switch time if comment contains it and the switch was done before 2 min
 
@@ -232,7 +246,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             else:
                 logger.debug("Cannot switch partition: No alternate partition configured for %s", partition)
                 return
-            
+
             # set max_possible restart threshold
             # if restart_threshold == -1:
             #     restart_threshold = total_nodes
@@ -475,7 +489,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         )
                 logger.info("Selectable Partitions: %s", usable_partitions)
                 return usable_partitions[0]
-            
+
             if 'preference' in self.batchSystemResources.columns:
                 logger.warning(
                     "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s and preferred type: %s",
@@ -579,7 +593,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 sbatch_line.append(f'--partition={partition}')
             else:
                 logger.info("Skipping slurm partition selection as mem and cpu are not specified.")
-            
+
             if comment is not None:
                 sbatch_line.append(f'--comment={comment}')
 
@@ -632,7 +646,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             #         f'The requested number of accelerators {accelerator} could not be provided.',
             #         f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
             #     ])
-    
+
     @classmethod
     def assessBatchResources(cls):
         slurm_partition_configs = os.popen(
@@ -642,7 +656,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             sed 's/NodeName=/\[/' |
             sed 's/ /\] /' |
             sed 's/ \+/\n/g' |
-            sed 's/(null)//g' | 
+            sed 's/(null)//g' |
             egrep "=|\["
             """
         ).read().strip()
