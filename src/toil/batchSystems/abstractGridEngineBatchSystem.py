@@ -245,6 +245,14 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 )
                 self.forgetJob(job_id)
                 return True
+            if status is not None:
+                self.updatedJobsQueue.put(
+                    UpdatedBatchJobInfo(
+                        jobID=job_id, exitStatus=status, exitReason=None, wallTime=None
+                    )
+                )
+                self.forgetJob(job_id)
+                return True
             return activity
 
         def _runStep(self):
