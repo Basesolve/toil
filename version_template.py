@@ -28,8 +28,8 @@ import the expand_ function and invoke it directly with either no or exactly one
 #  - don't import even standard modules at global scope without renaming them
 #    to have leading/trailing underscores
 
-baseVersion = '5.12.1a1-atoil'
-cgcloudVersion = '1.6.0a1.dev393-atoil'
+baseVersion = '5.12.1a1atoil'
+cgcloudVersion = '1.6.0a1.dev393atoil'
 
 
 def version():
