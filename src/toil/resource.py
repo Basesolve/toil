@@ -384,7 +384,7 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
         Return an instance of this class representing the module of the given name.
 
         If the given module name is "__main__", it will be translated to the actual
-        file name of the top-level script without the .py or .pyc extension. This
+        file name of the top-level script without the .so, .py or .pyc extension. This
         method assumes that the module with the specified name has already been loaded.
         """
         module = sys.modules[name]
@@ -393,8 +393,8 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
         fileAbsPath = os.path.abspath(module.__file__)
         filePath = fileAbsPath.split(os.path.sep)
         filePath[-1], extension = os.path.splitext(filePath[-1])
-        if extension not in (".py", ".pyc"):
-            raise Exception("The name of a user script/module must end in .py or .pyc.")
+        if extension not in (".py", ".pyc", ".so"):
+            raise Exception("The name of a user script/module must end in .so, .py or .pyc.")
         if name == "__main__":
             logger.debug("Discovering real name of module")
             # User script/module was invoked as the main program
