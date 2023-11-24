@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 import os
-import pickle
+import dill as pickle
 import re
 import shutil
 import sys

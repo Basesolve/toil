@@ -15,7 +15,7 @@ import ast
 import json
 import logging
 import os
-import pickle
+import dill as pickle
 import pwd
 import socket
 import sys

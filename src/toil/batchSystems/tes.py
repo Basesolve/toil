@@ -24,7 +24,7 @@ import datetime
 import logging
 import math
 import os
-import pickle
+import dill as pickle
 import time
 from argparse import ArgumentParser, _ArgumentGroup
 from typing import Any, Callable, Dict, List, Optional, Union

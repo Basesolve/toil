@@ -19,7 +19,7 @@ import itertools
 import logging
 import math
 import os
-import pickle
+import dill as pickle
 import sys
 import time
 import uuid

@@ -18,7 +18,7 @@ import base64
 import glob
 import logging
 import os
-import pickle
+import dill as pickle
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Union

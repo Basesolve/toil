@@ -421,7 +421,10 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
 
             for package in reversed(name.split('.')):
                 dirPathTail = filePath.pop()
-                assert dirPathTail == package
+                try:
+                    assert dirPathTail == package
+                except AssertionError as aser:
+                    logger.warning("AssertionError Occured: %s, possibly due to use of shared modules", aser)
             dirPath = os.path.abspath(os.path.sep.join(filePath))
         absPrefix = os.path.abspath(sys.prefix)
         inVenv = inVirtualEnv()

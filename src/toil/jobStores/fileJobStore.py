@@ -14,7 +14,7 @@
 import errno
 import logging
 import os
-import pickle
+import dill as pickle
 import random
 import re
 import shutil
