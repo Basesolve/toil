@@ -61,6 +61,8 @@ class BatchJobExitReason(enum.IntEnum):
     """Job landed on a node with incompatible resources"""
     PKILL: int = 9
     """Process was killed by user/kernel"""
+    OVERUSE = 253
+    """Process was killed by scheduler due constraints"""
 
 class UpdatedBatchJobInfo(NamedTuple):
     jobID: int
