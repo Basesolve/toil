@@ -177,6 +177,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if state == "NODE_FAIL":
                     logger.warning('[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
                     rc = None
+                if state == "OUT_OF_MEMORY":
+                    return BatchJobExitReason.MEMLIMIT
+                if state == "FAILED" and rc == 9:
+                    return BatchJobExitReason.PKILL
             # if state is None:
             #     logger.debug('Could not retrive node state, possibly a NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
             #     rc = None
