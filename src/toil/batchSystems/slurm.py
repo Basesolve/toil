@@ -523,7 +523,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             use_preferred_partition: Optional[bool],
             comment: Optional[str]) -> List[str]:
             #  Returns the sbatch command line before the script to run
-            sbatch_line = ['sbatch', '-J', f'toil_job_{jobID}_{jobName}']
+            timeout = os.getenv("TOIL_SLURM_JOB_TIMEOUT", "02:30:00")
+            sbatch_line = ['sbatch', "-t", timeout,'-J', f'toil_job_{jobID}_{jobName}']
             if gpus:
                 sbatch_line = sbatch_line[:1] + [f'--gres=gpu:{gpus}'] + sbatch_line[1:]
             environment = {}
