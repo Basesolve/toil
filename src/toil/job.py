@@ -657,6 +657,28 @@ class Requirer:
         self._requirementOverrides["preemptible"] = Requirer._parseResource(
             "preemptible", val
         )
+    
+    @property
+    def usePreferredPartition(self) -> bool:
+        """Whether to use preferred partitions for job."""
+        return cast(bool, self._fetchRequirement("usePreferredPartition"))
+
+    @usePreferredPartition.setter
+    def usePreferredPartition(self, val: ParseableFlag) -> None:
+        self._requirementOverrides["usePreferredPartition"] = Requirer._parseResource(
+            "usePreferredPartition", val
+        )
+
+    @property
+    def comment(self) -> str:
+        """Get job comment"""
+        return cast(str, self._fetchRequirement("comment"))
+
+    @comment.setter
+    def comment(self, val: str) -> None:
+        self._requirementOverrides["comment"] = Requirer._parseResource(
+            "comment", val
+        )
 
     @deprecated(new_function_name="preemptible")
     def preemptable(self, val: ParseableFlag) -> None:
