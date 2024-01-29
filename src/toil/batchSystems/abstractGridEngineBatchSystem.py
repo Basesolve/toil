@@ -124,10 +124,10 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             while len(self.waitingJobs) > 0 and \
                     len(self.runningJobs) < int(self.boss.config.max_jobs):
                 activity = True
-                jobID, cpu, memory, command, jobName, environment, gpus, use_preferred_partition, comment = self.waitingJobs.pop(0)
+                jobID, cpu, memory, command, jobName, environment, gpus, usePreferredPartition, comment = self.waitingJobs.pop(0)
 
                 # prepare job submission command
-                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, gpus, use_preferred_partition, comment)
+                subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, gpus, usePreferredPartition, comment)
                 logger.debug("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 if self.boss._outbox is not None:
@@ -310,7 +310,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             jobName: str,
             job_environment: Optional[Dict[str, str]] = None,
             gpus: Optional[int] = None,
-            use_preferred_partition: Optional[bool] = True,
+            usePreferredPartition: Optional[bool] = True,
             comment: Optional[str] = None) -> List[str]:
             """
             Preparation in putting together a command-line string
@@ -322,7 +322,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             :param: string subLine: the command line string to be called
             :param: string jobName: the name of the Toil job, to provide metadata to batch systems if desired
             :param: dict job_environment: the environment variables to be set on the worker
-            :param: bool use_preferred_partition: override prefferred partition selection for the job
+            :param: bool usePreferredPartition: override prefferred partition selection for the job
             :param: string comment: set a job comment
 
             :rtype: List[str]
@@ -427,14 +427,14 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 jobDesc.get_job_kind(),
                 job_environment,
                 gpus,
-                jobDesc.use_preferred_partition,
+                jobDesc.usePreferredPartition,
                 jobDesc.comment)
             )
             logger.debug("Issued the job command: %s with job id: %s and job name %s on spot capacity: %s with comment %s",
                 jobDesc.command,
                 str(jobID),
                 jobDesc.get_job_kind(),
-                jobDesc.use_preferred_partition,
+                jobDesc.usePreferredPartition,
                 jobDesc.comment
             )
         return jobID

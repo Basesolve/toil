@@ -751,8 +751,8 @@ def add_base_toil_options(
         help="A comment to be added to the batch job description.",
     )
     resource_options.add_argument(
-        "--usePrefferedPartitions",
-        dest="usePrefferedPartitions",
+        "--usePrefferedPartition",
+        dest="usePrefferedPartition",
         metavar="BOOL",
         type=convert_bool,
         default=True,

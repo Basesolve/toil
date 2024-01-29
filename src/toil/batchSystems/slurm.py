@@ -70,9 +70,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 jobName: str,
                 job_environment: Optional[Dict[str, str]] = None,
                 gpus: Optional[int] = None,
-                use_preferred_partition: Optional[bool] = True,
+                usePreferredPartition: Optional[bool] = True,
                 comment: Optional[str] = None,) -> List[str]:
-            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, gpus, use_preferred_partition, comment) + [f'--wrap={command}']
+            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, gpus, usePreferredPartition, comment) + [f'--wrap={command}']
 
         def submitJob(self, subLine):
             try:
@@ -519,7 +519,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             jobName: str,
             job_environment: Optional[Dict[str, str]],
             gpus: Optional[int],
-            use_preferred_partition: Optional[bool],
+            usePreferredPartition: Optional[bool],
             comment: Optional[str]) -> List[str]:
             #  Returns the sbatch command line before the script to run
             timeout = os.getenv("TOIL_SLURM_JOB_TIMEOUT", "02:30:00")
@@ -579,20 +579,20 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     "Trying to select partition based on cpus: %s and memory: %s of preferred type: %s",
                     slurm_cpu,
                     slurm_mem,
-                    use_preferred_partition
+                    usePreferredPartition
                 )
                 partition = self.select_partition(
                     slurm_cpu,
                     slurm_mem,
                     accelerators=gpus,
-                    preferred=use_preferred_partition,
+                    preferred=usePreferredPartition,
                 )
                 logger.info(
                     "Selected partition: %s based on cpus: %s and memory: %s of preferred type: %s",
                     partition,
                     slurm_cpu,
                     slurm_mem,
-                    use_preferred_partition
+                    usePreferredPartition
                 )
                 sbatch_line.append(f'--partition={partition}')
             else:

@@ -362,10 +362,10 @@ class RequirementsDict(TypedDict):
     accelerators: NotRequired[List[AcceleratorRequirement]]
     preemptible: NotRequired[bool]
     comment: NotRequired[str]
-    use_preferred_partition: NotRequired[bool]
+    usePreferredPartition: NotRequired[bool]
 
 # These must be all the key names in RequirementsDict
-REQUIREMENT_NAMES = ["disk", "memory", "cores", "accelerators", "preemptible", "comment", "use_preferred_partition"]
+REQUIREMENT_NAMES = ["disk", "memory", "cores", "accelerators", "preemptible", "comment", "usePreferredPartition"]
 
 # This is the supertype of all value types in RequirementsDict
 ParsedRequirement = Union[int, float, bool, List[AcceleratorRequirement]]
@@ -737,7 +737,7 @@ class JobDescription(Requirer):
         displayName: Optional[str] = "",
         command: Optional[str] = None,
         local: Optional[bool] = None,
-        use_preferred_partition: Optional[str] = True,
+        usePreferredPartition: Optional[str] = True,
         comment: Optional[str] = None,
     ) -> None:
         """
@@ -778,7 +778,7 @@ class JobDescription(Requirer):
         self.jobName = makeString(jobName)
         self.unitName = makeString(unitName)
         self.displayName = makeString(displayName)
-        self.use_preferred_partition: Optional[bool] = use_preferred_partition
+        self.usePreferredPartition: Optional[bool] = usePreferredPartition
         self.comment = makeString(comment)
 
         # Set properties that are not fully filled in on creation.
@@ -1422,7 +1422,7 @@ class Job:
         displayName: Optional[str] = "",
         descriptionClass: Optional[type] = None,
         local: Optional[bool] = None,
-        use_preferred_partition: Optional[bool] = True,
+        usePreferredPartition: Optional[bool] = True,
         comment: Optional[str] = None,
     ) -> None:
         """
@@ -1483,7 +1483,7 @@ class Job:
             unitName=unitName,
             displayName=displayName,
             local=local,
-            use_preferred_partition=use_preferred_partition,
+            usePreferredPartition=usePreferredPartition,
             comment=comment
         )
 
@@ -2241,7 +2241,7 @@ class Job:
         Is not executed as a job; runs within a ServiceHostJob.
         """
 
-        def __init__(self, memory=None, cores=None, disk=None, accelerators=None, preemptible=None, unitName=None, use_preferred_partition=None, comment=None):
+        def __init__(self, memory=None, cores=None, disk=None, accelerators=None, preemptible=None, unitName=None, usePreferredPartition=None, comment=None):
             """
             Memory, core and disk requirements are specified identically to as in \
             :func:`toil.job.Job.__init__`.
@@ -2932,7 +2932,7 @@ class FunctionWrappingJob(Job):
                          preemptible=resolve('preemptible'),
                          checkpoint=resolve('checkpoint', default=False),
                          unitName=resolve('name', default=None),
-                         use_preferred_partition=resolve('use_preferred_partition', default=True),
+                         usePreferredPartition=resolve('usePreferredPartition', default=True),
                          comment=resolve('comment', default=None)
                         )
 
