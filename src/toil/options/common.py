@@ -756,7 +756,6 @@ def add_base_toil_options(
         metavar="BOOL",
         type=convert_bool,
         default=True,
-        type=str,
         help="Use preferred partition types for jobs.",
     )
     resource_options.add_argument(
