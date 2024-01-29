@@ -53,7 +53,7 @@ from urllib.parse import urlparse, unquote, quote
 
 import requests
 
-from toil.options.common import add_base_toil_options, JOBSTORE_HELP
+from toil.options.common import add_base_toil_options, JOBSTORE_HELP, iC
 from toil.options.cwl import add_cwl_options
 from toil.options.wdl import add_wdl_options
 
