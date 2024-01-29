@@ -15,19 +15,19 @@ import enum
 import logging
 import os
 import shutil
+import time
 from abc import ABC, abstractmethod
 from argparse import ArgumentParser, _ArgumentGroup
 from contextlib import contextmanager
 from threading import Condition
-import time
 from typing import (Any,
                     ContextManager,
                     Dict,
-                    List,
-                    Set,
                     Iterator,
+                    List,
                     NamedTuple,
                     Optional,
+                    Set,
                     Union,
                     cast)
 
@@ -37,6 +37,7 @@ from toil.common import Config, Toil, cacheDirName
 from toil.deferred import DeferredFunctionManager
 from toil.fileStores.abstractFileStore import AbstractFileStore
 from toil.job import JobDescription, ParsedRequirement, Requirer
+from toil.lib.memoize import memoize
 from toil.resource import Resource
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,8 @@ class AbstractBatchSystem(ABC):
     @abstractmethod
     def supportsWorkerCleanup(cls) -> bool:
         """
+        Whether this batch system supports worker cleanup.
+
         Indicates whether this batch system invokes
         :meth:`BatchSystemSupport.workerCleanup` after the last job for a
         particular workflow invocation finishes. Note that the term *worker*
@@ -125,7 +128,9 @@ class AbstractBatchSystem(ABC):
 
     def setUserScript(self, userScript: Resource) -> None:
         """
-        Set the user script for this workflow. This method must be called before the first job is
+        Set the user script for this workflow.
+
+        This method must be called before the first job is
         issued to this batch system, and only if :meth:`.supportsAutoDeployment` returns True,
         otherwise it will raise an exception.
 
@@ -140,7 +145,6 @@ class AbstractBatchSystem(ABC):
         bus, so that it can send informational messages about the jobs it is
         running to other Toil components.
         """
-        pass
 
     @abstractmethod
     def issueBatchJob(self, jobDesc: JobDescription, job_environment: Optional[Dict[str, str]] = None) -> int:
@@ -269,7 +273,6 @@ class AbstractBatchSystem(ABC):
             setOption(option_name, parsing_function=None, check_function=None, default=None, env=None)
             returning nothing, used to update run configuration as a side effect.
         """
-        pass
 
     def getWorkerContexts(self) -> List[ContextManager[Any]]:
         """
@@ -378,7 +381,7 @@ class BatchSystemSupport(AbstractBatchSystem):
         :param name: the environment variable to be set on the worker.
 
         :param value: if given, the environment variable given by name will be set to this value.
-        if None, the variable's current value will be used as the value on the worker
+            If None, the variable's current value will be used as the value on the worker
 
         :raise RuntimeError: if value is None and the name cannot be found in the environment
         """
@@ -398,6 +401,7 @@ class BatchSystemSupport(AbstractBatchSystem):
         # We do in fact send messages to the message bus.
         self._outbox = message_bus.outbox()
 
+    @memoize
     def get_batch_logs_dir(self) -> str:
         """
         Get the directory where the backing batch system should save its logs.
@@ -410,6 +414,9 @@ class BatchSystemSupport(AbstractBatchSystem):
         """
         if self.config.batch_logs_dir:
             # Use what is specified
+            if not os.path.isdir(self.config.batch_logs_dir):
+                # But if it doesn't exist, make it exist
+                os.makedirs(self.config.batch_logs_dir, exist_ok=True)
             return self.config.batch_logs_dir
         # And if nothing is specified use the workDir.
         return Toil.getToilWorkDir(self.config.workDir)
@@ -448,7 +455,9 @@ class BatchSystemSupport(AbstractBatchSystem):
     @staticmethod
     def workerCleanup(info: WorkerCleanupInfo) -> None:
         """
-        Cleans up the worker node on batch system shutdown. Also see :meth:`supportsWorkerCleanup`.
+        Cleans up the worker node on batch system shutdown.
+
+        Also see :meth:`supportsWorkerCleanup`.
 
         :param WorkerCleanupInfo info: A named tuple consisting of all the relevant information
                for cleaning up the worker.
@@ -504,8 +513,10 @@ class NodeInfo:
 
 class AbstractScalableBatchSystem(AbstractBatchSystem):
     """
-    A batch system that supports a variable number of worker nodes. Used by :class:`toil.
-    provisioners.clusterScaler.ClusterScaler` to scale the number of worker nodes in the cluster
+    A batch system that supports a variable number of worker nodes.
+
+    Used by :class:`toil.provisioners.clusterScaler.ClusterScaler` 
+    to scale the number of worker nodes in the cluster
     up or down depending on overall load.
     """
 

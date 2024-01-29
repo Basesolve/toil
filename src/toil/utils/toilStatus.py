@@ -12,12 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tool for reporting on job status."""
-from collections import defaultdict
 import logging
 import os
 import sys
-from functools import reduce
-import json
 from typing import Any, Dict, List, Optional, Set
 
 from toil.bus import replay_message_bus
@@ -320,7 +317,7 @@ class ToilStatus:
 
 def main() -> None:
     """Reports the state of a Toil workflow."""
-    parser = parser_with_common_options()
+    parser = parser_with_common_options(prog="toil status")
     parser.add_argument("--failIfNotComplete", action="store_true",
                         help="Return exit value of 1 if toil jobs not all completed. default=%(default)s",
                         default=False)

@@ -13,9 +13,9 @@
 # limitations under the License.
 import logging
 import os
-import tempfile
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from tempfile import mkstemp
 from threading import Event, Semaphore
 from typing import (IO,
                     TYPE_CHECKING,
@@ -26,12 +26,14 @@ from typing import (IO,
                     Generator,
                     Iterator,
                     List,
+                    Literal,
                     Optional,
                     Set,
                     Tuple,
                     Type,
                     Union,
-                    cast)
+                    cast,
+                    overload)
 
 import dill
 
@@ -40,7 +42,7 @@ from toil.fileStores import FileID
 from toil.job import Job, JobDescription
 from toil.jobStores.abstractJobStore import AbstractJobStore
 from toil.lib.compatibility import deprecated
-from toil.lib.io import WriteWatchingStream
+from toil.lib.io import WriteWatchingStream, mkdtemp
 
 logger = logging.getLogger(__name__)
 
@@ -120,10 +122,6 @@ class AbstractFileStore(ABC):
         # job is re-run it will need to be able to re-delete these files.
         # This is a set of str objects, not FileIDs.
         self.filesToDelete: Set[str] = set()
-        # Records IDs of jobs that need to be deleted when the currently
-        # running job is cleaned up.
-        # May be modified by the worker to actually delete jobs!
-        self.jobsToDelete: Set[str] = set()
         # Holds records of file ID, or file ID and local path, for reporting
         # the accessed files of failed jobs.
         self._accessLog: List[Tuple[str, ...]] = []
@@ -211,7 +209,7 @@ class AbstractFileStore(ABC):
                  to be deleted once the job terminates, removing all files it
                  contains recursively.
         """
-        return os.path.abspath(tempfile.mkdtemp(dir=self.localTempDir))
+        return os.path.abspath(mkdtemp(dir=self.localTempDir))
 
     def getLocalTempFile(self, suffix: Optional[str] = None, prefix: Optional[str] = None) -> str:
         """
@@ -227,7 +225,7 @@ class AbstractFileStore(ABC):
                  for the duration of the job only, and is guaranteed to be deleted
                  once the job terminates.
         """
-        handle, tmpFile = tempfile.mkstemp(
+        handle, tmpFile = mkstemp(
             suffix=".tmp" if suffix is None else suffix,
             prefix="tmp" if prefix is None else prefix,
             dir=self.localTempDir
@@ -417,6 +415,21 @@ class AbstractFileStore(ABC):
         """
         raise NotImplementedError()
 
+    @overload
+    def readGlobalFileStream(
+        self,
+        fileStoreID: str,
+        encoding: Literal[None] = None,
+        errors: Optional[str] = None,
+    ) -> ContextManager[IO[bytes]]:
+        ...
+
+    @overload
+    def readGlobalFileStream(
+        self, fileStoreID: str, encoding: str, errors: Optional[str] = None
+    ) -> ContextManager[IO[str]]:
+        ...
+
     @abstractmethod
     def readGlobalFileStream(
         self,
@@ -589,7 +602,7 @@ class AbstractFileStore(ABC):
             os.rename(fileName + '.tmp', fileName)
 
     # Functions related to logging
-    def logToMaster(self, text: str, level: int = logging.INFO) -> None:
+    def log_to_leader(self, text: str, level: int = logging.INFO) -> None:
         """
         Send a logging message to the leader. The message will also be \
         logged by the worker at the same level.
@@ -600,13 +613,25 @@ class AbstractFileStore(ABC):
         logger.log(level=level, msg=("LOG-TO-MASTER: " + text))
         self.loggingMessages.append(dict(text=text, level=level))
 
+
+    @deprecated(new_function_name='export_file')
+    def logToMaster(self, text: str, level: int = logging.INFO) -> None:
+        self.log_to_leader(text, level)
+        
+
     # Functions run after the completion of the job.
     @abstractmethod
     def startCommit(self, jobState: bool = False) -> None:
         """
         Update the status of the job on the disk.
 
-        May start an asynchronous process. Call waitForCommit() to wait on that process.
+        May bump the version number of the job.
+
+        May start an asynchronous process. Call waitForCommit() to wait on that
+        process. You must waitForCommit() before committing any further updates
+        to the job. During the asynchronous process, it is safe to modify the
+        job; modifications after this call will not be committed until the next
+        call.
 
         :param jobState: If True, commit the state of the FileStore's job,
                     and file deletes. Otherwise, commit only file creates/updates.

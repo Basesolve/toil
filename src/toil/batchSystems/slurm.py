@@ -30,7 +30,6 @@ from toil.batchSystems.abstractGridEngineBatchSystem import \
 from toil.batchSystems.options import OptionSetter
 from toil.job import Requirer
 from toil.lib.misc import CalledProcessErrorStderr, call_command
-from toil.job import Requirer
 
 logger = logging.getLogger(__name__)
 
@@ -723,5 +722,5 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     OptionType = TypeVar('OptionType')
     @classmethod
     def setOptions(cls, setOption: OptionSetter) -> None:
-        setOption("allocate_mem", bool, default=False)
+        setOption("allocate_mem")
 
