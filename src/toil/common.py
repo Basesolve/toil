@@ -190,6 +190,8 @@ class Config:
     deadlockCheckInterval: Union[float, int]
 
     # Resource requirements
+    defaultComment: str
+    usePrefferedPartitions: bool
     defaultMemory: int
     defaultCores: Union[float, int]
     defaultDisk: int
@@ -361,6 +363,8 @@ class Config:
             set_option("deadlockWait")
             set_option("deadlockCheckInterval")
 
+        set_option("usePrefferedPartitions")
+        set_option("defaultComment")
         set_option("defaultMemory")
         set_option("defaultCores")
         set_option("defaultDisk")

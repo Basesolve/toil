@@ -361,9 +361,11 @@ class RequirementsDict(TypedDict):
     disk: NotRequired[int]
     accelerators: NotRequired[List[AcceleratorRequirement]]
     preemptible: NotRequired[bool]
+    comment: NotRequired[str]
+    use_preferred_partition: NotRequired[bool]
 
 # These must be all the key names in RequirementsDict
-REQUIREMENT_NAMES = ["disk", "memory", "cores", "accelerators", "preemptible"]
+REQUIREMENT_NAMES = ["disk", "memory", "cores", "accelerators", "preemptible", "comment", "use_preferred_partition"]
 
 # This is the supertype of all value types in RequirementsDict
 ParsedRequirement = Union[int, float, bool, List[AcceleratorRequirement]]
