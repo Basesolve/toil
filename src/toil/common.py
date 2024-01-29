@@ -53,7 +53,7 @@ from urllib.parse import urlparse, unquote, quote
 
 import requests
 
-from toil.options.common import add_base_toil_options, JOBSTORE_HELP, iC
+from toil.options.common import add_base_toil_options, JOBSTORE_HELP
 from toil.options.cwl import add_cwl_options
 from toil.options.wdl import add_wdl_options
 
@@ -379,8 +379,8 @@ class Config:
         set_option("enableUnlimitedPreemptibleRetries")
         set_option("doubleMem")
         set_option("enableBadConstraintGpuHandling")
-        set_option("maxJobDuration", int, iC(1))
-        set_option("rescueJobsFrequency", int, iC(1))
+        set_option("maxJobDuration")
+        set_option("rescueJobsFrequency")
 
         # Log management
         set_option("maxLogFileSize")
