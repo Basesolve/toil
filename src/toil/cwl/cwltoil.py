@@ -34,27 +34,25 @@ import stat
 import sys
 import textwrap
 import uuid
-from tempfile import NamedTemporaryFile, gettempdir
+from tempfile import NamedTemporaryFile, TemporaryFile, gettempdir
 from threading import Thread
-from typing import (
-    IO,
-    Any,
-    Callable,
-    Dict,
-    Iterator,
-    List,
-    Mapping,
-    MutableMapping,
-    MutableSequence,
-    Optional,
-    TextIO,
-    Tuple,
-    Type,
-    TypeVar,
-    Union,
-    cast,
-    Sequence,
-)
+from typing import (IO,
+                    Any,
+                    Callable,
+                    Dict,
+                    Iterator,
+                    List,
+                    Mapping,
+                    MutableMapping,
+                    MutableSequence,
+                    Optional,
+                    Sequence,
+                    TextIO,
+                    Tuple,
+                    Type,
+                    TypeVar,
+                    Union,
+                    cast)
 from urllib.parse import quote, unquote, urlparse, urlsplit
 
 import cwl_utils.errors
@@ -68,36 +66,30 @@ import cwltool.load_tool
 import cwltool.main
 import cwltool.resolver
 import schema_salad.ref_resolver
-from configargparse import ArgParser, SUPPRESS, Namespace
+from configargparse import SUPPRESS, ArgParser, Namespace
 from cwltool.loghandler import _logger as cwllogger
 from cwltool.loghandler import defaultStreamHandler
 from cwltool.mpi import MpiConfig
 from cwltool.mutation import MutationManager
 from cwltool.pathmapper import MapperEnt, PathMapper
-from cwltool.process import (
-    Process,
-    add_sizes,
-    compute_checksums,
-    fill_in_defaults,
-    shortname,
-)
+from cwltool.process import (Process,
+                             add_sizes,
+                             compute_checksums,
+                             fill_in_defaults,
+                             shortname)
 from cwltool.secrets import SecretStore
-from cwltool.software_requirements import (
-    DependenciesConfiguration,
-    get_container_from_software_requirements,
-)
+from cwltool.software_requirements import (DependenciesConfiguration,
+                                           get_container_from_software_requirements)
 from cwltool.stdfsaccess import StdFsAccess, abspath
-from cwltool.utils import (
-    CWLObjectType,
-    CWLOutputType,
-    DirectoryType,
-    adjustDirObjs,
-    aslist,
-    downloadHttpFile,
-    get_listing,
-    normalizeFilesDirs,
-    visit_class,
-)
+from cwltool.utils import (CWLObjectType,
+                           CWLOutputType,
+                           DirectoryType,
+                           adjustDirObjs,
+                           aslist,
+                           downloadHttpFile,
+                           get_listing,
+                           normalizeFilesDirs,
+                           visit_class)
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from schema_salad.avro.schema import Names
 from schema_salad.exceptions import ValidationException
@@ -110,18 +102,17 @@ from toil.common import Toil, addOptions
 from toil.cwl import check_cwltool_version
 
 check_cwltool_version()
-from toil.cwl.utils import (
-    CWL_UNSUPPORTED_REQUIREMENT_EXCEPTION,
-    CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE,
-    download_structure,
-    get_from_structure,
-    visit_cwl_class_and_reduce,
-)
+from toil.cwl.utils import (CWL_UNSUPPORTED_REQUIREMENT_EXCEPTION,
+                            CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE,
+                            download_structure,
+                            get_from_structure,
+                            visit_cwl_class_and_reduce)
 from toil.exceptions import FailedJobsException
 from toil.fileStores import FileID
 from toil.fileStores.abstractFileStore import AbstractFileStore
 from toil.job import AcceleratorRequirement, Job, Promise, Promised, unwrap
-from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchFileException
+from toil.jobStores.abstractJobStore import (AbstractJobStore,
+                                             NoSuchFileException)
 from toil.jobStores.fileJobStore import FileJobStore
 from toil.jobStores.utils import JobStoreUnavailableException, generate_locator
 from toil.lib.io import mkdtemp
@@ -1987,7 +1978,7 @@ def upload_file(
 
     Uploads local files to the Toil file store, and sets their location to a
     reference to the toil file store.
-    
+
     Unless skip_remote is set, downloads remote files into the file store and
     sets their locations to references into the file store as well.
     """
@@ -2614,6 +2605,13 @@ class CWLJob(CWLNamedJob):
                 streaming_allowed=runtime_context.streaming_allowed,
             )
 
+        # Collect standard output and standard error somewhere if they don't go to files.
+        # We need to keep two FDs to these because cwltool will close what we give it.
+        default_stdout = TemporaryFile()
+        runtime_context.default_stdout = os.fdopen(os.dup(default_stdout.fileno()), 'wb')
+        default_stderr = TemporaryFile()
+        runtime_context.default_stderr = os.fdopen(os.dup(default_stderr.fileno()), 'wb')
+
         process_uuid = uuid.uuid4()  # noqa F841
         started_at = datetime.datetime.now()  # noqa F841
 
@@ -2622,13 +2620,34 @@ class CWLJob(CWLNamedJob):
         logger.debug("Running tool %s with order: %s", self.cwltool, self.cwljob)
 
         runtime_context.name = self.description.unitName
-        output, status = ToilSingleJobExecutor().execute(
-            process=self.cwltool,
-            job_order_object=cwljob,
-            runtime_context=runtime_context,
-            logger=cwllogger,
-        )
-        ended_at = datetime.datetime.now()  # noqa F841
+
+        status = "did_not_run"
+        try:
+            output, status = ToilSingleJobExecutor().execute(
+                process=self.cwltool,
+                job_order_object=cwljob,
+                runtime_context=runtime_context,
+                logger=cwllogger,
+            )
+        finally:
+            ended_at = datetime.datetime.now()  # noqa F841
+
+            # Log any output/error data
+            default_stdout.seek(0, os.SEEK_END)
+            if default_stdout.tell() > 0:
+                default_stdout.seek(0)
+                file_store.log_user_stream(self.description.unitName + '.stdout', default_stdout)
+                if status != "success":
+                    default_stdout.seek(0)
+                    logger.error("Failed command standard output:\n%s", default_stdout.read().decode("utf-8", errors="replace"))
+            default_stderr.seek(0, os.SEEK_END)
+            if default_stderr.tell():
+                default_stderr.seek(0)
+                file_store.log_user_stream(self.description.unitName + '.stderr', default_stderr)
+                if status != "success":
+                    default_stderr.seek(0)
+                    logger.error("Failed command standard error:\n%s", default_stderr.read().decode("utf-8", errors="replace"))
+
         if status != "success":
             raise cwl_utils.errors.WorkflowException(status)
 
@@ -3352,12 +3371,12 @@ def determine_load_listing(
 
     1. no_listing: DIRECTORY_NAME.listing will be undefined.
         e.g.
-            
+
             inputs.DIRECTORY_NAME.listing == unspecified
 
     2. shallow_listing: DIRECTORY_NAME.listing will return a list one level
         deep of DIRECTORY_NAME's contents.
-        e.g. 
+        e.g.
 
             inputs.DIRECTORY_NAME.listing == [items in directory]
              inputs.DIRECTORY_NAME.listing[0].listing == undefined
@@ -3576,7 +3595,6 @@ def main(args: Optional[List[str]] = None, stdout: TextIO = sys.stdout) -> int:
         dependencies_configuration = DependenciesConfiguration(options)
         job_script_provider = dependencies_configuration
 
-    options.default_container = None
     runtime_context = cwltool.context.RuntimeContext(vars(options))
     runtime_context.toplevel = True  # enable discovery of secondaryFiles
     runtime_context.find_default_container = functools.partial(
@@ -3789,7 +3807,7 @@ def main(args: Optional[List[str]] = None, stdout: TextIO = sys.stdout) -> int:
                 Callable[[str], FileID],
                 functools.partial(toil.import_file, symlink=True),
             )
-            
+
             # Import all the input files, some of which may be missing optional
             # files.
             logger.info("Importing input files...")

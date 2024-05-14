@@ -65,13 +65,28 @@ class BatchJobExitReason(enum.IntEnum):
     OVERUSE = 253
     """Process was killed by scheduler due constraints"""
 
+    @classmethod
+    def to_string(cls, value: int) -> str:
+        """
+        Convert to human-readable string.
+
+        Given an int that may be or may be equal to a value from the enum,
+        produce the string value of its matching enum entry, or a stringified
+        int.
+        """
+        try:
+            return cls(value).name
+        except ValueError:
+            return str(value)
+
 class UpdatedBatchJobInfo(NamedTuple):
     jobID: int
     exitStatus: int
     """
     The exit status (integer value) of the job. 0 implies successful.
 
-    EXIT_STATUS_UNAVAILABLE_VALUE is used when the exit status is not available (e.g. job is lost).
+    EXIT_STATUS_UNAVAILABLE_VALUE is used when the exit status is not available
+    (e.g. job is lost, or otherwise died but actual exit code was not reported).
     """
 
     exitReason: Optional[BatchJobExitReason]
@@ -515,7 +530,7 @@ class AbstractScalableBatchSystem(AbstractBatchSystem):
     """
     A batch system that supports a variable number of worker nodes.
 
-    Used by :class:`toil.provisioners.clusterScaler.ClusterScaler` 
+    Used by :class:`toil.provisioners.clusterScaler.ClusterScaler`
     to scale the number of worker nodes in the cluster
     up or down depending on overall load.
     """

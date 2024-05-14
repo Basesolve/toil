@@ -37,11 +37,12 @@ from typing import (IO,
 
 import dill
 
-from toil.common import Toil, cacheDirName
+from toil.common import Toil, cacheDirName, getDirSizeRecursively
 from toil.fileStores import FileID
 from toil.job import Job, JobDescription
 from toil.jobStores.abstractJobStore import AbstractJobStore
 from toil.lib.compatibility import deprecated
+from toil.lib.conversions import bytes2human
 from toil.lib.io import WriteWatchingStream, mkdtemp
 
 logger = logging.getLogger(__name__)
@@ -116,7 +117,8 @@ class AbstractFileStore(ABC):
             self.jobDesc.command.split()[1] if self.jobDesc.command else ""
         )
         self.waitForPreviousCommit = waitForPreviousCommit
-        self.loggingMessages: List[Dict[str, Union[int, str]]] = []
+        self.logging_messages: List[Dict[str, Union[int, str]]] = []
+        self.logging_user_streams: List[dict[str, str]] = []
         # Records file IDs of files deleted during the current job. Doesn't get
         # committed back until the job is completely successful, because if the
         # job is re-run it will need to be able to re-delete these files.
@@ -125,6 +127,8 @@ class AbstractFileStore(ABC):
         # Holds records of file ID, or file ID and local path, for reporting
         # the accessed files of failed jobs.
         self._accessLog: List[Tuple[str, ...]] = []
+        # Holds total bytes of observed disk usage for the last job run under open()
+        self._job_disk_used: Optional[int] = None
 
     @staticmethod
     def createFileStore(
@@ -188,6 +192,7 @@ class AbstractFileStore(ABC):
         :param job: The job instance of the toil job to run.
         """
         failed = True
+        job_requested_disk = job.disk
         try:
             yield
             failed = False
@@ -196,6 +201,33 @@ class AbstractFileStore(ABC):
             # to appear as "another exception occurred" in the stack trace.
             if failed:
                 self._dumpAccessLogs()
+
+            # See how much disk space is used at the end of the job.
+            # Not a real peak disk usage, but close enough to be useful for warning the user.
+            self._job_disk_used = getDirSizeRecursively(self.localTempDir)
+
+            # Report disk usage
+            percent: float = 0.0
+            if job_requested_disk and job_requested_disk > 0:
+                percent = float(self._job_disk_used) / job_requested_disk * 100
+            disk_usage: str = (f"Job {self.jobName} used {percent:.2f}% disk ({bytes2human(self._job_disk_used)}B [{self._job_disk_used}B] used, "
+                               f"{bytes2human(job_requested_disk)}B [{job_requested_disk}B] requested).")
+            if self._job_disk_used > job_requested_disk:
+                self.log_to_leader("Job used more disk than requested. For CWL, consider increasing the outdirMin "
+                                 f"requirement, otherwise, consider increasing the disk requirement. {disk_usage}",
+                                 level=logging.WARNING)
+            else:
+                self.log_to_leader(disk_usage, level=logging.DEBUG)
+
+    def get_disk_usage(self) -> Optional[int]:
+        """
+        Get the number of bytes of disk used by the last job run under open().
+
+        Disk usage is measured at the end of the job.
+        TODO: Sample periodically and record peak usage.
+        """
+        return self._job_disk_used
+
 
     # Functions related to temp files and directories
     def getLocalTempDir(self) -> str:
@@ -611,13 +643,30 @@ class AbstractFileStore(ABC):
         :param level: The logging level.
         """
         logger.log(level=level, msg=("LOG-TO-MASTER: " + text))
-        self.loggingMessages.append(dict(text=text, level=level))
+        self.logging_messages.append(dict(text=text, level=level))
 
 
     @deprecated(new_function_name='export_file')
     def logToMaster(self, text: str, level: int = logging.INFO) -> None:
         self.log_to_leader(text, level)
-        
+
+    def log_user_stream(self, name: str, stream: IO[bytes]) -> None:
+        """
+        Send a stream of UTF-8 text to the leader as a named log stream.
+
+        Useful for things like the error logs of Docker containers. The leader
+        will show it to the user or organize it appropriately for user-level
+        log information.
+
+        :param name: A hierarchical, .-delimited string.
+        :param stream: A stream of encoded text. Encoding errors will be
+            tolerated.
+        """
+
+        # Read the whole stream into memory
+        steam_data = stream.read().decode('utf-8', errors='replace')
+        # And remember it for the worker to fish out
+        self.logging_user_streams.append(dict(name=name, text=steam_data))
 
     # Functions run after the completion of the job.
     @abstractmethod

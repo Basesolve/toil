@@ -27,7 +27,7 @@ If not already present, please install the latest Python ``virtualenv`` using pi
 
 And create a virtual environment called ``venv`` somewhere convenient, usch as under ``~``::
 
-    $ python -m virtualenv ~/venv
+    $ python3 -m virtualenv ~/venv
 
 .. _pip: https://pip.readthedocs.io/en/latest/installing/
 
@@ -74,7 +74,7 @@ Here's what each extra provides:
 |                | will be skipped if not on a linux computer).               |
 +----------------+------------------------------------------------------------+
 | ``aws``        | Provides support for managing a cluster on Amazon Web      |
-|                | Service (`AWS`_) using Toil's built in :ref:`clusterRef`.  |
+|                | Service (`AWS`_) using Toil's built in :ref:`clusterUtils`.|
 |                | Clusters can scale up and down automatically.              |
 |                | It also supports storing workflow state.                   |
 +----------------+------------------------------------------------------------+

@@ -2,13 +2,12 @@ import os
 from argparse import ArgumentParser, Action, _AppendAction
 from typing import Any, Optional, Union, Type, Callable, List, Dict, TYPE_CHECKING
 
-from distutils.util import strtobool
 from configargparse import SUPPRESS
 import logging
 
 from ruamel.yaml import YAML
 
-from toil.lib.conversions import bytes2human, human2bytes
+from toil.lib.conversions import bytes2human, human2bytes, strtobool
 
 from toil.batchSystems.options import add_all_batchsystem_options
 from toil.provisioners import parse_node_types
@@ -556,7 +555,7 @@ def add_base_toil_options(
         metavar="INT[,INT...]",
         help=f"Maximum number of nodes of each type in the cluster, if using autoscaling, "
         f"provided as a comma-separated list.  The first value is used as a default "
-        f"if the list length is less than the number of nodeTypes.  "
+        "if the list length is less than the number of nodeTypes.  "
         f"default=%(default)s",
     )
     autoscaling_options.add_argument(
@@ -974,6 +973,68 @@ def add_base_toil_options(
         default=False,
         help="Enable real-time logging from workers to leader",
     )
+    log_options.add_argument(
+        "--maxLogFileSize",
+        dest="maxLogFileSize",
+        default=100 * 1024 * 1024,
+        type=h2b,
+        action=make_open_interval_action(1),
+        help=f"The maximum size of a job log file to keep (in bytes), log files larger than "
+        f"this will be truncated to the last X bytes. Setting this option to zero will "
+        f"prevent any truncation. Setting this option to a negative value will truncate "
+        f"from the beginning.  Default={bytes2human(100 * 1024 * 1024)}",
+    )
+    log_options.add_argument(
+        "--writeLogs",
+        dest="writeLogs",
+        nargs="?",
+        action="store",
+        default=None,
+        const=os.getcwd(),
+        metavar="OPT_PATH",
+        help="Write worker logs received by the leader into their own files at the specified "
+        "path. Any non-empty standard output and error from failed batch system jobs will "
+        "also be written into files at this path.  The current working directory will be "
+        "used if a path is not specified explicitly. Note: By default only the logs of "
+        "failed jobs are returned to leader. Set log level to 'debug' or enable "
+        "'--writeLogsFromAllJobs' to get logs back from successful jobs, and adjust "
+        "'maxLogFileSize' to control the truncation limit for worker logs.",
+    )
+    log_options.add_argument(
+        "--writeLogsGzip",
+        dest="writeLogsGzip",
+        nargs="?",
+        action="store",
+        default=None,
+        const=os.getcwd(),
+        metavar="OPT_PATH",
+        help="Identical to --writeLogs except the logs files are gzipped on the leader.",
+    )
+    log_options.add_argument(
+        "--writeLogsFromAllJobs",
+        dest="writeLogsFromAllJobs",
+        type=convert_bool,
+        default=False,
+        metavar="BOOL",
+        help="Whether to write logs from all jobs (including the successful ones) without "
+        "necessarily setting the log level to 'debug'. Ensure that either --writeLogs "
+        "or --writeLogsGzip is set if enabling this option.",
+    )
+    log_options.add_argument(
+        "--writeMessages",
+        dest="write_messages",
+        default=None,
+        type=lambda x: None if x is None else os.path.abspath(x),
+        metavar="PATH",
+        help="File to send messages from the leader's message bus to.",
+    )
+    log_options.add_argument(
+        "--realTimeLogging",
+        dest="realTimeLogging",
+        type=convert_bool,
+        default=False,
+        help="Enable real-time logging from workers to leader",
+    )
 
     # Misc options
     misc_options = parser.add_argument_group(
@@ -1093,9 +1154,8 @@ def add_base_toil_options(
     misc_options.add_argument(
         "--disableProgress",
         dest="disableProgress",
-        type=convert_bool,
+        action="store_true",
         default=False,
-        metavar="BOOL",
         help="Disables the progress bar shown when standard error is a terminal.",
     )
 
@@ -1165,4 +1225,4 @@ def add_base_toil_options(
     caching.add_argument(
         "--disableCaching", dest="enableCaching", action="store_false", help=SUPPRESS
     )
-    caching.set_defaults(disableCaching=None)
+    caching.set_defaults(enableCaching=None)

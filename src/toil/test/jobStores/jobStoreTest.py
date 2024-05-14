@@ -40,7 +40,6 @@ from toil.job import Job, JobDescription, TemporaryID
 from toil.jobStores.abstractJobStore import (NoSuchFileException,
                                              NoSuchJobException)
 from toil.jobStores.fileJobStore import FileJobStore
-from toil.lib.aws.utils import create_s3_bucket, get_object_for_url
 from toil.lib.io import mkdtemp
 from toil.lib.memoize import memoize
 from toil.lib.retry import retry
@@ -548,14 +547,16 @@ class AbstractJobStoreTest:
             jobNames = ['testStatsAndLogging_writeLogFiles']
             jobLogList = ['string', b'bytes', '', b'newline\n']
             config = self._createConfig()
-            setattr(config, 'writeLogs', '.')
+            setattr(config, 'writeLogs', self._createTempDir())
             setattr(config, 'writeLogsGzip', None)
             StatsAndLogging.writeLogFiles(jobNames, jobLogList, config)
-            jobLogFile = os.path.join(config.writeLogs, jobNames[0] + '000.log')
+            jobLogFile = os.path.join(config.writeLogs, jobNames[0] + '_000.log')
+            # The log directory should get exactly one file, names after this
+            # easy job name with no replacements needed.
+            self.assertEqual(os.listdir(config.writeLogs), [os.path.basename(jobLogFile)])
             self.assertTrue(os.path.isfile(jobLogFile))
             with open(jobLogFile) as f:
                 self.assertEqual(f.read(), 'string\nbytes\n\nnewline\n')
-            os.remove(jobLogFile)
 
         def testBatchCreate(self):
             """Test creation of many jobs."""
@@ -1463,6 +1464,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
 
     def _hashTestFile(self, url: str) -> str:
         from toil.jobStores.aws.jobStore import AWSJobStore
+        from toil.lib.aws.utils import get_object_for_url
         str(AWSJobStore)  # to prevent removal of that import
         key = get_object_for_url(urlparse.urlparse(url), existing=True)
         contents = key.get().get('Body').read()
@@ -1471,7 +1473,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
     def _createExternalStore(self):
         """A S3.Bucket instance is returned"""
         from toil.jobStores.aws.jobStore import establish_boto3_session
-        from toil.lib.aws.utils import retry_s3
+        from toil.lib.aws.utils import retry_s3, create_s3_bucket
 
         resource = establish_boto3_session().resource(
             "s3", region_name=self.awsRegion()

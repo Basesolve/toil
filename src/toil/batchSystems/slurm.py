@@ -17,13 +17,13 @@ import os
 from argparse import ArgumentParser, _ArgumentGroup
 from queue import Empty
 from shlex import quote
-from typing import Dict, List, Optional, TypeVar, Union
+from typing import Dict, List, Optional, Tuple, TypeVar, Union
 
 #=======
 import time
 import configparser
 import pandas as pd
-from toil.batchSystems.abstractBatchSystem import BatchJobExitReason, InsufficientSystemResources, UpdatedBatchJobInfo
+from toil.batchSystems.abstractBatchSystem import BatchJobExitReason, InsufficientSystemResources, UpdatedBatchJobInfo, EXIT_STATUS_UNAVAILABLE_VALUE
 #=======
 from toil.batchSystems.abstractGridEngineBatchSystem import \
     AbstractGridEngineBatchSystem
@@ -72,7 +72,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 gpus: Optional[int] = None,
                 usePreferredPartition: Optional[bool] = True,
                 comment: Optional[str] = None,) -> List[str]:
-            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, gpus, usePreferredPartition, comment) + [f'--wrap={command}']
+            return self.prepareSbatch(cpu, memory, jobID, jobName, job_environment, gpus, usePreferredPartition, comment) + [f'--wrap=exec {command}']
 
         def submitJob(self, subLine):
             try:
@@ -103,12 +103,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 logger.error("sbatch command failed")
                 raise e
 
-        def coalesce_job_exit_codes(self, batch_job_id_list: list) -> list:
+        def coalesce_job_exit_codes(self, batch_job_id_list: list) -> List[Union[int, Tuple[int, Optional[BatchJobExitReason]], None]]:
             """
             Collect all job exit codes in a single call.
             :param batch_job_id_list: list of Job ID strings, where each string has the form
             "<job>[.<task>]".
-            :return: list of job exit codes, associated with the list of job IDs.
+            :return: list of job exit codes or exit code, exit reason pairs associated with the list of job IDs.
             """
             logger.debug("Getting exit codes for slurm jobs: %s", batch_job_id_list)
             # Convert batch_job_id_list to list of integer job IDs.
@@ -119,7 +119,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 exit_codes.append(self._get_job_return_code(status))
             return exit_codes
 
-        def getJobExitCode(self, batchJobID: str) -> int:
+        def getJobExitCode(self, batchJobID: str) -> Union[int, Tuple[int, Optional[BatchJobExitReason]], None]:
             """
             Get job exit code for given batch job ID.
             :param batchJobID: string of the form "<job>[.<task>]".
@@ -158,32 +158,73 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 status_dict = self._getJobDetailsFromScontrol(job_id_list)
             return status_dict
 
-        def _get_job_return_code(self, status: tuple) -> list:
+        def _get_job_return_code(self, status: tuple) -> Union[int, Tuple[int, Optional[BatchJobExitReason]], None]:
             """
+            Given a Slurm return code, status pair, summarize them into a Toil return code, exit reason pair.
+
+            The return code may have already been OR'd with the 128-offset
+            Slurm-reported signal.
+
+            Slurm will report return codes of 0 even if jobs time out instead
+            of succeeding:
+
+                2093597|TIMEOUT|0:0
+                2093597.batch|CANCELLED|0:15
+
+            So we guarantee here that, if the Slurm status string is not a
+            successful one as defined in
+            <https://slurm.schedmd.com/squeue.html#SECTION_JOB-STATE-CODES>, we
+            will not return a successful return code.
+
             Helper function for `getJobExitCode` and `coalesce_job_exit_codes`.
-            :param status: tuple containing the job's state and it's return code.
-            :return: the job's return code if it's completed, otherwise None.
+            :param status: tuple containing the job's state and it's return code from Slurm.
+            :return: the job's return code for Toil if it's completed, otherwise None.
             """
             state, rc, reason = status
-            # If job is in a running state, set return code to None to indicate we don't have
-            # an update.
-            if isinstance(state, str):
-                if state == 'PENDING' and reason == "BadConstraints":
+
+            # If a job is in one of these states, Slurm can't run it anymore.
+            # We don't include states where the job is held or paused here;
+            # those mean it could run and needs to wait for someone to un-hold
+            # it, so Toil should wait for it.
+            #
+            # We map from each terminal state to the Toil-ontology exit reason.
+            TERMINAL_STATES: Dict[str, BatchJobExitReason] = {
+                "BOOT_FAIL": BatchJobExitReason.LOST,
+                "CANCELLED": BatchJobExitReason.KILLED,
+                "COMPLETED": BatchJobExitReason.FINISHED,
+                "DEADLINE": BatchJobExitReason.KILLED,
+                "FAILED": BatchJobExitReason.FAILED,
+                "NODE_FAIL": BatchJobExitReason.LOST,
+                "OUT_OF_MEMORY": BatchJobExitReason.MEMLIMIT,
+                "PREEMPTED": BatchJobExitReason.KILLED,
+                "TIMEOUT": BatchJobExitReason.KILLED
+            }
+            if state not in TERMINAL_STATES:
+                if reason == "BadConstraints":
                     logger.warning('[SlurmJobHandler] Bad Constrains reason detected.')
                     return BatchJobExitReason.BADCONSTRAINTS
-                if state in ('PENDING', 'RUNNING', 'CONFIGURING', 'COMPLETING', 'RESIZING', 'SUSPENDED'):
-                    rc = None
-                if state == "NODE_FAIL":
-                    logger.warning('[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
-                    rc = None
-                if state == "OUT_OF_MEMORY":
-                    return BatchJobExitReason.MEMLIMIT
-                if state == "FAILED" and rc == 9:
-                    return BatchJobExitReason.PKILL
-            # if state is None:
-            #     logger.debug('Could not retrive node state, possibly a NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
-            #     rc = None
-            return rc
+                # Don't treat the job as exited yet
+                return None
+
+            exit_reason = TERMINAL_STATES[state]
+
+            if exit_reason == BatchJobExitReason.FINISHED:
+                # The only state that should produce a 0 ever is COMPLETED. So
+                # if the job is COMPLETED and the exit reason is thus FINISHED,
+                # pass along the code it has.
+                return (rc, exit_reason)
+            
+            if exit_reason == BatchJobExitReason.LOST:
+                logger.warning('[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition.')
+                return None
+
+            if rc == 0:
+                # The job claims to be in a state other than COMPLETED, but
+                # also to have not encountered a problem. Say the exit status
+                # is unavailable.
+                return (EXIT_STATUS_UNAVAILABLE_VALUE, exit_reason)
+            # If the code is nonzero, pass it along.
+            return (rc, exit_reason)# If the code is nonzero, pass it along.
 
         def get_last_partition_switch_details(self, comment):
             '''Get last partition switch time if comment contains it and the switch was done before 2 min
@@ -269,9 +310,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 logger.info(f"Executing: {switch_command}")
                 switch_exit_code = os.system(switch_command)
                 if switch_exit_code == 0:
-                    logger.info(f"Job: %s has been swithced to alternate partition: %s", job_id, alternate_partition)
+                    logger.info("Job: %s has been swithced to alternate partition: %s", job_id, alternate_partition)
                 else:
-                    logger.warning(f"Job: %s could not be swithced to alternate partition: %s, Error Code: %s", job_id, alternate_partition, switch_exit_code)
+                    logger.warning("Job: %s could not be swithced to alternate partition: %s, Error Code: %s", job_id, alternate_partition, switch_exit_code)
 
         def _getJobDetailsFromSacct(self, job_id_list: list) -> dict:
             """
@@ -521,9 +562,25 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             gpus: Optional[int],
             usePreferredPartition: Optional[bool],
             comment: Optional[str]) -> List[str]:
-            #  Returns the sbatch command line before the script to run
+            """
+            Returns the sbatch command line to run to queue the job.
+            """
             timeout = os.getenv("TOIL_SLURM_JOB_TIMEOUT", "02:30:00")
-            sbatch_line = ['sbatch', "-t", timeout,'-J', f'toil_job_{jobID}_{jobName}']
+            # Start by naming the job
+            sbatch_line = ['sbatch', "-t", timeout, '-J', f'toil_job_{jobID}_{jobName}']
+
+            # Make sure the job gets a signal before it disappears so that e.g.
+            # container cleanup finally blocks can run. Ask for SIGINT so we
+            # can get the default Python KeyboardInterrupt which third-party
+            # code is likely to plan for. Make sure to send it to the batch
+            # shell process with "B:", not to all the srun steps it launches
+            # (because there shouldn't be any). We cunningly replaced the batch
+            # shell process with the Toil worker process, so Toil should be
+            # able to get the signal.
+            #
+            # TODO: Add a way to detect when the job failed because it
+            # responded to this signal and use the right exit reason for it.
+            sbatch_line.append("--signal=B:INT@30")
             if gpus:
                 sbatch_line = sbatch_line[:1] + [f'--gres=gpu:{gpus}'] + sbatch_line[1:]
             environment = {}

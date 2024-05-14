@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 class StatsDict(MagicExpando):
     """Subclass of MagicExpando for type-checking purposes."""
 
-    jobs: List[str]
+    jobs: List[MagicExpando]
 
 
 def nextChainable(predecessor: JobDescription, jobStore: AbstractJobStore, config: Config) -> Optional[JobDescription]:
@@ -287,13 +287,14 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
 
     jobAttemptFailed = False
     failure_exit_code = 1
+    first_job_cores = None
     statsDict = StatsDict()  # type: ignore[no-untyped-call]
     statsDict.jobs = []
-    statsDict.workers.logsToMaster = []
+    statsDict.workers.logs_to_leader = []
+    statsDict.workers.logging_user_streams = []
 
     def blockFn() -> bool:
         return True
-    listOfJobs = [jobName]
     job = None
     try:
 
@@ -313,7 +314,6 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
         ##########################################
 
         jobDesc = jobStore.load_job(jobStoreID)
-        listOfJobs[0] = str(jobDesc)
         logger.debug("Parsed job description")
 
         ##########################################
@@ -363,6 +363,8 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
         ##########################################
 
         if config.stats:
+            # Remember the cores from the first job, which is how many we have reserved for us.
+            statsDict.workers.requested_cores = jobDesc.cores
             startClock = get_total_cpu_time()
 
         startTime = time.time()
@@ -411,7 +413,8 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
                             # job body cut.
 
                 # Accumulate messages from this job & any subsequent chained jobs
-                statsDict.workers.logsToMaster += fileStore.loggingMessages
+                statsDict.workers.logs_to_leader += fileStore.logging_messages
+                statsDict.workers.logging_user_streams += fileStore.logging_user_streams
 
                 logger.info("Completed body for %s", jobDesc)
 
@@ -457,9 +460,6 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
             # body) up after we finish executing it.
             successorID = successor.jobStoreID
 
-            # add the successor to the list of jobs run
-            listOfJobs.append(str(successor))
-
             # Now we need to become that successor, under the original ID.
             successor.replace(jobDesc)
             jobDesc = successor
@@ -489,6 +489,16 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
             statsDict.workers.time = str(time.time() - startTime)
             statsDict.workers.clock = str(totalCPUTime - startClock)
             statsDict.workers.memory = str(totalMemoryUsage)
+            # Say the worker used the max disk we saw from any job
+            max_bytes = 0
+            for job_stats in statsDict.jobs:
+                if "disk" in job_stats:
+                    max_bytes = max(max_bytes, int(job_stats.disk))
+            statsDict.workers.disk = str(max_bytes)
+            # Count the jobs executed.
+            # TODO: toil stats could compute this but its parser is too general to hook into simply.
+            statsDict.workers.jobs_run  = len(statsDict.jobs)
+
 
         # log the worker log path here so that if the file is truncated the path can still be found
         if redirectOutputToLogFile:
@@ -499,13 +509,16 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
     ##########################################
     #Trapping where worker goes wrong
     ##########################################
-    except Exception as e: #Case that something goes wrong in worker
+    except BaseException as e: #Case that something goes wrong in worker, or we are asked to stop
         traceback.print_exc()
         logger.error("Exiting the worker because of a failed job on host %s", socket.gethostname())
         if isinstance(e, CWL_UNSUPPORTED_REQUIREMENT_EXCEPTION):
             # We need to inform the leader that this is a CWL workflow problem
             # and it needs to inform its caller.
             failure_exit_code = CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE
+        elif isinstance(e, SystemExit) and isinstance(e.code, int) and e.code != 0:
+            # We're meant to be exiting with a particular code.
+            failure_exit_code = e.code
         AbstractFileStore._terminateEvent.set()
     finally:
         # Get rid of our deferred function manager now so we can't mistake it
@@ -581,7 +594,6 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
         jobDesc.logJobStoreFileID = logJobStoreFileID = jobStore.getEmptyFileStoreID(
             jobDesc.jobStoreID, cleanup=True
         )
-        jobDesc.chainedJobs = listOfJobs
         with jobStore.update_file_stream(logJobStoreFileID) as w:
             with open(tempWorkerLogPath, 'rb') as f:
                 if os.path.getsize(tempWorkerLogPath) > logFileByteReportLimit !=0:
@@ -605,10 +617,13 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
             # Make sure lines are Unicode so they can be JSON serialized as part of the dict.
             # We may have damaged the Unicode text by cutting it at an arbitrary byte so we drop bad characters.
             logMessages = [line.decode('utf-8', 'skip') for line in logFile.read().splitlines()]
-        statsDict.logs.names = listOfJobs
+        statsDict.logs.names = [names.stats_name for names in jobDesc.get_chain()]
         statsDict.logs.messages = logMessages
 
-    if (debugging or config.stats or statsDict.workers.logsToMaster) and not jobAttemptFailed:  # We have stats/logging to report back
+    if debugging or config.stats or statsDict.workers.logs_to_leader or statsDict.workers.logging_user_streams:
+        # We have stats/logging to report back.
+        # We report even if the job attempt failed.
+        # TODO: Will that upset analysis of the stats?
         jobStore.write_logs(json.dumps(statsDict, ensure_ascii=True))
 
     # Remove the temp dir
@@ -631,10 +646,10 @@ def workerScript(jobStore: AbstractJobStore, config: Config, jobName: str, jobSt
 
     # This must happen after the log file is done with, else there is no place to put the log
     if (not jobAttemptFailed) and jobDesc.is_subtree_done():
-        # We can now safely get rid of the JobDescription, and all jobs it chained up
-        for otherID in jobDesc.merged_jobs:
-            jobStore.delete_job(otherID)
-        jobStore.delete_job(str(jobDesc.jobStoreID))
+        for merged_in in jobDesc.get_chain():
+            # We can now safely get rid of the JobDescription, and all jobs it chained up
+            jobStore.delete_job(merged_in.job_store_id)
+        
 
     if jobAttemptFailed:
         return failure_exit_code

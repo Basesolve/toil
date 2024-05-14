@@ -28,14 +28,16 @@ import enlighten
 from toil import resolveEntryPoint
 from toil.batchSystems import DeadlockException
 from toil.batchSystems.abstractBatchSystem import (AbstractBatchSystem,
-                                                   BatchJobExitReason)
+                                                   BatchJobExitReason,
+                                                   EXIT_STATUS_UNAVAILABLE_VALUE)
 from toil.bus import (JobCompletedMessage,
                       JobFailedMessage,
                       JobIssuedMessage,
                       JobMissingMessage,
                       JobUpdatedMessage,
                       QueueSizeMessage,
-                      gen_message_bus_path)
+                      gen_message_bus_path,
+                      get_job_kind)
 from toil.common import Config, ToilMetrics
 from toil.cwl.utils import CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE
 from toil.exceptions import FailedJobsException
@@ -705,8 +707,9 @@ class Leader:
             if exitStatus == 0:
                 logger.debug('Job ended: %s', updatedJob)
             else:
-                logger.warning(f'Job failed with exit value {exitStatus}: {updatedJob}\n'
-                               f'Exit reason: {exitReason}')
+                status_string = str(exitStatus) if exitStatus != EXIT_STATUS_UNAVAILABLE_VALUE else "<UNAVAILABLE>"
+                logger.warning(f'Job failed with exit value {status_string}: {updatedJob}\n'
+                               f'Exit reason: {BatchJobExitReason.to_string(exitReason)}')
                 if exitStatus == CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE:
                     # This is a CWL job informing us that the workflow is
                     # asking things of us that Toil can't do. When we raise an
@@ -715,7 +718,7 @@ class Leader:
                     logger.warning("This indicates an unsupported CWL requirement!")
                     self.recommended_fail_exit_code = CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE
             # Tell everyone it stopped running.
-            self._messages.publish(JobCompletedMessage(updatedJob.get_job_kind(), updatedJob.jobStoreID, exitStatus))
+            self._messages.publish(JobCompletedMessage(get_job_kind(updatedJob.get_names()), updatedJob.jobStoreID, exitStatus))
             self.process_finished_job(bsID, exitStatus, wall_time=wallTime, exit_reason=exitReason)
 
     def _processLostJobs(self):
@@ -921,7 +924,7 @@ class Leader:
                    "%s and %s",
                    jobNode, str(jobBatchSystemID), jobNode.requirements_string())
         # Tell everyone it is issued and the queue size changed
-        self._messages.publish(JobIssuedMessage(jobNode.get_job_kind(), jobNode.jobStoreID, jobBatchSystemID))
+        self._messages.publish(JobIssuedMessage(get_job_kind(jobNode.get_names()), jobNode.jobStoreID, jobBatchSystemID))
         self._messages.publish(QueueSizeMessage(self.getNumberOfJobsIssued()))
         # Tell the user there's another job to do
         self.progress_overall.total += 1
@@ -1157,7 +1160,7 @@ class Leader:
             self.progress_overall.update(incr=-1)
             self.progress_failed.update(incr=1)
 
-        # Delegate to the vers
+        # Delegate to the version that uses a JobDescription
         return self.process_finished_job_description(issued_job, result_status, wall_time, exit_reason, batch_system_id)
 
     def process_finished_job_description(self, finished_job: JobDescription, result_status: int,
@@ -1208,11 +1211,12 @@ class Leader:
                     # more memory efficient than read().striplines() while leaving off the
                     # trailing \n left when using readlines()
                     # http://stackoverflow.com/a/15233739
-                    StatsAndLogging.logWithFormatting(job_store_id, log_stream, method=logger.warning,
+                    StatsAndLogging.logWithFormatting(f'Log from job "{job_store_id}"', log_stream, method=logger.warning,
                                                       message='The job seems to have left a log file, indicating failure: %s' % replacement_job)
                 if self.config.writeLogs or self.config.writeLogsGzip:
                     with replacement_job.getLogFileHandle(self.jobStore) as log_stream:
-                        StatsAndLogging.writeLogFiles(replacement_job.chainedJobs, log_stream, self.config, failed=True)
+                        # Send log data from the job store to each per-job log file involved.
+                        StatsAndLogging.writeLogFiles([names.stats_name for names in replacement_job.get_chain()], log_stream, self.config, failed=True)
             if result_status != 0:
                 # If the batch system returned a non-zero exit code then the worker
                 # is assumed not to have captured the failure of the job, so we
@@ -1236,13 +1240,12 @@ class Leader:
                         else:
                             with log_stream:
                                 if os.path.getsize(log_file) > 0:
-                                    StatsAndLogging.logWithFormatting(job_store_id, log_stream, method=logger.warning,
+                                    StatsAndLogging.logWithFormatting(f'Log from job "{job_store_id}"', log_stream, method=logger.warning,
                                                                       message='The batch system left a non-empty file %s:' % log_file)
                                     if self.config.writeLogs or self.config.writeLogsGzip:
                                         file_root, _ = os.path.splitext(os.path.basename(log_file))
-                                        job_names = replacement_job.chainedJobs
-                                        if job_names is None:   # For jobs that fail this way, replacement_job.chainedJobs is not guaranteed to be set
-                                            job_names = [str(replacement_job)]
+                                        job_names = [names.stats_name for names in replacement_job.get_chain()]
+                                        # Tack the batch system log file name onto each job's name
                                         job_names = [j + '_' + file_root for j in job_names]
                                         log_stream.seek(0)
                                         StatsAndLogging.writeLogFiles(job_names, log_stream, self.config, failed=True)
@@ -1309,7 +1312,7 @@ class Leader:
 
         # Tell everyone it failed
 
-        self._messages.publish(JobFailedMessage(job_desc.get_job_kind(), job_id))
+        self._messages.publish(JobFailedMessage(get_job_kind(job_desc.get_names()), job_id))
 
         if job_id in self.toilState.service_to_client:
             # Is a service job
