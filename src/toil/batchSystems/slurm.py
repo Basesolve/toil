@@ -770,12 +770,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 sbatch_line.append(f"--cpus-per-task={slurm_cpu}")
 
             if slurm_mem and slurm_cpu:
-                logger.info(
-                    "Trying to select partition based on cpus: %s and memory: %s of preferred type: %s",
-                    slurm_cpu,
-                    slurm_mem,
-                    usePreferredPartition,
-                )
+                # logger.info(
+                #     "Trying to select partition based on cpus: %s and memory: %s of preferred type: %s",
+                #     slurm_cpu,
+                #     slurm_mem,
+                #     usePreferredPartition,
+                # )
                 partition = self.select_partition(
                     slurm_cpu,
                     slurm_mem,
@@ -801,12 +801,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             stdoutfile: str = self.boss.format_std_out_err_path(jobID, "%j", "out")
             stderrfile: str = self.boss.format_std_out_err_path(jobID, "%j", "err")
             sbatch_line.extend(["-o", stdoutfile, "-e", stderrfile])
-            logging.info(
-                """
-                SBATCH CMD: %s
-                """,
-                " ".join(sbatch_line),
-            )
             return sbatch_line
 
         def parse_elapsed(self, elapsed):
