@@ -128,7 +128,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
 
                 # prepare job submission command
                 subLine = self.prepareSubmission(cpu, memory, jobID, command, jobName, environment, gpus, usePreferredPartition, comment)
-                logger.debug("Running %r", subLine)
+                logger.info("Running %r", " ".join(subLine))
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 if self.boss._outbox is not None:
                     #JobID corresponds to the toil version of the jobID, dif from jobstore idea of the id, batchjobid is what we get from slurm
