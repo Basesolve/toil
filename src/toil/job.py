@@ -1233,7 +1233,7 @@ class JobDescription(Requirer):
             self.memory = self.memory * 2
             logger.warning("We have doubled the memory of the killed job %s to %s bytes due to doubleMem flag",
                            self, self.memory)
-        if (exit_reason == BatchJobExitReason.MEMLIMIT or exit_reason == BatchJobExitReason.PKILL or exit_reason == BatchJobExitReason.OVERUSE) and self._config.doubleMem:
+        if (exit_reason == BatchJobExitReason.MEMLIMIT or exit_reason == BatchJobExitReason.PKILL or exit_reason == BatchJobExitReason.KILLED or exit_reason == BatchJobExitReason.OVERUSE) and self._config.doubleMem:
             self.memory = self.memory * 2
             max_memory_possible = os.popen("scontrol show node -o | egrep -o 'RealMemory=[0-9]+' | cut -d '=' -f2 | sort -u | head -1").read().strip()
             if max_memory_possible:
