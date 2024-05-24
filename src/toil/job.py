@@ -1234,7 +1234,7 @@ class JobDescription(Requirer):
                 logger.warning("Double Memory enabled, but could not determine max possible memory in specified batchSystem. Memory limiting is not possible")
             if max_memory_possible:
                 if self.memory > max_memory_possible:
-                    logger.warning("The memory doubled value %s is greater than the max memory possible %s, setting memory to max memory possible",self.memory *2, max_memory_possible)
+                    logger.warning("The memory doubled value %s is greater than the max memory possible %s, setting memory to max memory possible",self.memory, max_memory_possible)
                     self.memory = max_memory_possible
             logger.warning("We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
                            self, self.memory)
