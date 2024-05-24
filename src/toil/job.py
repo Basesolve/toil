@@ -1226,19 +1226,14 @@ class JobDescription(Requirer):
             self.remainingTryCount = max(0, self.remainingTryCount - 1)
             logger.warning("Due to failure we are reducing the remaining try count of job %s with ID %s to %s",
                            self, self.jobStoreID, self.remainingTryCount)
-        # Set the default memory to be at least as large as the default, in
-        # case this was a malloc failure (we do this because of the combined
-        # batch system)
-        if exit_reason == BatchJobExitReason.PKILL and self._config.doubleMem:
-            self.memory = self.memory * 2
-            logger.warning("We have doubled the memory of the killed job %s to %s bytes due to doubleMem flag",
-                           self, self.memory)
         if (exit_reason == BatchJobExitReason.MEMLIMIT or exit_reason == BatchJobExitReason.PKILL or exit_reason == BatchJobExitReason.KILLED or exit_reason == BatchJobExitReason.OVERUSE) and self._config.doubleMem:
             self.memory = self.memory * 2
-            max_memory_possible = os.popen("scontrol show node -o | egrep -o 'RealMemory=[0-9]+' | cut -d '=' -f2 | sort -u | head -1").read().strip()
+            try:
+                max_memory_possible = int(os.popen("scontrol show node -o | egrep -o 'RealMemory=[0-9]+' | cut -d '=' -f2 | sort -u | head -1").read().strip()) * (10 ** 6)
+            except ValueError as ver:
+                logger.warning("Double Memory enabled, but could not determine max possible memory in specified batchSystem. Memory limiting is not possible")
             if max_memory_possible:
-                max_memory_possible = int(max_memory_possible) * 10^6
-                if self.memory * 2 > max_memory_possible:
+                if self.memory > max_memory_possible:
                     logger.warning("The memory doubled value %s is greater than the max memory possible %s, setting memory to max memory possible",self.memory *2, max_memory_possible)
                     self.memory = max_memory_possible
             logger.warning("We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
@@ -1247,6 +1242,9 @@ class JobDescription(Requirer):
             self.accelerators = []
             logger.warning("We have removed accelerators if any for the failed job %s to try fixing incompatibility",
                            self)
+        # Set the default memory to be at least as large as the default, in
+        # case this was a malloc failure (we do this because of the combined
+        # batch system)
         if self.memory < self._config.defaultMemory:
             self.memory = self._config.defaultMemory
             logger.warning("We have increased the default memory of the failed job %s to %s bytes",
