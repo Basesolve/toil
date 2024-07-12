@@ -426,7 +426,7 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
             for package in reversed(name.split('.')):
                 dirPathTail = filePath.pop()
                 if dirPathTail != package:
-                    raise RuntimeWarning("Incorrect path to package. possibly due to use of shared modules")
+                    logger.debug("[W] Incorrect path to package. possibly due to use of shared modules")
             dirPath = os.path.abspath(os.path.sep.join(filePath))
         absPrefix = os.path.abspath(sys.prefix)
         inVenv = inVirtualEnv()
