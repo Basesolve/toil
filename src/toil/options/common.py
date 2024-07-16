@@ -7,7 +7,7 @@ import logging
 
 from ruamel.yaml import YAML
 
-from toil.lib.conversions import bytes2human, human2bytes, strtobool
+from toil.lib.conversions import bytes2human, human2bytes, strtobool, opt_strtobool
 
 from toil.batchSystems.options import add_all_batchsystem_options
 from toil.provisioners import parse_node_types
@@ -143,9 +143,14 @@ def make_open_interval_action(
                 func = fC(min, max)
             try:
                 if not func(values):
-                    raise parser.error(
-                        f"{option_string} ({values}) must be within the range: [{min}, {'infinity' if max is None else max})"
-                    )
+                    if max is None:
+                        raise parser.error(
+                            f"{option_string} ({values}) must be at least {min}"
+                        )
+                    else:
+                        raise parser.error(
+                            f"{option_string} ({values}) must be at least {min} and strictly less than {max})"
+                        )
             except AssertionError:
                 raise RuntimeError(
                     f"The {option_string} option has an invalid value: {values}"
@@ -177,21 +182,19 @@ def parse_jobstore(jobstore_uri: str) -> str:
         return jobstore_uri
 
 
-JOBSTORE_HELP = (
-    "The location of the job store for the workflow.  "
-    "A job store holds persistent information about the jobs, stats, and files in a "
-    "workflow. If the workflow is run with a distributed batch system, the job "
-    "store must be accessible by all worker nodes. Depending on the desired "
-    "job store implementation, the location should be formatted according to "
-    "one of the following schemes:\n\n"
-    "file:<path> where <path> points to a directory on the file systen\n\n"
-    "aws:<region>:<prefix> where <region> is the name of an AWS region like "
-    "us-west-2 and <prefix> will be prepended to the names of any top-level "
-    "AWS resources in use by job store, e.g. S3 buckets.\n\n "
-    "google:<project_id>:<prefix> TODO: explain\n\n"
-    "For backwards compatibility, you may also specify ./foo (equivalent to "
-    "file:./foo or just file:foo) or /bar (equivalent to file:/bar)."
-)
+JOBSTORE_HELP = ("The location of the job store for the workflow.  "
+                 "A job store holds persistent information about the jobs, stats, and files in a "
+                 "workflow. If the workflow is run with a distributed batch system, the job "
+                 "store must be accessible by all worker nodes. Depending on the desired "
+                 "job store implementation, the location should be formatted according to "
+                 "one of the following schemes:\n\n"
+                 "file:<path> where <path> points to a directory on the file system\n\n"
+                 "aws:<region>:<prefix> where <region> is the name of an AWS region like "
+                 "us-west-2 and <prefix> will be prepended to the names of any top-level "
+                 "AWS resources in use by job store, e.g. S3 buckets.\n\n "
+                 "google:<project_id>:<prefix> TODO: explain\n\n"
+                 "For backwards compatibility, you may also specify ./foo (equivalent to "
+                 "file:./foo or just file:foo) or /bar (equivalent to file:/bar).")
 
 
 def add_base_toil_options(
@@ -219,14 +222,6 @@ def add_base_toil_options(
         metavar="PATH",
         help="Get options from a config file.",
     )
-
-    def convert_bool(b: str) -> bool:
-        """Convert a string representation of bool to bool"""
-        return bool(strtobool(b))
-
-    def opt_strtobool(b: Optional[str]) -> Optional[bool]:
-        """Convert an optional string representation of bool to None or bool"""
-        return b if b is None else convert_bool(b)
 
     add_logging_options(parser)
     parser.register("type", "bool", parseBool)  # Custom type for arg=True/False.
@@ -438,37 +433,21 @@ def add_base_toil_options(
         description="Allows configuring Toil's data storage.",
     )
     link_imports = file_store_options.add_mutually_exclusive_group()
-    link_imports_help = (
-        "When using a filesystem based job store, CWL input files are by default symlinked in.  "
-        "Setting this option to True instead copies the files into the job store, which may protect "
-        "them from being modified externally.  When set to False, as long as caching is enabled, "
-        "Toil will protect the file automatically by changing the permissions to read-only."
-        "default=%(default)s"
-    )
-    link_imports.add_argument(
-        "--symlinkImports",
-        dest="symlinkImports",
-        type=convert_bool,
-        default=True,
-        metavar="BOOL",
-        help=link_imports_help,
-    )
+    link_imports_help = ("When using a filesystem based job store, CWL input files are by default symlinked in.  "
+                         "Setting this option to True instead copies the files into the job store, which may protect "
+                         "them from being modified externally.  When set to False, as long as caching is enabled, "
+                         "Toil will protect the file automatically by changing the permissions to read-only."
+                         "default=%(default)s")
+    link_imports.add_argument("--symlinkImports", dest="symlinkImports", type=strtobool, default=True,
+                              metavar="BOOL", help=link_imports_help)
     move_exports = file_store_options.add_mutually_exclusive_group()
-    move_exports_help = (
-        "When using a filesystem based job store, output files are by default moved to the "
-        "output directory, and a symlink to the moved exported file is created at the initial "
-        "location.  Setting this option to True instead copies the files into the output directory.  "
-        "Applies to filesystem-based job stores only."
-        "default=%(default)s"
-    )
-    move_exports.add_argument(
-        "--moveOutputs",
-        dest="moveOutputs",
-        type=convert_bool,
-        default=False,
-        metavar="BOOL",
-        help=move_exports_help,
-    )
+    move_exports_help = ('When using a filesystem based job store, output files are by default moved to the '
+                         'output directory, and a symlink to the moved exported file is created at the initial '
+                         'location.  Setting this option to True instead copies the files into the output directory.  '
+                         'Applies to filesystem-based job stores only.'
+                         'default=%(default)s')
+    move_exports.add_argument("--moveOutputs", dest="moveOutputs", type=strtobool, default=False, metavar="BOOL",
+                              help=move_exports_help)
 
     caching = file_store_options.add_mutually_exclusive_group()
     caching_help = "Enable or disable caching for your workflow, specifying this overrides default from job store"
@@ -642,24 +621,13 @@ def add_base_toil_options(
         "disk than others.",
     )
 
-    autoscaling_options.add_argument(
-        "--metrics",
-        dest="metrics",
-        default=False,
-        type=convert_bool,
-        metavar="BOOL",
-        help="Enable the prometheus/grafana dashboard for monitoring CPU/RAM usage, "
-        "queue size, and issued jobs.",
-    )
-    autoscaling_options.add_argument(
-        "--assumeZeroOverhead",
-        dest="assume_zero_overhead",
-        default=False,
-        type=convert_bool,
-        metavar="BOOL",
-        help="Ignore scheduler and OS overhead and assume jobs can use every last byte "
-        "of memory and disk on a node when autoscaling.",
-    )
+    autoscaling_options.add_argument("--metrics", dest="metrics", default=False, type=strtobool, metavar="BOOL",
+                                     help="Enable the prometheus/grafana dashboard for monitoring CPU/RAM usage, "
+                                          "queue size, and issued jobs.")
+    autoscaling_options.add_argument("--assumeZeroOverhead", dest="assume_zero_overhead", default=False,
+                                     type=strtobool, metavar="BOOL",
+                                     help="Ignore scheduler and OS overhead and assume jobs can use every last byte "
+                                          "of memory and disk on a node when autoscaling.")
 
     # Parameters to limit service jobs / detect service deadlocks
     service_options = parser.add_argument_group(
@@ -753,91 +721,39 @@ def add_base_toil_options(
         "--defaultUsePreferredPartition",
         dest="defaultUsePreferredPartition",
         metavar="BOOL",
-        type=convert_bool,
+        type=strtobool,
         default=True,
         help="Use preferred partition types for jobs.",
     )
-    resource_options.add_argument(
-        "--defaultMemory",
-        dest="defaultMemory",
-        default="2.0 Gi",
-        type=h2b,
-        action=make_open_interval_action(1),
-        help=resource_help_msg.format(
-            "default", "memory", disk_mem_note, bytes2human(2147483648)
-        ),
-    )
-    resource_options.add_argument(
-        "--defaultCores",
-        dest="defaultCores",
-        default=1,
-        metavar="FLOAT",
-        type=float,
-        action=make_open_interval_action(1.0),
-        help=resource_help_msg.format("default", "cpu", cpu_note, str(1)),
-    )
-    resource_options.add_argument(
-        "--defaultDisk",
-        dest="defaultDisk",
-        default="2.0 Gi",
-        metavar="INT",
-        type=h2b,
-        action=make_open_interval_action(1),
-        help=resource_help_msg.format(
-            "default", "disk", disk_mem_note, bytes2human(2147483648)
-        ),
-    )
-    resource_options.add_argument(
-        "--defaultAccelerators",
-        dest="defaultAccelerators",
-        default=[],
-        metavar="ACCELERATOR[,ACCELERATOR...]",
-        type=parse_accelerator_list,
-        action="extend",
-        help=resource_help_msg.format("default", "accelerators", accelerators_note, []),
-    )
-    resource_options.add_argument(
-        "--defaultPreemptible",
-        "--defaultPreemptable",
-        dest="defaultPreemptible",
-        metavar="BOOL",
-        type=convert_bool,
-        nargs="?",
-        const=True,
-        default=False,
-        help="Make all jobs able to run on preemptible (spot) nodes by default.",
-    )
-    resource_options.add_argument(
-        "--maxCores",
-        dest="maxCores",
-        default=SYS_MAX_SIZE,
-        metavar="INT",
-        type=int,
-        action=make_open_interval_action(1),
-        help=resource_help_msg.format("max", "cpu", cpu_note, str(SYS_MAX_SIZE)),
-    )
-    resource_options.add_argument(
-        "--maxMemory",
-        dest="maxMemory",
-        default=SYS_MAX_SIZE,
-        metavar="INT",
-        type=h2b,
-        action=make_open_interval_action(1),
-        help=resource_help_msg.format(
-            "max", "memory", disk_mem_note, bytes2human(SYS_MAX_SIZE)
-        ),
-    )
-    resource_options.add_argument(
-        "--maxDisk",
-        dest="maxDisk",
-        default=SYS_MAX_SIZE,
-        metavar="INT",
-        type=h2b,
-        action=make_open_interval_action(1),
-        help=resource_help_msg.format(
-            "max", "disk", disk_mem_note, bytes2human(SYS_MAX_SIZE)
-        ),
-    )
+    resource_options.add_argument('--defaultMemory', dest='defaultMemory', default="2.0 Gi", type=h2b,
+                                  action=make_open_interval_action(1),
+                                  help=resource_help_msg.format('default', 'memory', disk_mem_note,
+                                                                bytes2human(2147483648)))
+    resource_options.add_argument('--defaultCores', dest='defaultCores', default=1, metavar='FLOAT', type=float,
+                                  action=make_open_interval_action(1.0),
+                                  help=resource_help_msg.format('default', 'cpu', cpu_note, str(1)))
+    resource_options.add_argument('--defaultDisk', dest='defaultDisk', default="2.0 Gi", metavar='INT', type=h2b,
+                                  action=make_open_interval_action(1),
+                                  help=resource_help_msg.format('default', 'disk', disk_mem_note,
+                                                                bytes2human(2147483648)))
+    resource_options.add_argument('--defaultAccelerators', dest='defaultAccelerators', default=[],
+                                  metavar='ACCELERATOR[,ACCELERATOR...]', type=parse_accelerator_list, action="extend",
+                                  help=resource_help_msg.format('default', 'accelerators', accelerators_note, []))
+    resource_options.add_argument('--defaultPreemptible', '--defaultPreemptable', dest='defaultPreemptible',
+                                  metavar='BOOL',
+                                  type=strtobool, nargs='?', const=True, default=False,
+                                  help='Make all jobs able to run on preemptible (spot) nodes by default.')
+    resource_options.add_argument('--maxCores', dest='maxCores', default=SYS_MAX_SIZE, metavar='INT', type=int,
+                                  action=make_open_interval_action(1),
+                                  help=resource_help_msg.format('max', 'cpu', cpu_note, str(SYS_MAX_SIZE)))
+    resource_options.add_argument('--maxMemory', dest='maxMemory', default=SYS_MAX_SIZE, metavar='INT', type=h2b,
+                                  action=make_open_interval_action(1),
+                                  help=resource_help_msg.format('max', 'memory', disk_mem_note,
+                                                                bytes2human(SYS_MAX_SIZE)))
+    resource_options.add_argument('--maxDisk', dest='maxDisk', default=SYS_MAX_SIZE, metavar='INT', type=h2b,
+                                  action=make_open_interval_action(1),
+                                  help=resource_help_msg.format('max', 'disk', disk_mem_note,
+                                                                bytes2human(SYS_MAX_SIZE)))
 
     # Retrying/rescuing jobs
     job_options = parser.add_argument_group(
@@ -845,158 +761,90 @@ def add_base_toil_options(
         description="The options for jobs that either run too long/fail or get lost (some batch systems have issues!).",
     )
     job_options.add_argument(
-        "--retryCount",
-        dest="retryCount",
-        default=1,
-        type=int,
-        action=make_open_interval_action(0),
-        metavar="INT",
-        help=f"Number of times to retry a failing job before giving up and "
-        f"labeling job failed. default={1}",
-    )
-    job_options.add_argument(
-        "--enableUnlimitedPreemptibleRetries",
-        "--enableUnlimitedPreemptableRetries",
-        dest="enableUnlimitedPreemptibleRetries",
-        type=convert_bool,
-        default=False,
-        metavar="BOOL",
-        help="If set, preemptible failures (or any failure due to an instance getting "
-        "unexpectedly terminated) will not count towards job failures and --retryCount.",
-    )
-    job_options.add_argument(
-        "--doubleMem",
-        dest="doubleMem",
-        type=convert_bool,
-        default=False,
-        metavar="BOOL",
-        help="If set, batch jobs which die to reaching memory limit on batch schedulers "
-        "will have their memory doubled and they will be retried. The remaining "
-        "retry count will be reduced by 1. Currently supported by LSF.",
-    )
-    job_options.add_argument(
         "--enableBadConstraintGpuHandling",
         dest="enableBadConstraintGpuHandling",
-        type=convert_bool,
+        type=strtobool,
         default=False,
         metavar="BOOL",
         help="If set, batch jobs which die to unsupported gpu requirements on batch schedulers "
         "will be resubmitted with no gpu requirements.",
     )
-    job_options.add_argument(
-        "--maxJobDuration",
-        dest="maxJobDuration",
-        default=SYS_MAX_SIZE,
-        type=int,
-        action=make_open_interval_action(1),
-        metavar="INT",
-        help=f"Maximum runtime of a job (in seconds) before we kill it (this is a lower bound, "
-        f"and the actual time before killing the job may be longer).  "
-        f"default=%(default)s",
-    )
-    job_options.add_argument(
-        "--rescueJobsFrequency",
-        dest="rescueJobsFrequency",
-        default=60,
-        type=int,
-        action=make_open_interval_action(1),
-        metavar="INT",
-        help=f"Period of time to wait (in seconds) between checking for missing/overlong jobs, "
-        f"that is jobs which get lost by the batch system. Expert parameter.  "
-        f"default=%(default)s",
-    )
+    job_options.add_argument("--retryCount", dest="retryCount", default=1, type=int,
+                             action=make_open_interval_action(0), metavar="INT",
+                             help=f"Number of times to retry a failing job before giving up and "
+                                  f"labeling job failed. default={1}")
+    job_options.add_argument("--enableUnlimitedPreemptibleRetries", "--enableUnlimitedPreemptableRetries",
+                             dest="enableUnlimitedPreemptibleRetries",
+                             type=strtobool, default=False, metavar="BOOL",
+                             help="If set, preemptible failures (or any failure due to an instance getting "
+                                  "unexpectedly terminated) will not count towards job failures and --retryCount.")
+    job_options.add_argument("--doubleMem", dest="doubleMem", type=strtobool, default=False, metavar="BOOL",
+                             help="If set, batch jobs which die to reaching memory limit on batch schedulers "
+                                  "will have their memory doubled and they will be retried. The remaining "
+                                  "retry count will be reduced by 1. Currently supported by LSF.")
+    job_options.add_argument("--maxJobDuration", dest="maxJobDuration", default=SYS_MAX_SIZE, type=int,
+                             action=make_open_interval_action(1), metavar="INT",
+                             help=f"Maximum runtime of a job (in seconds) before we kill it (this is a lower bound, "
+                                  f"and the actual time before killing the job may be longer).  "
+                                  f"default=%(default)s")
+    job_options.add_argument("--rescueJobsFrequency", dest="rescueJobsFrequency", default=60, type=int,
+                             action=make_open_interval_action(1), metavar="INT",
+                             help=f"Period of time to wait (in seconds) between checking for missing/overlong jobs, "
+                                  f"that is jobs which get lost by the batch system. Expert parameter.  "
+                                  f"default=%(default)s")
+    job_options.add_argument("--jobStoreTimeout", dest="job_store_timeout", default=30, type=float,
+                             action=make_open_interval_action(0), metavar="FLOAT",
+                             help=f"Maximum time (in seconds) to wait for a job's update to the job store "
+                                  f"before declaring it failed. default=%(default)s")
+
 
     # Log management options
     log_options = parser.add_argument_group(
         title="Toil log management options.",
         description="Options for how Toil should manage its logs.",
     )
-    log_options.add_argument(
-        "--maxLogFileSize",
-        dest="maxLogFileSize",
-        default=100 * 1024 * 1024,
-        type=h2b,
-        action=make_open_interval_action(1),
-        help=f"The maximum size of a job log file to keep (in bytes), log files larger than "
-        f"this will be truncated to the last X bytes. Setting this option to zero will "
-        f"prevent any truncation. Setting this option to a negative value will truncate "
-        f"from the beginning.  Default={bytes2human(100 * 1024 * 1024)}",
-    )
-    log_options.add_argument(
-        "--writeLogs",
-        dest="writeLogs",
-        nargs="?",
-        action="store",
-        default=None,
-        const=os.getcwd(),
-        metavar="OPT_PATH",
-        help="Write worker logs received by the leader into their own files at the specified "
-        "path. Any non-empty standard output and error from failed batch system jobs will "
-        "also be written into files at this path.  The current working directory will be "
-        "used if a path is not specified explicitly. Note: By default only the logs of "
-        "failed jobs are returned to leader. Set log level to 'debug' or enable "
-        "'--writeLogsFromAllJobs' to get logs back from successful jobs, and adjust "
-        "'maxLogFileSize' to control the truncation limit for worker logs.",
-    )
-    log_options.add_argument(
-        "--writeLogsGzip",
-        dest="writeLogsGzip",
-        nargs="?",
-        action="store",
-        default=None,
-        const=os.getcwd(),
-        metavar="OPT_PATH",
-        help="Identical to --writeLogs except the logs files are gzipped on the leader.",
-    )
-    log_options.add_argument(
-        "--writeLogsFromAllJobs",
-        dest="writeLogsFromAllJobs",
-        type=convert_bool,
-        default=False,
-        metavar="BOOL",
-        help="Whether to write logs from all jobs (including the successful ones) without "
-        "necessarily setting the log level to 'debug'. Ensure that either --writeLogs "
-        "or --writeLogsGzip is set if enabling this option.",
-    )
-    log_options.add_argument(
-        "--writeMessages",
-        dest="write_messages",
-        default=None,
-        type=lambda x: None if x is None else os.path.abspath(x),
-        metavar="PATH",
-        help="File to send messages from the leader's message bus to.",
-    )
-    log_options.add_argument(
-        "--realTimeLogging",
-        dest="realTimeLogging",
-        type=convert_bool,
-        default=False,
-        help="Enable real-time logging from workers to leader",
-    )
+    log_options.add_argument("--maxLogFileSize", dest="maxLogFileSize", default=100 * 1024 * 1024, type=h2b,
+                             action=make_open_interval_action(1),
+                             help=f"The maximum size of a job log file to keep (in bytes), log files larger than "
+                                  f"this will be truncated to the last X bytes. Setting this option to zero will "
+                                  f"prevent any truncation. Setting this option to a negative value will truncate "
+                                  f"from the beginning.  Default={bytes2human(100 * 1024 * 1024)}")
+    log_options.add_argument("--writeLogs", dest="writeLogs", nargs='?', action='store', default=None,
+                             const=os.getcwd(), metavar="OPT_PATH",
+                             help="Write worker logs received by the leader into their own files at the specified "
+                                  "path. Any non-empty standard output and error from failed batch system jobs will "
+                                  "also be written into files at this path.  The current working directory will be "
+                                  "used if a path is not specified explicitly. Note: By default only the logs of "
+                                  "failed jobs are returned to leader. Set log level to 'debug' or enable "
+                                  "'--writeLogsFromAllJobs' to get logs back from successful jobs, and adjust "
+                                  "'maxLogFileSize' to control the truncation limit for worker logs.")
+    log_options.add_argument("--writeLogsGzip", dest="writeLogsGzip", nargs='?', action='store', default=None,
+                             const=os.getcwd(), metavar="OPT_PATH",
+                             help="Identical to --writeLogs except the logs files are gzipped on the leader.")
+    log_options.add_argument("--writeLogsFromAllJobs", dest="writeLogsFromAllJobs", type=strtobool,
+                             default=False, metavar="BOOL",
+                             help="Whether to write logs from all jobs (including the successful ones) without "
+                                  "necessarily setting the log level to 'debug'. Ensure that either --writeLogs "
+                                  "or --writeLogsGzip is set if enabling this option.")
+    log_options.add_argument("--writeMessages", dest="write_messages", default=None,
+                             type=lambda x: None if x is None else os.path.abspath(x), metavar="PATH",
+                             help="File to send messages from the leader's message bus to.")
+    log_options.add_argument("--realTimeLogging", dest="realTimeLogging", type=strtobool, default=False,
+                             help="Enable real-time logging from workers to leader")
 
     # Misc options
     misc_options = parser.add_argument_group(
         title="Toil miscellaneous options.", description="Everything else."
     )
-    misc_options.add_argument(
-        "--disableChaining",
-        dest="disableChaining",
-        type=convert_bool,
-        default=False,
-        metavar="BOOL",
-        help="Disables chaining of jobs (chaining uses one job's resource allocation "
-        "for its successor job if possible).",
-    )
-    misc_options.add_argument(
-        "--disableJobStoreChecksumVerification",
-        dest="disableJobStoreChecksumVerification",
-        default=False,
-        type=convert_bool,
-        metavar="BOOL",
-        help="Disables checksum verification for files transferred to/from the job store.  "
-        "Checksum verification is a safety check to ensure the data is not corrupted "
-        "during transfer. Currently only supported for non-streaming AWS files.",
-    )
+    misc_options.add_argument('--disableChaining', dest='disableChaining', type=strtobool, default=False,
+                              metavar="BOOL",
+                              help="Disables chaining of jobs (chaining uses one job's resource allocation "
+                                   "for its successor job if possible).")
+    misc_options.add_argument("--disableJobStoreChecksumVerification", dest="disableJobStoreChecksumVerification",
+                              default=False, type=strtobool, metavar="BOOL",
+                              help="Disables checksum verification for files transferred to/from the job store.  "
+                                   "Checksum verification is a safety check to ensure the data is not corrupted "
+                                   "during transfer. Currently only supported for non-streaming AWS files.")
 
     class SSEKeyAction(Action):
         def __call__(
@@ -1048,54 +896,25 @@ def add_base_toil_options(
             # note: this will overwrite existing entries
             items.update(values)
 
-    misc_options.add_argument(
-        "--setEnv",
-        "-e",
-        metavar="NAME=VALUE or NAME",
-        dest="environment",
-        default={},
-        type=yaml_safe_load,
-        action=ExtendActionDict,
-        help="Set an environment variable early on in the worker. If VALUE is null, it will "
-        "be looked up in the current environment. Independently of this option, the worker "
-        "will try to emulate the leader's environment before running a job, except for "
-        "some variables known to vary across systems.  Using this option, a variable can "
-        "be injected into the worker process itself before it is started.",
-    )
-    misc_options.add_argument(
-        "--servicePollingInterval",
-        dest="servicePollingInterval",
-        default=60.0,
-        type=float,
-        action=make_open_interval_action(0.0),
-        metavar="FLOAT",
-        help=f"Interval of time service jobs wait between polling for the existence of the "
-        f"keep-alive flag.  Default: {60.0}",
-    )
-    misc_options.add_argument(
-        "--forceDockerAppliance",
-        dest="forceDockerAppliance",
-        type=convert_bool,
-        default=False,
-        metavar="BOOL",
-        help="Disables sanity checking the existence of the docker image specified by "
-        "TOIL_APPLIANCE_SELF, which Toil uses to provision mesos for autoscaling.",
-    )
-    misc_options.add_argument(
-        "--statusWait",
-        dest="statusWait",
-        type=int,
-        default=3600,
-        metavar="INT",
-        help="Seconds to wait between reports of running jobs.",
-    )
-    misc_options.add_argument(
-        "--disableProgress",
-        dest="disableProgress",
-        action="store_true",
-        default=False,
-        help="Disables the progress bar shown when standard error is a terminal.",
-    )
+    misc_options.add_argument("--setEnv", '-e', metavar='NAME=VALUE or NAME', dest="environment",
+                              default={}, type=yaml_safe_load, action=ExtendActionDict,
+                              help="Set an environment variable early on in the worker. If VALUE is null, it will "
+                                   "be looked up in the current environment. Independently of this option, the worker "
+                                   "will try to emulate the leader's environment before running a job, except for "
+                                   "some variables known to vary across systems.  Using this option, a variable can "
+                                   "be injected into the worker process itself before it is started.")
+    misc_options.add_argument("--servicePollingInterval", dest="servicePollingInterval", default=60.0, type=float,
+                              action=make_open_interval_action(0.0), metavar="FLOAT",
+                              help=f"Interval of time service jobs wait between polling for the existence of the "
+                                   f"keep-alive flag.  Default: {60.0}")
+    misc_options.add_argument('--forceDockerAppliance', dest='forceDockerAppliance', type=strtobool, default=False,
+                              metavar="BOOL",
+                              help='Disables sanity checking the existence of the docker image specified by '
+                                   'TOIL_APPLIANCE_SELF, which Toil uses to provision mesos for autoscaling.')
+    misc_options.add_argument('--statusWait', dest='statusWait', type=int, default=3600, metavar="INT",
+                              help="Seconds to wait between reports of running jobs.")
+    misc_options.add_argument('--disableProgress', dest='disableProgress', action="store_true", default=False,
+                              help="Disables the progress bar shown when standard error is a terminal.")
 
     # Debug options
     debug_options = parser.add_argument_group(

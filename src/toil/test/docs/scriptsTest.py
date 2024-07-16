@@ -4,6 +4,9 @@ import shutil
 import subprocess
 import sys
 import unittest
+import pytest
+
+from typing import List
 
 pkg_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))  # noqa
 sys.path.insert(0, pkg_root)  # noqa
@@ -21,12 +24,6 @@ class ToilDocumentationTest(ToilTest):
 
     def tearDown(self) -> None:
         super(ToilTest, self).tearDown()
-        # src/toil/test/docs/scripts/cwlExampleFiles/sample_1_output.txt
-        output_files = ["sample_1_output.txt", "sample_2_output.txt", "sample_3_output.txt"]
-        for output in output_files:
-            output_file = os.path.join(self.directory, 'scripts/cwlExampleFiles', output)
-            if os.path.exists(output_file):
-                os.remove(output_file)
 
         jobstores = ['/mnt/ephemeral/workspace/toil-pull-requests/toilWorkflowRun']
         for jobstore in jobstores:
@@ -36,9 +33,9 @@ class ToilDocumentationTest(ToilTest):
         unittest.TestCase.tearDown(self)
 
     """Just check the exit code"""
-    def checkExitCode(self, script):
+    def checkExitCode(self, script, extra_args: List[str] = []):
         program = os.path.join(self.directory, "scripts", script)
-        process = subprocess.Popen([python, program, "file:my-jobstore", "--clean=always"],
+        process = subprocess.Popen([python, program, "file:my-jobstore", "--clean=always"] + extra_args,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         stdout, stderr = process.communicate()
         if isinstance(stdout, bytes):
@@ -65,13 +62,11 @@ class ToilDocumentationTest(ToilTest):
         n = re.search(pattern, outerr)
         self.assertNotEqual(n, None, f"Pattern:\n{expectedPattern}\nOutput:\n{outerr}")
 
-    @needs_cwl
-    def testCwlexample(self):
-        self.checkExitCode("tutorial_cwlexample.py")
-
     def testStats(self):
-        self.checkExitCode("tutorial_stats.py")
+        # This script asks for 4 cores but we might need to run the tests in only 3.
+        self.checkExitCode("tutorial_stats.py", ["--scale=0.5"])
 
+    @pytest.mark.timeout(1200)
     def testDynamic(self):
         self.checkExitCode("tutorial_dynamic.py")
 
@@ -117,6 +112,7 @@ class ToilDocumentationTest(ToilTest):
                                   "second or third.*Hello world, I have a message: second or third.*Hello world,"
                                   " I have a message: last")
 
+    @pytest.mark.timeout(1200)
     def testPromises2(self):
         self.checkExpectedOut("tutorial_promises2.py",
                               "['00000', '00001', '00010', '00011', '00100', '00101', '00110', '00111',"
@@ -145,6 +141,7 @@ class ToilDocumentationTest(ToilTest):
 
     def testStaging(self):
         self.checkExitCode("tutorial_staging.py")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,7 @@ functions to "handle" different things happening. Over time, it has become very
 brittle: exactly the right handling functions need to be called in exactly the
 right order, or it gets confused and does the wrong thing.
 
-The MessageBus is meant to let the leader avoid this by more losely coupling
+The MessageBus is meant to let the leader avoid this by more loosely coupling
 its components together, by having them communicate by sending messages instead
 of by calling functions.
 
@@ -741,12 +741,16 @@ def replay_message_bus(path: str) -> Dict[str, JobStatus]:
 
     return job_statuses
 
-def gen_message_bus_path() -> str:
+def gen_message_bus_path(tmpdir: Optional[str] = None) -> str:
     """
     Return a file path in tmp to store the message bus at.
     Calling function is responsible for cleaning the generated file.
+
+    The tmpdir argument will override the directory that the
+    message bus will be made in. If not provided, the standard tempfile
+    order will be used.
     """
-    fd, path = tempfile.mkstemp()
+    fd, path = tempfile.mkstemp(dir=tmpdir)
     os.close(fd)
     return path
     #TODO Might want to clean up the tmpfile at some point after running the workflow

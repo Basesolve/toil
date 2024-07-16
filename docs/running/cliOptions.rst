@@ -172,6 +172,8 @@ levels in toil are based on priority from the logging module:
                         Sets the maximum log file size in bytes (``--rotatingLogging`` must be active).
   --log-dir DIRPATH
                         For CWL and local file system only. Log stdout and stderr (if tool requests stdout/stderr) to the DIRPATH.
+  --logColors BOOL
+                        Enable or disable colored logging. Default=True.
 
 **Batch System Options**
 
@@ -206,6 +208,10 @@ levels in toil are based on priority from the logging module:
                         the waiting period. Only works for grid engine batch
                         systems such as gridengine, htcondor, torque, slurm,
                         and lsf.
+  --statePollingTimeout STATEPOLLINGTIMEOUT
+                        Time, in seconds, to retry against a broken scheduler.
+                        Only works for grid engine batch systems such as 
+                        gridengine, htcondor, torque, slurm, and lsf.
   --batchLogsDir BATCHLOGSDIR
                         Directory to tell the backing batch system to log into.
                         Should be available on both the leader and the workers,
@@ -233,6 +239,11 @@ levels in toil are based on priority from the logging module:
   --kubernetesPodTimeout KUBERNETES_POD_TIMEOUT
                         Seconds to wait for a scheduled Kubernetes pod to
                         start running. (default: 120s)
+  --kubernetesPrivileged BOOL
+                        Whether to allow Kubernetes pods to run as privileged. This can be
+                        used to enable FUSE mounts for faster runtimes with Singularity.
+                        When launching Toil-managed clusters, this will be set to true by --allowFuse.
+                        (default: False)
   --awsBatchRegion AWS_BATCH_REGION
                         The AWS region containing the AWS Batch queue to submit
                         to.
@@ -425,7 +436,7 @@ from the batch system.
 The options for jobs that either run too long/fail or get lost (some batch
 systems have issues!).
 
-  --retryCount RETRYCOUNT
+  --retryCount INT
                         Number of times to retry a failing job before giving
                         up and labeling job failed. default=1
   --enableUnlimitedPreemptibleRetries
@@ -437,14 +448,17 @@ systems have issues!).
 			doubled and they will be retried. The remaining
 			retry count will be reduced by 1. Currently only
 			supported by LSF. default=False.
-  --maxJobDuration MAXJOBDURATION
+  --maxJobDuration INT
                         Maximum runtime of a job (in seconds) before we kill
                         it (this is a lower bound, and the actual time before
                         killing the job may be longer).
-  --rescueJobsFrequency RESCUEJOBSFREQUENCY
+  --rescueJobsFrequency INT
                         Period of time to wait (in seconds) between checking
                         for missing/overlong jobs, that is jobs which get lost
                         by the batch system. Expert parameter.
+  --jobStoreTimeout FLOAT
+                        Maximum time (in seconds) to wait for a job's update to
+                        the job store before declaring it failed. 
 
 **Log Management Options**
 

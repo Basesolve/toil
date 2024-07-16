@@ -64,8 +64,7 @@ else:
     from typing_extensions import Literal
 
 from toil import logProcessContext, lookupEnvVar
-from toil.batchSystems.options import (add_all_batchsystem_options,
-                                       set_batchsystem_options)
+from toil.batchSystems.options import set_batchsystem_options
 from toil.bus import (ClusterDesiredSizeMessage,
                       ClusterSizeMessage,
                       JobCompletedMessage,
@@ -75,17 +74,15 @@ from toil.bus import (ClusterDesiredSizeMessage,
                       MessageBus,
                       QueueSizeMessage)
 from toil.fileStores import FileID
-from toil.lib.aws import zone_to_region, build_tag_dict_from_env
 from toil.lib.compatibility import deprecated
 from toil.lib.io import try_path, AtomicFileCreate
 from toil.lib.retry import retry
 from toil.provisioners import (add_provisioner_options,
-                               cluster_factory,
-                               parse_node_types)
+                               cluster_factory)
 from toil.realtimeLogger import RealtimeLogger
 from toil.statsAndLogging import (add_logging_options,
                                   set_logging_from_options)
-from toil.version import dockerRegistry, dockerTag, version, baseVersion
+from toil.version import dockerRegistry, dockerTag, version
 
 if TYPE_CHECKING:
     from toil.batchSystems.abstractBatchSystem import AbstractBatchSystem
@@ -125,6 +122,7 @@ class Config:
     kubernetes_owner: Optional[str]
     kubernetes_service_account: Optional[str]
     kubernetes_pod_timeout: float
+    kubernetes_privileged: bool
     tes_endpoint: str
     tes_user: str
     tes_password: str
@@ -138,6 +136,7 @@ class Config:
     """The backing scheduler will be instructed, if possible, to save logs
     to this directory, where the leader can read them."""
     statePollingWait: int
+    state_polling_timeout: int
     disableAutoDeployment: bool
 
     # Core options
@@ -149,6 +148,7 @@ class Config:
     workflowAttemptNumber: int
     jobStore: str
     logLevel: str
+    colored_logs: bool
     workDir: Optional[str]
     coordination_dir: Optional[str]
     noStdOutErr: bool
@@ -212,6 +212,7 @@ class Config:
     enableBadConstraintGpuHandling: bool
     maxJobDuration: int
     rescueJobsFrequency: int
+    job_store_timeout: float
 
     # Log management
     maxLogFileSize: int
@@ -380,6 +381,7 @@ class Config:
         set_option("enableBadConstraintGpuHandling")
         set_option("maxJobDuration")
         set_option("rescueJobsFrequency")
+        set_option("job_store_timeout")
 
         # Log management
         set_option("maxLogFileSize")
@@ -406,6 +408,7 @@ class Config:
         set_option("badWorker")
         set_option("badWorkerFailInterval")
         set_option("logLevel")
+        set_option("colored_logs")
 
         # Apply overrides as highest priority
         # Override workDir with value of TOIL_WORKDIR_OVERRIDE if it exists
@@ -416,8 +419,6 @@ class Config:
             self.workDir = os.getenv('TOIL_COORDINATION_DIR_OVERRIDE')
 
         self.check_configuration_consistency()
-
-        logger.debug("Loaded configuration: %s", vars(options))
 
     def check_configuration_consistency(self) -> None:
         """Old checks that cannot be fit into an action class for argparse"""
@@ -606,7 +607,10 @@ def generate_config(filepath: str) -> None:
 
 
 def parser_with_common_options(
-        provisioner_options: bool = False, jobstore_option: bool = True, prog: Optional[str] = None
+    provisioner_options: bool = False,
+    jobstore_option: bool = True,
+    prog: Optional[str] = None,
+    default_log_level: Optional[int] = None
 ) -> ArgParser:
     parser = ArgParser(prog=prog or "Toil", formatter_class=ArgumentDefaultsHelpFormatter)
 
@@ -617,7 +621,7 @@ def parser_with_common_options(
         parser.add_argument('jobStore', type=str, help=JOBSTORE_HELP)
 
     # always add these
-    add_logging_options(parser)
+    add_logging_options(parser, default_log_level)
     parser.add_argument("--version", action='version', version=version)
     parser.add_argument("--tempDirRoot", dest="tempDirRoot", type=str, default=tempfile.gettempdir(),
                         help="Path to where temporary directory containing all temp files are created, "
@@ -715,7 +719,7 @@ def addOptions(parser: ArgumentParser, jobstore_as_flag: bool = False, cwl: bool
                             help="WDL document URI")
         parser.add_argument("inputs_uri", type=str, nargs='?',
                             help="WDL input JSON URI")
-        parser.add_argument("--input", "-i", dest="inputs_uri", type=str,
+        parser.add_argument("--input", "--inputs", "-i", dest="inputs_uri", type=str,
                             help="WDL input JSON URI")
         check_arguments(typ="wdl")
 
@@ -723,7 +727,7 @@ def addOptions(parser: ArgumentParser, jobstore_as_flag: bool = False, cwl: bool
 @lru_cache(maxsize=None)
 def getNodeID() -> str:
     """
-    Return unique ID of the current node (host). The resulting string will be convertable to a uuid.UUID.
+    Return unique ID of the current node (host). The resulting string will be convertible to a uuid.UUID.
 
     Tries several methods until success. The returned ID should be identical across calls from different processes on
     the same node at least until the next OS reboot.
@@ -771,7 +775,7 @@ def getNodeID() -> str:
                        "experience cryptic job failures")
     if len(nodeID.replace('-', '')) < UUID_LENGTH:
         # Some platforms (Mac) give us not enough actual hex characters.
-        # Repeat them so the result is convertable to a uuid.UUID
+        # Repeat them so the result is convertible to a uuid.UUID
         nodeID = nodeID.replace('-', '')
         num_repeats = UUID_LENGTH // len(nodeID) + 1
         nodeID = nodeID * num_repeats
@@ -815,6 +819,7 @@ class Toil(ContextManager["Toil"]):
         set_logging_from_options(self.options)
         config = Config()
         config.setOptions(self.options)
+        logger.debug("Loaded configuration: %s", vars(self.options))
         if config.jobStore is None:
             raise RuntimeError("No jobstore provided!")
         jobStore = self.getJobStore(config.jobStore)
@@ -891,6 +896,16 @@ class Toil(ContextManager["Toil"]):
         :return: The root job's return value
         """
         self._assertContextManagerUsed()
+
+        from toil.job import Job
+
+        # Check that the rootJob is an instance of the Job class
+        if not isinstance(rootJob, Job):
+            raise RuntimeError("The type of the root job is not a job.")
+
+        # Check that the rootJob has been initialized
+        rootJob.check_initialized()
+
 
         # Write shared files to the job store
         self._jobStore.write_leader_pid()
@@ -1272,6 +1287,8 @@ class Toil(ContextManager["Toil"]):
                --workDir flag
         :param config_coordination_dir: Value passed to the program using the
                --coordinationDir flag
+        :param workflow_id: Used if a tmpdir_prefix exists to create full
+               directory paths unique per workflow
 
         :return: Path to the Toil coordination directory. Ought to be on a
                  POSIX filesystem that allows directories containing open files to be
@@ -1300,6 +1317,9 @@ class Toil(ContextManager["Toil"]):
                     os.path.join(os.environ['XDG_RUNTIME_DIR'], 'toil'))) or
                 # Try under /run/lock. It might be a temp dir style sticky directory.
                 try_path('/run/lock') or
+                # Try all possible temp directories, falling back to the current working
+                # directory
+                tempfile.gettempdir() or
                 # Finally, fall back on the work dir and hope it's a legit filesystem.
                 cls.getToilWorkDir(config_work_dir)
         )
@@ -1379,6 +1399,7 @@ class Toil(ContextManager["Toil"]):
 
         # Make a per-workflow and node subdirectory
         subdir = os.path.join(base, cls.get_workflow_path_component(workflow_id))
+
         # Make it exist
         os.makedirs(subdir, exist_ok=True)
         # TODO: May interfere with workflow directory creation logging if it's the same directory.
@@ -1436,6 +1457,8 @@ class ToilMetrics:
             clusterName = str(provisioner.clusterName)
             if provisioner._zone is not None:
                 if provisioner.cloud == 'aws':
+                    # lazy import to avoid AWS dependency if the aws extra is not installed
+                    from toil.lib.aws import zone_to_region
                     # Remove AZ name
                     region = zone_to_region(provisioner._zone)
                 else:
