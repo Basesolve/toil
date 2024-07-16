@@ -62,8 +62,10 @@ class BatchJobExitReason(enum.IntEnum):
     """Job landed on a node with incompatible resources"""
     PKILL: int = 9
     """Process was killed by user/kernel"""
-    OVERUSE = 253
+    OVERUSE:int = 253
     """Process was killed by scheduler due constraints"""
+    CONTAINER_MEMLIMIT:int = 137
+    """Container memory limit is exceeded"""    
 
     @classmethod
     def to_string(cls, value: int) -> str:

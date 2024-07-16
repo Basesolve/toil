@@ -1222,22 +1222,40 @@ class JobDescription(Requirer):
         if self._config.enableUnlimitedPreemptibleRetries and exit_reason == BatchJobExitReason.LOST:
             logger.info("*Not* reducing try count (%s) of job %s with ID %s",
                         self.remainingTryCount, self, self.jobStoreID)
+        if exit_reason in (
+            BatchJobExitReason.MEMLIMIT,
+            BatchJobExitReason.PKILL,
+            BatchJobExitReason.KILLED,
+            BatchJobExitReason.OVERUSE,
+            BatchJobExitReason.CONTAINER_MEMLIMIT
+            ) and self._config.doubleMem:
+            logger.debug("*Not* reducing try count (%s) of job %s with ID %s",
+                        self.remainingTryCount, self, self.jobStoreID)
         else:
             self.remainingTryCount = max(0, self.remainingTryCount - 1)
             logger.warning("Due to failure we are reducing the remaining try count of job %s with ID %s to %s",
-                           self, self.jobStoreID, self.remainingTryCount)
-        if (exit_reason == BatchJobExitReason.MEMLIMIT or exit_reason == BatchJobExitReason.PKILL or exit_reason == BatchJobExitReason.KILLED or exit_reason == BatchJobExitReason.OVERUSE) and self._config.doubleMem:
+                            self, self.jobStoreID, self.remainingTryCount)
+        if exit_reason in (
+            BatchJobExitReason.MEMLIMIT,
+            BatchJobExitReason.PKILL,
+            BatchJobExitReason.KILLED,
+            BatchJobExitReason.OVERUSE,
+            BatchJobExitReason.CONTAINER_MEMLIMIT
+            ) and self._config.doubleMem:
             self.memory = self.memory * 2
             try:
                 max_memory_possible = int(os.popen("scontrol show node -o | egrep -o 'RealMemory=[0-9]+' | cut -d '=' -f2 | sort -u | head -1").read().strip()) * (10 ** 6)
-            except ValueError as ver:
+            except ValueError:
                 logger.warning("Double Memory enabled, but could not determine max possible memory in specified batchSystem. Memory limiting is not possible")
             if max_memory_possible:
                 if self.memory > max_memory_possible:
                     logger.warning("The memory doubled value %s is greater than the max memory possible %s, setting memory to max memory possible",self.memory, max_memory_possible)
                     self.memory = max_memory_possible
+                    self.remainingTryCount = max(0, self.remainingTryCount - 1)
+                    logger.warning("Reducing the remaining try count of job %s with ID %s to %s",
+                            self, self.jobStoreID, self.remainingTryCount)
             logger.warning("We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
-                           self, self.memory)
+                            self, self.memory)
         if exit_reason == BatchJobExitReason.BADCONSTRAINTS and self._config.enableBadConstraintGpuHandling:
             self.accelerators = []
             logger.warning("We have removed accelerators if any for the failed job %s to try fixing incompatibility",
