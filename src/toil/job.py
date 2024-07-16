@@ -1222,6 +1222,10 @@ class JobDescription(Requirer):
         if self._config.enableUnlimitedPreemptibleRetries and exit_reason == BatchJobExitReason.LOST:
             logger.info("*Not* reducing try count (%s) of job %s with ID %s",
                         self.remainingTryCount, self, self.jobStoreID)
+        logger.info(">>>>>> exit_reason: %s",exit_reason)
+        logger.info(">>>>>> type of exit_reason: %s",type(exit_reason))
+        logger.info(">>>>>> BatchJobExitReason.MEMLIMIT %s",BatchJobExitReason.MEMLIMIT)
+        logger.info(">>>>>> type of BatchJobExitReason.MEMLIMIT %s",type(BatchJobExitReason.MEMLIMIT))
         if exit_reason in (
             BatchJobExitReason.MEMLIMIT,
             BatchJobExitReason.PKILL,
