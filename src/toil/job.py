@@ -82,6 +82,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+def can_this_be_imported():
+    print("yes it can be!")
 
 class JobPromiseConstraintError(RuntimeError):
     """
