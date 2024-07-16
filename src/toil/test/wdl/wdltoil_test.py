@@ -16,12 +16,12 @@ from toil.test import (ToilTest,
                        needs_docker_cuda,
                        needs_google_storage,
                        needs_singularity_or_docker,
+                       needs_wdl,
                        slow, integrative)
-from toil.test.provisioners.clusterTest import AbstractClusterTest
 from toil.version import exactPython
 from toil.wdl.wdltoil import WDLSectionJob, WDLWorkflowGraph
 
-
+@needs_wdl
 class BaseWDLTest(ToilTest):
     """Base test class for WDL tests."""
 
@@ -45,7 +45,7 @@ class WDLConformanceTests(BaseWDLTest):
     def setUpClass(cls) -> None:
 
         url = "https://github.com/DataBiosphere/wdl-conformance-tests.git"
-        commit = "032fb99a1458d456b6d5f17d27928469ec1a1c68"
+        commit = "c87b62b4f460e009fd42edec13669c4db14cf90c"
 
         p = subprocess.Popen(
             f"git clone {url} {cls.wdl_dir} && cd {cls.wdl_dir} && git checkout {commit}",
@@ -64,7 +64,7 @@ class WDLConformanceTests(BaseWDLTest):
     # estimated running time: 2 minutes
     @slow
     def test_conformance_tests_v10(self):
-        tests_to_run = "0,1,5-7,9-15,17,22-24,26,28-30,32-40,53,57-59,62,67-69"
+        tests_to_run = "0-15,17-20,22-71,73-77"
         p = subprocess.run(self.base_command + ["-v", "1.0", "-n", tests_to_run], capture_output=True)
 
         if p.returncode != 0:
@@ -75,9 +75,19 @@ class WDLConformanceTests(BaseWDLTest):
     # estimated running time: 2 minutes
     @slow
     def test_conformance_tests_v11(self):
-        tests_to_run = "2-11,13-15,17-20,22-24,26,29,30,32-40,53,57-59,62,67-69"
+        tests_to_run = "1-63,65-71,73-75,77"
         p = subprocess.run(self.base_command + ["-v", "1.1", "-n", tests_to_run], capture_output=True)
 
+        if p.returncode != 0:
+            print(p.stdout.decode('utf-8', errors='replace'))
+
+        p.check_returncode()
+
+    @slow
+    def test_conformance_tests_integration(self):
+        ids_to_run = "encode,tut01,tut02,tut03,tut04"
+        p = subprocess.run(self.base_command + ["-v", "1.0", "--id", ids_to_run], capture_output=True)
+        
         if p.returncode != 0:
             print(p.stdout.decode('utf-8', errors='replace'))
 
@@ -116,6 +126,14 @@ class WDLTests(BaseWDLTest):
         assert os.path.exists(result['ga4ghMd5.value'])
         assert os.path.basename(result['ga4ghMd5.value']) == 'md5sum.txt'
 
+    def test_missing_output_directory(self):
+        """
+        Test if Toil can run a WDL workflow into a new directory.
+        """
+        wdl = os.path.abspath('src/toil/test/wdl/md5sum/md5sum.1.0.wdl')
+        json_file = os.path.abspath('src/toil/test/wdl/md5sum/md5sum.json')
+        subprocess.check_call(self.base_command + [wdl, json_file, '-o', os.path.join(self.output_dir, "does", "not", "exist"), '--logDebug', '--retryCount=0'])
+
     @needs_singularity_or_docker
     def test_miniwdl_self_test(self, extra_args: Optional[List[str]] = None) -> None:
         """Test if the MiniWDL self test runs and produces the expected output."""
@@ -141,7 +159,7 @@ class WDLTests(BaseWDLTest):
         assert isinstance(outputs['hello_caller.message_files'], list)
         assert len(outputs['hello_caller.message_files']) == 2
         for item in outputs['hello_caller.message_files']:
-            # All the files should be strings in the "out" direcotry
+            # All the files should be strings in the "out" directory
             assert isinstance(item, str)
             assert item.startswith(out_dir)
 
@@ -347,71 +365,6 @@ class WDLTests(BaseWDLTest):
                     assert "decl1" in result[0]
                     assert "decl2" in result[0]
                     assert "successor" in result[1]
-
-
-@integrative
-@slow
-@pytest.mark.timeout(600)
-class WDLKubernetesClusterTest(AbstractClusterTest):
-    """
-    Ensure WDL works on the Kubernetes batchsystem.
-    """
-
-    def __init__(self, name):
-        super().__init__(name)
-        self.clusterName = 'wdl-integration-test-' + str(uuid4())
-        # t2.medium is the minimum t2 instance that permits Kubernetes
-        self.leaderNodeType = "t2.medium"
-        self.instanceTypes = ["t2.medium"]
-        self.clusterType = "kubernetes"
-
-    def setUp(self) -> None:
-        super().setUp()
-        self.jobStore = f'aws:{self.awsRegion()}:wdl-test-{uuid4()}'
-
-    def launchCluster(self) -> None:
-        self.createClusterUtil(args=['--leaderStorage', str(self.requestedLeaderStorage),
-                                     '--nodeTypes', ",".join(self.instanceTypes),
-                                     '-w', ",".join(self.numWorkers),
-                                     '--nodeStorage', str(self.requestedLeaderStorage)])
-
-    def test_wdl_kubernetes_cluster(self):
-        """
-        Test that a wdl workflow works on a kubernetes cluster. Launches a cluster with 1 worker. This runs a wdl
-        workflow that performs an image pull on the worker.
-        :return:
-        """
-        self.numWorkers = "1"
-        self.requestedLeaderStorage = 30
-        # create the cluster
-        self.launchCluster()
-        # get leader
-        self.cluster = cluster_factory(
-            provisioner="aws", zone=self.zone, clusterName=self.clusterName
-        )
-        self.leader = self.cluster.getLeader()
-
-        url = "https://github.com/DataBiosphere/wdl-conformance-tests.git"
-        commit = "09b9659cd01473e836738a2e0dd205df0adb49c5"
-        wdl_dir = "wdl_conformance_tests"
-
-        # get the wdl-conformance-tests repo to get WDL tasks to run
-        self.sshUtil([
-            "bash",
-            "-c",
-            f"git clone {url} {wdl_dir} && cd {wdl_dir} && git checkout {commit}"
-        ])
-
-        # run on kubernetes batchsystem
-        toil_options = ['--batchSystem=kubernetes',
-                        f"--jobstore={self.jobStore}"]
-
-        # run WDL workflow that will run singularity
-        test_options = [f"tests/md5sum/md5sum.wdl", f"tests/md5sum/md5sum.json"]
-        self.sshUtil([
-            "bash",
-            "-c",
-            f"cd {wdl_dir} && toil-wdl-runner {' '.join(test_options)} {' '.join(toil_options)}"])
 
 
 if __name__ == "__main__":

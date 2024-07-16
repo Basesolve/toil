@@ -17,26 +17,25 @@ import logging
 import os
 import types
 from ssl import SSLError
-from typing import Optional, cast, TYPE_CHECKING
+from typing import Optional, cast, TYPE_CHECKING, Dict, List, Tuple
 
 from boto3.s3.transfer import TransferConfig
-from boto.exception import SDBResponseError
 from botocore.client import Config
 from botocore.exceptions import ClientError
+from mypy_boto3_sdb.type_defs import ItemTypeDef, AttributeTypeDef
 
-from toil.lib.aws import session
-from toil.lib.aws.utils import connection_reset, get_bucket_region
+from toil.lib.aws import session, AWSServerErrors
+from toil.lib.aws.utils import connection_error, get_bucket_region
 from toil.lib.compatibility import compat_bytes
 from toil.lib.retry import (DEFAULT_DELAYS,
                             DEFAULT_TIMEOUT,
-                            ErrorCondition,
                             get_error_code,
                             get_error_message,
                             get_error_status,
                             old_retry,
                             retry)
 if TYPE_CHECKING:
-    from mypy_boto3_s3 import S3Client, S3ServiceResource
+    from mypy_boto3_s3 import S3ServiceResource
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +125,11 @@ class SDBHelper:
         return cls._maxChunks() * cls.maxValueSize
 
     @classmethod
-    def binaryToAttributes(cls, binary):
+    def binaryToAttributes(cls, binary) -> Dict[str, str]:
         """
         Turn a bytestring, or None, into SimpleDB attributes.
         """
-        if binary is None: return {'numChunks': 0}
+        if binary is None: return {'numChunks': '0'}
         assert isinstance(binary, bytes)
         assert len(binary) <= cls.maxBinarySize()
         # The use of compression is just an optimization. We can't include it in the maxValueSize
@@ -144,9 +143,40 @@ class SDBHelper:
         assert len(encoded) <= cls._maxEncodedSize()
         n = cls.maxValueSize
         chunks = (encoded[i:i + n] for i in range(0, len(encoded), n))
-        attributes = {cls._chunkName(i): chunk for i, chunk in enumerate(chunks)}
-        attributes.update({'numChunks': len(attributes)})
+        attributes = {cls._chunkName(i): chunk.decode("utf-8") for i, chunk in enumerate(chunks)}
+        attributes.update({'numChunks': str(len(attributes))})
         return attributes
+
+    @classmethod
+    def attributeDictToList(cls, attributes: Dict[str, str]) -> List[AttributeTypeDef]:
+        """
+        Convert the attribute dict (ex: from binaryToAttributes) into a list of attribute typed dicts
+        to be compatible with boto3 argument syntax
+        :param attributes: Dict[str, str], attribute in object form
+        :return: List[AttributeTypeDef], list of attributes in typed dict form
+        """
+        return [{"Name": name, "Value": value} for name, value in attributes.items()]
+
+    @classmethod
+    def attributeListToDict(cls, attributes: List[AttributeTypeDef]) -> Dict[str, str]:
+        """
+        Convert the attribute boto3 representation of list of attribute typed dicts
+        back to a dictionary with name, value pairs
+        :param attribute: List[AttributeTypeDef, attribute in typed dict form
+        :return: Dict[str, str], attribute in dict form
+        """
+        return {attribute["Name"]: attribute["Value"] for attribute in attributes}
+
+    @classmethod
+    def get_attributes_from_item(cls, item: ItemTypeDef, keys: List[str]) -> List[Optional[str]]:
+        return_values: List[Optional[str]] = [None for _ in keys]
+        mapped_indices: Dict[str, int] = {name: index for index, name in enumerate(keys)}
+        for attribute in item["Attributes"]:
+            name = attribute["Name"]
+            value = attribute["Value"]
+            if name in mapped_indices:
+                return_values[mapped_indices[name]] = value
+        return return_values
 
     @classmethod
     def _chunkName(cls, i):
@@ -166,14 +196,21 @@ class SDBHelper:
         return 'numChunks'
 
     @classmethod
-    def attributesToBinary(cls, attributes):
+    def attributesToBinary(cls, attributes: List[AttributeTypeDef]) -> Tuple[bytes, int]:
         """
         :rtype: (str|None,int)
         :return: the binary data and the number of chunks it was composed from
         """
-        chunks = [(int(k), v) for k, v in attributes.items() if cls._isValidChunkName(k)]
+        chunks = []
+        numChunks: int = 0
+        for attribute in attributes:
+            name = attribute["Name"]
+            value = attribute["Value"]
+            if cls._isValidChunkName(name):
+                chunks.append((int(name), value))
+            if name == "numChunks":
+                numChunks = int(value)
         chunks.sort()
-        numChunks = int(attributes['numChunks'])
         if numChunks:
             serializedJob = b''.join(v.encode() for k, v in chunks)
             compressed = base64.b64decode(serializedJob)
@@ -193,10 +230,7 @@ def fileSizeAndTime(localFilePath):
     return file_stat.st_size, file_stat.st_mtime
 
 
-@retry(errors=[ErrorCondition(
-    error=ClientError,
-    error_codes=[404, 500, 502, 503, 504]
-)])
+@retry(errors=[AWSServerErrors])
 def uploadFromPath(localFilePath: str,
                    resource,
                    bucketName: str,
@@ -232,10 +266,7 @@ def uploadFromPath(localFilePath: str,
     return version
 
 
-@retry(errors=[ErrorCondition(
-    error=ClientError,
-    error_codes=[404, 500, 502, 503, 504]
-)])
+@retry(errors=[AWSServerErrors])
 def uploadFile(readable,
                resource,
                bucketName: str,
@@ -287,10 +318,7 @@ class ServerSideCopyProhibitedError(RuntimeError):
     insists that you pay to download and upload the data yourself instead.
     """
 
-@retry(errors=[ErrorCondition(
-    error=ClientError,
-    error_codes=[404, 500, 502, 503, 504]
-)])
+@retry(errors=[AWSServerErrors])
 def copyKeyMultipart(resource: "S3ServiceResource",
                      srcBucketName: str,
                      srcKeyName: str,
@@ -439,9 +467,9 @@ def sdb_unavailable(e):
 
 
 def no_such_sdb_domain(e):
-    return (isinstance(e, SDBResponseError)
-            and e.error_code
-            and e.error_code.endswith('NoSuchDomain'))
+    return (isinstance(e, ClientError)
+            and get_error_code(e)
+            and get_error_code(e).endswith('NoSuchDomain'))
 
 
 def retryable_ssl_error(e):
@@ -452,7 +480,7 @@ def retryable_ssl_error(e):
 def retryable_sdb_errors(e):
     return (sdb_unavailable(e)
             or no_such_sdb_domain(e)
-            or connection_reset(e)
+            or connection_error(e)
             or retryable_ssl_error(e))
 
 

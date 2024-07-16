@@ -17,7 +17,7 @@ import os
 from argparse import ArgumentParser, _ArgumentGroup
 from queue import Empty
 from shlex import quote
-from typing import Dict, List, Optional, Tuple, TypeVar, Union
+from typing import Dict, List, Optional, Set, Tuple, TypeVar, Union
 
 # =======
 import time
@@ -40,9 +40,51 @@ from toil.lib.misc import CalledProcessErrorStderr, call_command
 
 logger = logging.getLogger(__name__)
 
+# We have a complete list of Slurm states. States not in one of these aren't
+# allowed. See <https://slurm.schedmd.com/squeue.html#SECTION_JOB-STATE-CODES>
+
+# If a job is in one of these states, Slurm can't run it anymore.
+# We don't include states where the job is held or paused here;
+# those mean it could run and needs to wait for someone to un-hold
+# it, so Toil should wait for it.
+#
+# We map from each terminal state to the Toil-ontology exit reason.
+TERMINAL_STATES: Dict[str, BatchJobExitReason] = {
+    "BOOT_FAIL": BatchJobExitReason.LOST,
+    "CANCELLED": BatchJobExitReason.KILLED,
+    "COMPLETED": BatchJobExitReason.FINISHED,
+    "DEADLINE": BatchJobExitReason.KILLED,
+    "FAILED": BatchJobExitReason.FAILED,
+    "NODE_FAIL": BatchJobExitReason.LOST,
+    "OUT_OF_MEMORY": BatchJobExitReason.MEMLIMIT,
+    "PREEMPTED": BatchJobExitReason.KILLED,
+    "REVOKED": BatchJobExitReason.KILLED,
+    "SPECIAL_EXIT": BatchJobExitReason.FAILED,
+    "TIMEOUT": BatchJobExitReason.KILLED
+}
+
+# If a job is in one of these states, it might eventually move to a different
+# state.
+NONTERMINAL_STATES: Set[str] = {
+    "CONFIGURING",
+    "COMPLETING",
+    "PENDING",
+    "RUNNING",
+    "RESV_DEL_HOLD",
+    "REQUEUE_FED",
+    "REQUEUE_HOLD",
+    "REQUEUED",
+    "RESIZING",
+    "SIGNALING",
+    "STAGE_OUT",
+    "STOPPED",
+    "SUSPENDED"
+} 
 
 class SlurmBatchSystem(AbstractGridEngineBatchSystem):
-    class Worker(AbstractGridEngineBatchSystem.Worker):
+
+    class GridEngineThread(AbstractGridEngineBatchSystem.GridEngineThread):
+
         def getRunningJobIDs(self):
             # Should return a dictionary of Job IDs and number of seconds
             times = {}
@@ -123,7 +165,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 logger.debug("sbatch submitted job %d", result)
                 return result
             except OSError as e:
-                logger.error("sbatch command failed")
+                logger.error(f"sbatch command failed with error: {e}")
                 raise e
 
         def coalesce_job_exit_codes(
@@ -220,23 +262,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             """
             state, rc, reason = status
 
-            # If a job is in one of these states, Slurm can't run it anymore.
-            # We don't include states where the job is held or paused here;
-            # those mean it could run and needs to wait for someone to un-hold
-            # it, so Toil should wait for it.
-            #
-            # We map from each terminal state to the Toil-ontology exit reason.
-            TERMINAL_STATES: Dict[str, BatchJobExitReason] = {
-                "BOOT_FAIL": BatchJobExitReason.LOST,
-                "CANCELLED": BatchJobExitReason.KILLED,
-                "COMPLETED": BatchJobExitReason.FINISHED,
-                "DEADLINE": BatchJobExitReason.KILLED,
-                "FAILED": BatchJobExitReason.FAILED,
-                "NODE_FAIL": BatchJobExitReason.LOST,
-                "OUT_OF_MEMORY": BatchJobExitReason.MEMLIMIT,
-                "PREEMPTED": BatchJobExitReason.KILLED,
-                "TIMEOUT": BatchJobExitReason.KILLED,
-            }
             if state not in TERMINAL_STATES:
                 if reason == "BadConstraints":
                     logger.warning("[SlurmJobHandler] Bad Constrains reason detected.")
@@ -394,6 +419,24 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         switch_exit_code,
                     )
 
+        def _canonicalize_state(self, state: str) -> str:
+            """
+            Turn a state string form SLURM into just the state token like "CANCELED".
+            """
+
+            # Slurm will sometimes send something like "CANCELED by 30065" in
+            # the state column for some reason.
+            
+            state_token = state
+
+            if " " in state_token:
+                state_token = state.split(" ", 1)[0]
+
+            if state_token not in TERMINAL_STATES and state_token not in NONTERMINAL_STATES:
+                raise RuntimeError("Toil job in unimplemented Slurm state " + state)
+            
+            return state_token
+
         def _getJobDetailsFromSacct(self, job_id_list: list) -> dict:
             """
             Get SLURM job exit codes for the jobs in `job_id_list` by running `sacct`.
@@ -426,6 +469,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if len(values) < 3:
                     continue
                 job_id_raw, state, exitcode = values
+                state = self._canonicalize_state(state)
                 logger.debug("%s state of job %s is %s", args[0], job_id_raw, state)
                 # JobIDRaw is in the form JobID[.JobStep]; we're not interested in job steps.
                 job_id_parts = job_id_raw.split(".")
@@ -546,6 +590,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 if job_id not in job_id_list:
                     continue
                 state = job["JobState"]
+                state = self._canonicalize_state(state)
                 reason = ""
                 if state == "PENDING":
                     reason = job.get("Reason")
