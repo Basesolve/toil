@@ -1515,9 +1515,9 @@ class JobDescription(Requirer):
         if self.memory < self._config.defaultMemory:
             self.memory = self._config.defaultMemory
             logger.warning(
-                "We have increased the default memory of the failed job %s to %s bytes",
+                "We have increased the default memory of the failed job %s to %s GB",
                 self,
-                self.memory,
+                round((self.memory / (1024 * 1024 * 1024)), 2),
             )
 
         if self.disk < self._config.defaultDisk:
