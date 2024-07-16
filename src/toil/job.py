@@ -86,10 +86,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def can_this_be_imported():
-    print("yes it can be!")
-
-
 class JobPromiseConstraintError(RuntimeError):
     """
     Error for job being asked to promise its return value, but it not available.
