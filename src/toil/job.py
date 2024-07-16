@@ -1434,8 +1434,8 @@ class JobDescription(Requirer):
             )
             and self._config.doubleMem
         ):
-            logger.debug(
-                "*Not* reducing try count (%s) of job %s with ID %s",
+            logger.info(
+                "*Not* reducing try count as doubling or memory is enabled, (%s) of job %s with ID %s",
                 self.remainingTryCount,
                 self,
                 self.jobStoreID,
