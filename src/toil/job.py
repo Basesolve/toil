@@ -1435,7 +1435,7 @@ class JobDescription(Requirer):
             and self._config.doubleMem
         ):
             logger.info(
-                "*Not* reducing try count as doubling or memory is enabled, (%s) of job %s with ID %s",
+                "Not reducing try count (%s) as doubling or memory is enabled for job %s with ID %s",
                 self.remainingTryCount,
                 self,
                 self.jobStoreID,
@@ -1496,9 +1496,9 @@ class JobDescription(Requirer):
                         self.remainingTryCount,
                     )
             logger.warning(
-                "We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
+                "We have doubled the memory of the failed job %s to %s GB due to doubleMem flag",
                 self,
-                self.memory,
+                round((self.memory / (1024 * 1024 * 1024)), 2),
             )
         if (
             exit_reason == BatchJobExitReason.BADCONSTRAINTS
