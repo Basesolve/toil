@@ -1419,7 +1419,7 @@ class JobDescription(Requirer):
                 self,
                 self.jobStoreID,
             )
-        if (
+        elif (
             exit_reason
             in (
                 BatchJobExitReason.MEMLIMIT,
@@ -1431,7 +1431,7 @@ class JobDescription(Requirer):
             and self._config.doubleMem
         ):
             logger.info(
-                "Not reducing try count (%s) as doubling or memory is enabled for job %s with ID %s",
+                "Not reducing try count (%s) as doubling of memory is enabled for job %s with ID %s",
                 self.remainingTryCount,
                 self,
                 self.jobStoreID,
