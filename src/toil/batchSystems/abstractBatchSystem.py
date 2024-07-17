@@ -65,9 +65,7 @@ class BatchJobExitReason(enum.IntEnum):
     """Job disappeared from the scheduler without actually stopping, so Toil killed it."""
     MAXJOBDURATION: int = 8
     """Job ran longer than --maxJobDuration, so Toil killed it."""
-    PKILL: int = 9
-    """Process was killed by user/kernel"""
-    PARTITION: int = 10
+    PARTITION: int = 9
     """Job was not able to talk to the leader via the job store, so Toil declared it failed."""
     BADCONSTRAINTS: int = 257
     """Job landed on a node with incompatible resources"""

@@ -1423,7 +1423,7 @@ class JobDescription(Requirer):
             exit_reason
             in (
                 BatchJobExitReason.MEMLIMIT,
-                BatchJobExitReason.PKILL,
+                BatchJobExitReason.PARTITION,
                 BatchJobExitReason.KILLED,
                 BatchJobExitReason.OVERUSE,
                 BatchJobExitReason.CONTAINER_MEMLIMIT,
@@ -1448,7 +1448,7 @@ class JobDescription(Requirer):
             exit_reason
             in (
                 BatchJobExitReason.MEMLIMIT,
-                BatchJobExitReason.PKILL,
+                BatchJobExitReason.PARTITION,
                 BatchJobExitReason.KILLED,
                 BatchJobExitReason.OVERUSE,
                 BatchJobExitReason.CONTAINER_MEMLIMIT,
