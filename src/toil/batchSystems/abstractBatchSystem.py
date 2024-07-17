@@ -65,12 +65,12 @@ class BatchJobExitReason(enum.IntEnum):
     """Job disappeared from the scheduler without actually stopping, so Toil killed it."""
     MAXJOBDURATION: int = 8
     """Job ran longer than --maxJobDuration, so Toil killed it."""
-    PARTITION: int = 9
+    PKILL: int = 9
+    """Process was killed by user/kernel"""
+    PARTITION: int = 10
     """Job was not able to talk to the leader via the job store, so Toil declared it failed."""
     BADCONSTRAINTS: int = 257
     """Job landed on a node with incompatible resources"""
-    PKILL: int = 9
-    """Process was killed by user/kernel"""
     OVERUSE: int = 253
     """Process was killed by scheduler due constraints"""
     CONTAINER_MEMLIMIT: int = 137
