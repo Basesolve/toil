@@ -1419,6 +1419,23 @@ class JobDescription(Requirer):
                 self,
                 self.jobStoreID,
             )
+        elif (
+            exit_reason
+            in (
+                BatchJobExitReason.MEMLIMIT,
+                BatchJobExitReason.PARTITION,
+                BatchJobExitReason.KILLED,
+                BatchJobExitReason.OVERUSE,
+                BatchJobExitReason.CONTAINER_MEMLIMIT,
+            )
+            and self._config.doubleMem
+        ):
+            logger.info(
+                "Not reducing try count (%s) as doubling of memory is enabled for job %s with ID %s",
+                self.remainingTryCount,
+                self,
+                self.jobStoreID,
+            )
         else:
             self.remainingTryCount = max(0, self.remainingTryCount - 1)
             logger.warning(
@@ -1428,11 +1445,18 @@ class JobDescription(Requirer):
                 self.remainingTryCount,
             )
         if (
-            exit_reason == BatchJobExitReason.MEMLIMIT
-            or exit_reason == BatchJobExitReason.KILLED
-            or exit_reason == BatchJobExitReason.OVERUSE
-        ) and self._config.doubleMem:
+            exit_reason
+            in (
+                BatchJobExitReason.MEMLIMIT,
+                BatchJobExitReason.PARTITION,
+                BatchJobExitReason.KILLED,
+                BatchJobExitReason.OVERUSE,
+                BatchJobExitReason.CONTAINER_MEMLIMIT,
+            )
+            and self._config.doubleMem
+        ):
             self.memory = self.memory * 2
+            max_memory_possible = 0
             try:
                 max_memory_possible = int(
                     os.popen(
@@ -1445,6 +1469,13 @@ class JobDescription(Requirer):
                 logger.warning(
                     "Double Memory enabled, but could not determine max possible memory in specified batchSystem. Memory limiting is not possible"
                 )
+                self.remainingTryCount = max(0, self.remainingTryCount - 1)
+                logger.warning(
+                    "Due to failure in determining max memory possible we are reducing the remaining try count of job %s with ID %s to %s",
+                    self,
+                    self.jobStoreID,
+                    self.remainingTryCount,
+                )
             if max_memory_possible:
                 if self.memory > max_memory_possible:
                     logger.warning(
@@ -1453,10 +1484,17 @@ class JobDescription(Requirer):
                         max_memory_possible,
                     )
                     self.memory = max_memory_possible
+                    self.remainingTryCount = max(0, self.remainingTryCount - 1)
+                    logger.warning(
+                        "As the doubled memory is more than the max memory possible we are reducing the remaining try count of job %s with ID %s to %s",
+                        self,
+                        self.jobStoreID,
+                        self.remainingTryCount,
+                    )
             logger.warning(
-                "We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
+                "We have doubled the memory of the failed job %s to %s GB due to doubleMem flag",
                 self,
-                self.memory,
+                round((self.memory / (1024 * 1024 * 1024)), 2),
             )
         if (
             exit_reason == BatchJobExitReason.BADCONSTRAINTS
@@ -1473,9 +1511,9 @@ class JobDescription(Requirer):
         if self.memory < self._config.defaultMemory:
             self.memory = self._config.defaultMemory
             logger.warning(
-                "We have increased the default memory of the failed job %s to %s bytes",
+                "We have increased the default memory of the failed job %s to %s GB",
                 self,
-                self.memory,
+                round((self.memory / (1024 * 1024 * 1024)), 2),
             )
 
         if self.disk < self._config.defaultDisk:
@@ -3761,7 +3799,9 @@ class ServiceHostJob(Job):
             # the service, to do this while the run method is running we
             # cheat and set the return value promise within the run method
             self._fulfillPromises(startCredentials, fileStore.jobStore)
-            self._rvs = {}  # Set this to avoid the return values being updated after the
+            self._rvs = (
+                {}
+            )  # Set this to avoid the return values being updated after the
             # run method has completed!
 
             # Now flag that the service is running jobs can connect to it
