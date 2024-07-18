@@ -162,7 +162,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 output = call_command(subLine, env=no_session_environment)
                 # sbatch prints a line like 'Submitted batch job 2954103'
                 result = int(output.strip().split()[-1])
-                logger.debug("sbatch submitted job %d", result)
+                logger.info("sbatch submitted job %d", result)
                 return result
             except OSError as e:
                 logger.error(f"sbatch command failed with error: {e}")
