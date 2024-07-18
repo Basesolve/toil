@@ -278,9 +278,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 return (rc, exit_reason)
 
             if exit_reason == BatchJobExitReason.LOST:
-                logger.warning(
-                    "[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition."
-                )
+                # logger.debug(
+                #     "[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition."
+                # )
                 return None
 
             if rc == 0:
