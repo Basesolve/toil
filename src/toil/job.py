@@ -1427,10 +1427,11 @@ class JobDescription(Requirer):
                 self.jobStoreID,
                 self.remainingTryCount,
             )
+        # 137 = 128 + 9 - occurs when a job is killed due to memory limit by kernel on oom-killer invoked
+        # 143 occurs when a container based job is killed due to memory limit by kernel on oom-killer invoked
         if (
-            exit_reason == BatchJobExitReason.MEMLIMIT
-            or exit_reason == BatchJobExitReason.KILLED
-            or exit_reason == BatchJobExitReason.OVERUSE
+            exit_reason in (BatchJobExitReason.MEMLIMIT,BatchJobExitReason.KILLED,BatchJobExitReason.OVERUSE)
+            or exit_status in (137, 143)
         ) and self._config.doubleMem:
             self.memory = self.memory * 2
             try:
