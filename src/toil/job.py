@@ -1428,34 +1428,17 @@ class JobDescription(Requirer):
                 BatchJobExitReason.OVERUSE,
                 BatchJobExitReason.CONTAINER_MEMLIMIT,
             )
+            or exit_status in (137, 143)
             and self._config.doubleMem
         ):
+            # 137 = 128 + 9 - occurs when a job is killed due to memory limit by kernel on oom-killer invoked
+            # 143 occurs when a container based job is killed due to memory limit by kernel on oom-killer invoked
             logger.info(
                 "Not reducing try count (%s) as doubling of memory is enabled for job %s with ID %s",
                 self.remainingTryCount,
                 self,
                 self.jobStoreID,
             )
-        else:
-            self.remainingTryCount = max(0, self.remainingTryCount - 1)
-            logger.warning(
-                "Due to failure we are reducing the remaining try count of job %s with ID %s to %s",
-                self,
-                self.jobStoreID,
-                self.remainingTryCount,
-            )
-        # 137 = 128 + 9 - occurs when a job is killed due to memory limit by kernel on oom-killer invoked
-        # 143 occurs when a container based job is killed due to memory limit by kernel on oom-killer invoked
-        if (
-            exit_reason in (
-                BatchJobExitReason.MEMLIMIT,
-                BatchJobExitReason.PARTITION,
-                BatchJobExitReason.KILLED,
-                BatchJobExitReason.OVERUSE,
-                BatchJobExitReason.CONTAINER_MEMLIMIT,
-            )
-            or exit_status in (137, 143)
-        ) and self._config.doubleMem:
             self.memory = self.memory * 2
             max_memory_possible = 0
             try:
@@ -1496,6 +1479,14 @@ class JobDescription(Requirer):
                 "We have doubled the memory of the failed job %s to %s GB due to doubleMem flag",
                 self,
                 round((self.memory / (1024 * 1024 * 1024)), 2),
+            )
+        else:
+            self.remainingTryCount = max(0, self.remainingTryCount - 1)
+            logger.warning(
+                "Due to failure we are reducing the remaining try count of job %s with ID %s to %s",
+                self,
+                self.jobStoreID,
+                self.remainingTryCount,
             )
         if (
             exit_reason == BatchJobExitReason.BADCONSTRAINTS
