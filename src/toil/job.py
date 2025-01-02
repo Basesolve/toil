@@ -1420,8 +1420,7 @@ class JobDescription(Requirer):
                 self.jobStoreID,
             )
         elif (
-            exit_reason
-            in (
+            exit_reason in (
                 BatchJobExitReason.MEMLIMIT,
                 BatchJobExitReason.PARTITION,
                 BatchJobExitReason.KILLED,
@@ -1429,8 +1428,7 @@ class JobDescription(Requirer):
                 BatchJobExitReason.CONTAINER_MEMLIMIT,
             )
             or exit_status in (137, 143)
-            and self._config.doubleMem
-        ):
+        ) and self._config.doubleMem:
             # 137 = 128 + 9 - occurs when a job is killed due to memory limit by kernel on oom-killer invoked
             # 143 occurs when a container based job is killed due to memory limit by kernel on oom-killer invoked
             logger.info(
@@ -3791,9 +3789,7 @@ class ServiceHostJob(Job):
             # the service, to do this while the run method is running we
             # cheat and set the return value promise within the run method
             self._fulfillPromises(startCredentials, fileStore.jobStore)
-            self._rvs = (
-                {}
-            )  # Set this to avoid the return values being updated after the
+            self._rvs = {}  # Set this to avoid the return values being updated after the
             # run method has completed!
 
             # Now flag that the service is running jobs can connect to it
