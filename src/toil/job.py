@@ -1427,7 +1427,7 @@ class JobDescription(Requirer):
                 BatchJobExitReason.OVERUSE,
                 BatchJobExitReason.CONTAINER_MEMLIMIT,
             )
-            or exit_status in (137, 143)
+            or exit_status in (137, 143, 9)
         ) and self._config.doubleMem:
             # 137 = 128 + 9 - occurs when a job is killed due to memory limit by kernel on oom-killer invoked
             # 143 occurs when a container based job is killed due to memory limit by kernel on oom-killer invoked
