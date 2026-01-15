@@ -18,6 +18,7 @@ import errno
 import logging
 import math
 import os
+import pandas
 from queue import Empty
 import sys
 import shlex
@@ -1473,7 +1474,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 cdict[k] = v
             config_dicts.append(cdict)
 
-        config_data = pd.DataFrame.from_dict(config_dicts)
+        config_data = pandas.DataFrame.from_dict(config_dicts)
         # print(config_data)
         req_configs = config_data[
             [
