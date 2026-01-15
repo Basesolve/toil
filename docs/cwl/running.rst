@@ -91,9 +91,17 @@ printed to the stdout stream after workflow execution.
 ``--stats``: Save resources usages in json files that can be collected with the
 ``toil stats`` command after the workflow is done.
 
-``--disable-streaming``: Does not allow streaming of input files. This is enabled
-by default for files marked with ``streamable`` flag True and only for remote files
-when the jobStore is not on local machine.
+Extra Toil CWL Options
+++++++++++++++++++++++
+
+Besides the normal Toil options and the options supported by cwltool, toil-cwl-runner adds some of its own options:
+
+  --bypass-file-store   Do not use Toil's file store system and assume all paths are accessible in place from all nodes. This can avoid possibly-redundant file copies into Toil's job store storage, and is required for CWL's ``InplaceUpdateRequirement``. But, it allows a failed job execution to leave behind a partially-modified state, which means that a restarted workflow might not work correctly.
+  --reference-inputs    Do not copy remote inputs into Toil's file store and assume they are accessible in place from all nodes.
+  --disable-streaming   Do not allow streaming of job input files. By default, files marked with ``streamable`` True are streamed from remote job stores.
+  --cwl-default-ram     Apply CWL specification default ramMin.
+  --no-cwl-default-ram  Do not apply CWL specification default ramMin, so that Toil --defaultMemory applies. This can help jobs get to Slurm with no memory limit assigned.
+  --cwl-min-ram BYTES   Specify a minimum memory allocation for all tasks. If ``--no-cwl-default-ram`` is passed, this does not apply to tools that do not specify a memory requirement; ``--defaultMemory`` is used for those tools in that case.
 
 Running CWL in the Cloud
 ------------------------
@@ -107,6 +115,8 @@ To run a CWL workflow in AWS with toil see :ref:`awscwl`.
 .. _Directory: http://www.commonwl.org/v1.0/CommandLineTool.html#Directory
 .. _secondaryFiles: http://www.commonwl.org/v1.0/CommandLineTool.html#CommandInputParameter
 .. _InitialWorkDirRequirement: http://www.commonwl.org/v1.0/CommandLineTool.html#InitialWorkDirRequirement
+
+.. _inplaceupdaterequirement:
 
 Running CWL workflows with InplaceUpdateRequirement
 ---------------------------------------------------

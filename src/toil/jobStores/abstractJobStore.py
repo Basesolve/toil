@@ -16,48 +16,44 @@ import os
 import dill as pickle
 import re
 import shutil
-import sys
 from abc import ABC, ABCMeta, abstractmethod
+from collections.abc import Iterator, ValuesView
 from contextlib import closing, contextmanager
 from datetime import timedelta
 from http.client import BadStatusLine
-from typing import (IO,
-                    TYPE_CHECKING,
-                    Any,
-                    Callable,
-                    ContextManager,
-                    Dict,
-                    Iterable,
-                    Iterator,
-                    List,
-                    Optional,
-                    Set,
-                    Tuple,
-                    Union,
-                    ValuesView,
-                    cast,
-                    overload)
-
-if sys.version_info >= (3, 8):
-    from typing import Literal
-else:
-    from typing_extensions import Literal
-
+from typing import (
+    IO,
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    ContextManager,
+    Literal,
+    Optional,
+    Union,
+    cast,
+    overload,
+    Type,
+)
 from urllib.error import HTTPError
 from urllib.parse import ParseResult, urlparse
-from urllib.request import urlopen
+from urllib.request import urlopen, Request
 from uuid import uuid4
 
 from toil.common import Config, getNodeID, safeUnpickleFromStream
 from toil.fileStores import FileID
-from toil.job import (CheckpointJobDescription,
-                      JobDescription,
-                      JobException,
-                      ServiceJobDescription)
+from toil.job import (
+    CheckpointJobDescription,
+    JobDescription,
+    JobException,
+    ServiceJobDescription,
+)
+from toil.lib.ftp_utils import FtpFsAccess
 from toil.lib.compatibility import deprecated
+from toil.lib.exceptions import UnimplementedURLException
 from toil.lib.io import WriteWatchingStream
 from toil.lib.memoize import memoize
 from toil.lib.retry import ErrorCondition, retry
+from toil.lib.url import URLAccess
 
 if TYPE_CHECKING:
     from toil.job import TemporaryID
@@ -67,17 +63,21 @@ logger = logging.getLogger(__name__)
 try:
     from botocore.exceptions import ProxyConnectionError
 except ImportError:
+
     class ProxyConnectionError(BaseException):  # type: ignore
         """Dummy class."""
+
 
 class LocatorException(Exception):
     """
     Base exception class for all locator exceptions.
     For example, job store/aws bucket exceptions where they already exist
     """
-    def __init__(self, error_msg: str, locator: str, prefix: Optional[str]=None):
+
+    def __init__(self, error_msg: str, locator: str, prefix: Optional[str] = None):
         full_locator = locator if prefix is None else f"{prefix}:{locator}"
         super().__init__(error_msg % full_locator)
+
 
 class InvalidImportExportUrlException(Exception):
     def __init__(self, url: ParseResult) -> None:
@@ -86,25 +86,11 @@ class InvalidImportExportUrlException(Exception):
         """
         super().__init__("The URL '%s' is invalid." % url.geturl())
 
-class UnimplementedURLException(RuntimeError):
-    def __init__(self, url: ParseResult, operation: str) -> None:
-        """
-        Make a new exception to report that a URL scheme is not implemented, or
-        that the implementation can't be loaded because its dependencies are
-        not installed.
-
-        :param url: The given URL
-        :param operation: Whether we are trying to 'import' or 'export'
-        """
-        super().__init__(
-            f"No available job store implementation can {operation} the URL "
-            f"'{url.geturl()}'. Ensure Toil has been installed "
-            f"with the appropriate extras."
-        )
 
 class NoSuchJobException(Exception):
     """Indicates that the specified job does not exist."""
-    def __init__(self, jobStoreID: FileID):
+
+    def __init__(self, jobStoreID: Union[FileID, str]):
         """
         :param str jobStoreID: the jobStoreID that was mistakenly assumed to exist
         """
@@ -113,17 +99,21 @@ class NoSuchJobException(Exception):
 
 class ConcurrentFileModificationException(Exception):
     """Indicates that the file was attempted to be modified by multiple processes at once."""
-    def __init__(self, jobStoreFileID: FileID):
+
+    def __init__(self, jobStoreFileID: Union[FileID, str]):
         """
         :param jobStoreFileID: the ID of the file that was modified by multiple workers
                or processes concurrently
         """
-        super().__init__('Concurrent update to file %s detected.' % jobStoreFileID)
+        super().__init__("Concurrent update to file %s detected." % jobStoreFileID)
 
 
 class NoSuchFileException(Exception):
     """Indicates that the specified file does not exist."""
-    def __init__(self, jobStoreFileID: FileID, customName: Optional[str] = None, *extra: Any):
+
+    def __init__(
+        self, jobStoreFileID: Union[FileID, str], customName: Optional[str] = None, *extra: Any
+    ):
         """
         :param jobStoreFileID: the ID of the file that was mistakenly assumed to exist
         :param customName: optionally, an alternate name for the nonexistent file
@@ -146,22 +136,32 @@ class NoSuchFileException(Exception):
 
 class NoSuchJobStoreException(LocatorException):
     """Indicates that the specified job store does not exist."""
+
     def __init__(self, locator: str, prefix: str):
         """
         :param str locator: The location of the job store
+        :param str prefix: The type of job store
         """
-        super().__init__("The job store '%s' does not exist, so there is nothing to restart.", locator, prefix)
+        super().__init__(
+            "The job store '%s' does not exist, so there is nothing to restart.",
+            locator,
+            prefix
+        )
 
 
 class JobStoreExistsException(LocatorException):
     """Indicates that the specified job store already exists."""
+
     def __init__(self, locator: str, prefix: str):
         """
         :param str locator: The location of the job store
         """
         super().__init__(
             "The job store '%s' already exists. Use --restart to resume the workflow, or remove "
-            "the job store with 'toil clean' to start the workflow from scratch.", locator, prefix)
+            "the job store with 'toil clean' to start the workflow from scratch.",
+            locator,
+            prefix
+        )
 
 
 class AbstractJobStore(ABC):
@@ -213,7 +213,7 @@ class AbstractJobStore(ABC):
         self.__config = config
         self.write_config()
 
-    @deprecated(new_function_name='write_config')
+    @deprecated(new_function_name="write_config")
     def writeConfig(self) -> None:
         return self.write_config()
 
@@ -222,7 +222,9 @@ class AbstractJobStore(ABC):
         Persists the value of the :attr:`AbstractJobStore.config` attribute to the
         job store, so that it can be retrieved later by other instances of this class.
         """
-        with self.write_shared_file_stream('config.pickle', encrypted=False) as fileHandle:
+        with self.write_shared_file_stream(
+            "config.pickle", encrypted=False
+        ) as fileHandle:
             pickle.dump(self.__config, fileHandle, pickle.HIGHEST_PROTOCOL)
 
     def resume(self) -> None:
@@ -232,14 +234,19 @@ class AbstractJobStore(ABC):
 
         :raises NoSuchJobStoreException: if the physical storage for this job store doesn't exist
         """
-        with self.read_shared_file_stream('config.pickle') as fileHandle:
+        with self.read_shared_file_stream("config.pickle") as fileHandle:
             config = safeUnpickleFromStream(fileHandle)
             assert config.workflowID is not None
             self.__config = config
 
     @property
     def config(self) -> Config:
-        """Return the Toil configuration associated with this job store."""
+        """
+        Return the Toil configuration associated with this job store.
+
+        :raises AttributeError: if the config has not yet been assigned (i.e.
+            during :meth:`resume`).
+        """
         return self.__config
 
     @property
@@ -250,9 +257,9 @@ class AbstractJobStore(ABC):
         """
         return self.__locator
 
-    rootJobStoreIDFileName = 'rootJobStoreID'
+    rootJobStoreIDFileName = "rootJobStoreID"
 
-    @deprecated(new_function_name='set_root_job')
+    @deprecated(new_function_name="set_root_job")
     def setRootJob(self, rootJobStoreID: FileID) -> None:
         """Set the root job of the workflow backed by this job store."""
         return self.set_root_job(rootJobStoreID)
@@ -264,9 +271,9 @@ class AbstractJobStore(ABC):
         :param job_id: The ID of the job to set as root
         """
         with self.write_shared_file_stream(self.rootJobStoreIDFileName) as f:
-            f.write(job_id.encode('utf-8'))
+            f.write(job_id.encode("utf-8"))
 
-    @deprecated(new_function_name='load_root_job')
+    @deprecated(new_function_name="load_root_job")
     def loadRootJob(self) -> JobDescription:
         return self.load_root_job()
 
@@ -281,16 +288,18 @@ class AbstractJobStore(ABC):
         """
         try:
             with self.read_shared_file_stream(self.rootJobStoreIDFileName) as f:
-                rootJobStoreID = f.read().decode('utf-8')
+                rootJobStoreID = f.read().decode("utf-8")
         except NoSuchFileException:
-            raise JobException('No job has been set as the root in this job store')
+            raise JobException("No job has been set as the root in this job store")
         if not self.job_exists(rootJobStoreID):
-            raise JobException("The root job '%s' doesn't exist. Either the Toil workflow "
-                               "is finished or has never been started" % rootJobStoreID)
+            raise JobException(
+                "The root job '%s' doesn't exist. Either the Toil workflow "
+                "is finished or has never been started" % rootJobStoreID
+            )
         return self.load_job(rootJobStoreID)
 
     # FIXME: This is only used in tests, why do we have it?
-    @deprecated(new_function_name='create_root_job')
+    @deprecated(new_function_name="create_root_job")
     def createRootJob(self, desc: JobDescription) -> JobDescription:
         return self.create_root_job(desc)
 
@@ -307,7 +316,7 @@ class AbstractJobStore(ABC):
         self.set_root_job(job_description.jobStoreID)
         return job_description
 
-    @deprecated(new_function_name='get_root_job_return_value')
+    @deprecated(new_function_name="get_root_job_return_value")
     def getRootJobReturnValue(self) -> Any:
         return self.get_root_job_return_value()
 
@@ -318,12 +327,12 @@ class AbstractJobStore(ABC):
         Raises an exception if the root job hasn't fulfilled its promise yet.
         """
         # Parse out the return value from the root job
-        with self.read_shared_file_stream('rootJobReturnValue') as fH:
+        with self.read_shared_file_stream("rootJobReturnValue") as fH:
             return safeUnpickleFromStream(fH)
 
     @staticmethod
     @memoize
-    def _get_job_store_classes() -> List['AbstractJobStore']:
+    def _get_job_store_classes() -> list["AbstractJobStore"]:
         """
         A list of concrete AbstractJobStore implementations whose dependencies are installed.
 
@@ -333,81 +342,83 @@ class AbstractJobStore(ABC):
             "toil.jobStores.fileJobStore.FileJobStore",
             "toil.jobStores.googleJobStore.GoogleJobStore",
             "toil.jobStores.aws.jobStore.AWSJobStore",
-            "toil.jobStores.abstractJobStore.JobStoreSupport")
+            "toil.jobStores.abstractJobStore.JobStoreSupport",
+        )
         jobStoreClasses = []
         for className in jobStoreClassNames:
-            moduleName, className = className.rsplit('.', 1)
+            moduleName, className = className.rsplit(".", 1)
             from importlib import import_module
+
             try:
                 module = import_module(moduleName)
             except (ImportError, ProxyConnectionError):
-                logger.debug("Unable to import '%s' as is expected if the corresponding extra was "
-                             "omitted at installation time.", moduleName)
+                logger.debug(
+                    "Unable to import '%s' as is expected if the corresponding extra was "
+                    "omitted at installation time.",
+                    moduleName,
+                )
             else:
                 jobStoreClass = getattr(module, className)
                 jobStoreClasses.append(jobStoreClass)
         return jobStoreClasses
 
-    @classmethod
-    def _findJobStoreForUrl(cls, url: ParseResult, export: bool = False) -> 'AbstractJobStore':
-        """
-        Returns the AbstractJobStore subclass that supports the given URL.
-
-        :param ParseResult url: The given URL
-
-        :param bool export: Determines if the url is supported for exporting
-
-        :rtype: toil.jobStore.AbstractJobStore
-        """
-        for implementation in cls._get_job_store_classes():
-            if implementation._supports_url(url, export):
-                return implementation
-        raise UnimplementedURLException(url, "export" if export else "import")
 
     # Importing a file with a shared file name returns None, but without one it
     # returns a file ID. Explain this to MyPy.
 
     @overload
-    def importFile(self,
-                   srcUrl: str,
-                   sharedFileName: str,
-                   hardlink: bool = False,
-                   symlink: bool = True) -> None: ...
+    def importFile(
+        self,
+        srcUrl: str,
+        sharedFileName: str,
+        hardlink: bool = False,
+        symlink: bool = True,
+    ) -> None: ...
 
     @overload
-    def importFile(self,
-                   srcUrl: str,
-                   sharedFileName: None = None,
-                   hardlink: bool = False,
-                   symlink: bool = True) -> FileID: ...
+    def importFile(
+        self,
+        srcUrl: str,
+        sharedFileName: None = None,
+        hardlink: bool = False,
+        symlink: bool = True,
+    ) -> FileID: ...
 
-    @deprecated(new_function_name='import_file')
-    def importFile(self,
-                   srcUrl: str,
-                   sharedFileName: Optional[str] = None,
-                   hardlink: bool = False,
-                   symlink: bool = True) -> Optional[FileID]:
+    @deprecated(new_function_name="import_file")
+    def importFile(
+        self,
+        srcUrl: str,
+        sharedFileName: Optional[str] = None,
+        hardlink: bool = False,
+        symlink: bool = True,
+    ) -> Optional[FileID]:
         return self.import_file(srcUrl, sharedFileName, hardlink, symlink)
 
     @overload
-    def import_file(self,
-                    src_uri: str,
-                    shared_file_name: str,
-                    hardlink: bool = False,
-                    symlink: bool = True) -> None: ...
+    def import_file(
+        self,
+        src_uri: str,
+        shared_file_name: str,
+        hardlink: bool = False,
+        symlink: bool = True,
+    ) -> None: ...
 
     @overload
-    def import_file(self,
-                    src_uri: str,
-                    shared_file_name: None = None,
-                    hardlink: bool = False,
-                    symlink: bool = True) -> FileID: ...
+    def import_file(
+        self,
+        src_uri: str,
+        shared_file_name: None = None,
+        hardlink: bool = False,
+        symlink: bool = True,
+    ) -> FileID: ...
 
-    def import_file(self,
-                    src_uri: str,
-                    shared_file_name: Optional[str] = None,
-                    hardlink: bool = False,
-                    symlink: bool = True) -> Optional[FileID]:
+    def import_file(
+        self,
+        src_uri: str,
+        shared_file_name: Optional[str] = None,
+        hardlink: bool = False,
+        symlink: bool = True,
+    ) -> Optional[FileID]:
         """
         Imports the file at the given URL into job store. The ID of the newly imported file is
         returned. If the name of a shared file name is provided, the file will be imported as
@@ -444,19 +455,24 @@ class AbstractJobStore(ABC):
         # optimizations that circumvent this, the _import_file method should be overridden by
         # subclasses of AbstractJobStore.
         parseResult = urlparse(src_uri)
-        otherCls = self._findJobStoreForUrl(parseResult)
-        return self._import_file(otherCls,
-                                 parseResult,
-                                 shared_file_name=shared_file_name,
-                                 hardlink=hardlink,
-                                 symlink=symlink)
+        otherCls = URLAccess._find_url_implementation(parseResult)
+        logger.info("Importing input %s...", src_uri)
+        return self._import_file(
+            otherCls,
+            parseResult,
+            shared_file_name=shared_file_name,
+            hardlink=hardlink,
+            symlink=symlink,
+        )
 
-    def _import_file(self,
-                     otherCls: 'AbstractJobStore',
-                     uri: ParseResult,
-                     shared_file_name: Optional[str] = None,
-                     hardlink: bool = False,
-                     symlink: bool = True) -> Optional[FileID]:
+    def _import_file(
+        self,
+        otherCls: Type["URLAccess"],
+        uri: ParseResult,
+        shared_file_name: Optional[str] = None,
+        hardlink: bool = False,
+        symlink: bool = True,
+    ) -> Optional[FileID]:
         """
         Import the file at the given URL using the given job store class to retrieve that file.
         See also :meth:`.importFile`. This method applies a generic approach to importing: it
@@ -465,7 +481,7 @@ class AbstractJobStore(ABC):
 
         Raises FileNotFoundError if the file does not exist.
 
-        :param AbstractJobStore otherCls: The concrete subclass of AbstractJobStore that supports
+        :param URLAccess otherCls: The class of URLAccess that supports
                reading from the given URL and getting the file size from the URL.
 
         :param ParseResult uri: The location of the file to import.
@@ -486,7 +502,7 @@ class AbstractJobStore(ABC):
                 otherCls._read_from_url(uri, writable)
                 return None
 
-    @deprecated(new_function_name='export_file')
+    @deprecated(new_function_name="export_file")
     def exportFile(self, jobStoreFileID: FileID, dstUrl: str) -> None:
         return self.export_file(jobStoreFileID, dstUrl)
 
@@ -505,17 +521,21 @@ class AbstractJobStore(ABC):
         :param str file_id: The id of the file in the job store that should be exported.
 
         :param str dst_uri: URL that points to a file or object in the storage mechanism of a
-                supported URL scheme e.g. a blob in an AWS s3 bucket.
+                supported URL scheme e.g. a blob in an AWS s3 bucket. May also be a local path.
         """
+        from toil.common import Toil
+        dst_uri = Toil.normalize_uri(dst_uri)
         parseResult = urlparse(dst_uri)
-        otherCls = self._findJobStoreForUrl(parseResult, export=True)
+        otherCls = URLAccess._find_url_implementation(parseResult, export=True)
         self._export_file(otherCls, file_id, parseResult)
 
-    def _export_file(self, otherCls: 'AbstractJobStore', jobStoreFileID: FileID, url: ParseResult) -> None:
+    def _export_file(
+        self, otherCls: Type["URLAccess"], jobStoreFileID: FileID, url: ParseResult
+    ) -> None:
         """
         Refer to exportFile docstring for information about this method.
 
-        :param AbstractJobStore otherCls: The concrete subclass of AbstractJobStore that supports
+        :param URLAccess otherCls: The class of URLAccess that supports
                exporting to the given URL. Note that the type annotation here is not completely
                accurate. This is not an instance, it's a class, but there is no way to reflect
                that in :pep:`484` type hints.
@@ -526,11 +546,13 @@ class AbstractJobStore(ABC):
         """
         self._default_export_file(otherCls, jobStoreFileID, url)
 
-    def _default_export_file(self, otherCls: 'AbstractJobStore', jobStoreFileID: FileID, url: ParseResult) -> None:
+    def _default_export_file(
+        self, otherCls: Type["URLAccess"], jobStoreFileID: FileID, url: ParseResult
+    ) -> None:
         """
         Refer to exportFile docstring for information about this method.
 
-        :param AbstractJobStore otherCls: The concrete subclass of AbstractJobStore that supports
+        :param URLAccess otherCls: The class of URLAccess that supports
                exporting to the given URL. Note that the type annotation here is not completely
                accurate. This is not an instance, it's a class, but there is no way to reflect
                that in :pep:`484` type hints.
@@ -541,211 +563,9 @@ class AbstractJobStore(ABC):
         """
         executable = False
         with self.read_file_stream(jobStoreFileID) as readable:
-            if getattr(jobStoreFileID, 'executable', False):
+            if getattr(jobStoreFileID, "executable", False):
                 executable = jobStoreFileID.executable
             otherCls._write_to_url(readable, url, executable)
-
-    @classmethod
-    def url_exists(cls, src_uri: str) -> bool:
-        """
-        Return True if the file at the given URI exists, and False otherwise.
-
-        :param src_uri: URL that points to a file or object in the storage
-               mechanism of a supported URL scheme e.g. a blob in an AWS s3 bucket.
-        """
-        parseResult = urlparse(src_uri)
-        otherCls = cls._findJobStoreForUrl(parseResult)
-        return otherCls._url_exists(parseResult)
-
-    @classmethod
-    def get_size(cls, src_uri: str) -> Optional[int]:
-        """
-        Get the size in bytes of the file at the given URL, or None if it cannot be obtained.
-
-        :param src_uri: URL that points to a file or object in the storage
-               mechanism of a supported URL scheme e.g. a blob in an AWS s3 bucket.
-        """
-        parseResult = urlparse(src_uri)
-        otherCls = cls._findJobStoreForUrl(parseResult)
-        return otherCls._get_size(parseResult)
-
-    @classmethod
-    def get_is_directory(cls, src_uri: str) -> bool:
-        """
-        Return True if the thing at the given URL is a directory, and False if
-        it is a file. The URL may or may not end in '/'.
-        """
-        parseResult = urlparse(src_uri)
-        otherCls = cls._findJobStoreForUrl(parseResult)
-        return otherCls._get_is_directory(parseResult)
-
-    @classmethod
-    def list_url(cls, src_uri: str) -> List[str]:
-        """
-        List the directory at the given URL. Returned path components can be
-        joined with '/' onto the passed URL to form new URLs. Those that end in
-        '/' correspond to directories. The provided URL may or may not end with
-        '/'.
-
-        Currently supported schemes are:
-
-            - 's3' for objects in Amazon S3
-                e.g. s3://bucket/prefix/
-
-            - 'file' for local files
-                e.g. file:///local/dir/path/
-
-        :param str src_uri: URL that points to a directory or prefix in the storage mechanism of a
-                supported URL scheme e.g. a prefix in an AWS s3 bucket.
-
-        :return: A list of URL components in the given directory, already URL-encoded.
-        """
-        parseResult = urlparse(src_uri)
-        otherCls = cls._findJobStoreForUrl(parseResult)
-        return otherCls._list_url(parseResult)
-
-    @classmethod
-    def read_from_url(cls, src_uri: str, writable: IO[bytes]) -> Tuple[int, bool]:
-        """
-        Read the given URL and write its content into the given writable stream.
-
-        Raises FileNotFoundError if the URL doesn't exist.
-
-        :return: The size of the file in bytes and whether the executable permission bit is set
-        """
-        parseResult = urlparse(src_uri)
-        otherCls = cls._findJobStoreForUrl(parseResult)
-        return otherCls._read_from_url(parseResult, writable)
-
-    @classmethod
-    def open_url(cls, src_uri: str) -> IO[bytes]:
-        """
-        Read from the given URI.
-
-        Raises FileNotFoundError if the URL doesn't exist.
-
-        Has a readable stream interface, unlike :meth:`read_from_url` which
-        takes a writable stream.
-        """
-        parseResult = urlparse(src_uri)
-        otherCls = cls._findJobStoreForUrl(parseResult)
-        return otherCls._open_url(parseResult)
-
-    @classmethod
-    @abstractmethod
-    def _url_exists(cls, url: ParseResult) -> bool:
-        """
-        Return True if the item at the given URL exists, and Flase otherwise.
-        """
-        raise NotImplementedError(f"No implementation for {url}")
-
-    @classmethod
-    @abstractmethod
-    def _get_size(cls, url: ParseResult) -> Optional[int]:
-        """
-        Get the size of the object at the given URL, or None if it cannot be obtained.
-        """
-        raise NotImplementedError(f"No implementation for {url}")
-
-    @classmethod
-    @abstractmethod
-    def _get_is_directory(cls, url: ParseResult) -> bool:
-        """
-        Return True if the thing at the given URL is a directory, and False if
-        it is a file or it is known not to exist. The URL may or may not end in
-        '/'.
-
-        :param url: URL that points to a file or object, or directory or prefix,
-               in the storage mechanism of a supported URL scheme e.g. a blob
-               in an AWS s3 bucket.
-        """
-        raise NotImplementedError(f"No implementation for {url}")
-
-    @classmethod
-    @abstractmethod
-    def _read_from_url(cls, url: ParseResult, writable: IO[bytes]) -> Tuple[int, bool]:
-        """
-        Reads the contents of the object at the specified location and writes it to the given
-        writable stream.
-
-        Refer to :func:`~AbstractJobStore.importFile` documentation for currently supported URL schemes.
-
-        Raises FileNotFoundError if the thing at the URL is not found.
-
-        :param ParseResult url: URL that points to a file or object in the storage
-               mechanism of a supported URL scheme e.g. a blob in an AWS s3 bucket.
-
-        :param IO[bytes] writable: a writable stream
-
-        :return: The size of the file in bytes and whether the executable permission bit is set
-        """
-        raise NotImplementedError(f"No implementation for {url}")
-
-    @classmethod
-    @abstractmethod
-    def _list_url(cls, url: ParseResult) -> List[str]:
-        """
-        List the contents of the given URL, which may or may not end in '/'
-
-        Returns a list of URL components. Those that end in '/' are meant to be
-        directories, while those that do not are meant to be files.
-
-        Refer to :func:`~AbstractJobStore.importFile` documentation for currently supported URL schemes.
-
-        :param ParseResult url: URL that points to a directory or prefix in the
-        storage mechanism of a supported URL scheme e.g. a prefix in an AWS s3
-        bucket.
-
-        :return: The children of the given URL, already URL-encoded if
-        appropriate. (If the URL is a bare path, no encoding is done.)
-        """
-        raise NotImplementedError(f"No implementation for {url}")
-
-    @classmethod
-    @abstractmethod
-    def _open_url(cls, url: ParseResult) -> IO[bytes]:
-        """
-        Get a stream of the object at the specified location.
-
-        Refer to :func:`~AbstractJobStore.importFile` documentation for currently supported URL schemes.
-
-        Raises FileNotFoundError if the thing at the URL is not found.
-        """
-        raise NotImplementedError(f"No implementation for {url}")
-
-    @classmethod
-    @abstractmethod
-    def _write_to_url(cls, readable: Union[IO[bytes], IO[str]], url: ParseResult, executable: bool = False) -> None:
-        """
-        Reads the contents of the given readable stream and writes it to the object at the
-        specified location. Raises FileNotFoundError if the URL doesn't exist..
-
-        Refer to AbstractJobStore.importFile documentation for currently supported URL schemes.
-
-        :param Union[IO[bytes], IO[str]] readable: a readable stream
-
-        :param ParseResult url: URL that points to a file or object in the storage
-               mechanism of a supported URL scheme e.g. a blob in an AWS s3 bucket.
-
-        :param bool executable: determines if the file has executable permissions
-        """
-        raise NotImplementedError(f"No implementation for {url}")
-
-    @classmethod
-    @abstractmethod
-    def _supports_url(cls, url: ParseResult, export: bool = False) -> bool:
-        """
-        Returns True if the job store supports the URL's scheme.
-
-        Refer to AbstractJobStore.importFile documentation for currently supported URL schemes.
-
-        :param ParseResult url: a parsed URL that may be supported
-
-        :param bool export: Determines if the url is supported for exported
-
-        :return bool: returns true if the cls supports the URL
-        """
-        raise NotImplementedError(f"No implementation for {url}")
 
     @abstractmethod
     def destroy(self) -> None:
@@ -762,11 +582,11 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='get_env')
-    def getEnv(self) -> Dict[str, str]:
+    @deprecated(new_function_name="get_env")
+    def getEnv(self) -> dict[str, str]:
         return self.get_env()
 
-    def get_env(self) -> Dict[str, str]:
+    def get_env(self) -> dict[str, str]:
         """
         Returns a dictionary of environment variables that this job store requires to be set in
         order to function properly on a worker.
@@ -777,7 +597,7 @@ class AbstractJobStore(ABC):
 
     # Cleanup functions
     def clean(
-        self, jobCache: Optional[Dict[Union[str, "TemporaryID"], JobDescription]] = None
+        self, jobCache: Optional[dict[Union[str, "TemporaryID"], JobDescription]] = None
     ) -> JobDescription:
         """
         Function to cleanup the state of a job store after a restart.
@@ -805,7 +625,9 @@ class AbstractJobStore(ABC):
                 return self.load_job(jobId)
 
         def haveJob(jobId: str) -> bool:
-            assert len(jobId) > 1, f"Job ID {jobId} too short; is a string being used as a list?"
+            assert (
+                len(jobId) > 1
+            ), f"Job ID {jobId} too short; is a string being used as a list?"
             if jobCache is not None:
                 if jobId in jobCache:
                     return True
@@ -825,13 +647,15 @@ class AbstractJobStore(ABC):
                 jobCache[str(jobDescription.jobStoreID)] = jobDescription
                 self.update_job(jobDescription)
 
-        def getJobDescriptions() -> Union[ValuesView[JobDescription], Iterator[JobDescription]]:
+        def getJobDescriptions() -> (
+            Union[ValuesView[JobDescription], Iterator[JobDescription]]
+        ):
             if jobCache is not None:
                 return jobCache.values()
             else:
                 return self.jobs()
 
-        def get_jobs_reachable_from_root() -> Set[str]:
+        def get_jobs_reachable_from_root() -> set[str]:
             """
             Traverse the job graph from the root job and return a flattened set of all active jobstore IDs.
 
@@ -841,8 +665,7 @@ class AbstractJobStore(ABC):
             # Iterate from the root JobDescription and collate all jobs
             # that are reachable from it.
             root_job_description = self.load_root_job()
-            reachable_from_root: Set[str] = set()
-
+            reachable_from_root: set[str] = set()
 
             for merged_in in root_job_description.get_chain():
                 # Add the job itself and any other jobs that chained with it.
@@ -853,7 +676,6 @@ class AbstractJobStore(ABC):
             for service_job_store_id in root_job_description.services:
                 if haveJob(service_job_store_id):
                     reachable_from_root.add(service_job_store_id)
-
 
             # Unprocessed means it might have successor jobs we need to add.
             unprocessed_job_descriptions = [root_job_description]
@@ -867,15 +689,24 @@ class AbstractJobStore(ABC):
                         # exploring them, since we took their successors.
                         reachable_from_root.add(merged_in.job_store_id)
                     for successor_job_store_id in job_description.allSuccessors():
-                        if successor_job_store_id not in reachable_from_root and haveJob(successor_job_store_id):
-                            successor_job_description = getJobDescription(successor_job_store_id)
+                        if (
+                            successor_job_store_id not in reachable_from_root
+                            and haveJob(successor_job_store_id)
+                        ):
+                            successor_job_description = getJobDescription(
+                                successor_job_store_id
+                            )
 
                             # Add all of the successor's linked service jobs as well.
-                            for service_job_store_id in successor_job_description.services:
+                            for (
+                                service_job_store_id
+                            ) in successor_job_description.services:
                                 if haveJob(service_job_store_id):
                                     reachable_from_root.add(service_job_store_id)
 
-                            new_job_descriptions_to_process.append(successor_job_description)
+                            new_job_descriptions_to_process.append(
+                                successor_job_description
+                            )
                 unprocessed_job_descriptions = new_job_descriptions_to_process
 
             logger.debug(f"{len(reachable_from_root)} jobs reachable from root.")
@@ -885,22 +716,32 @@ class AbstractJobStore(ABC):
 
         # Cleanup jobs that are not reachable from the root, and therefore orphaned
         # TODO: Avoid reiterating reachable_from_root (which may be very large)
-        unreachable = [x for x in getJobDescriptions() if x.jobStoreID not in reachable_from_root]
+        unreachable = [
+            x for x in getJobDescriptions() if x.jobStoreID not in reachable_from_root
+        ]
         for jobDescription in unreachable:
             # clean up any associated files before deletion
             for fileID in jobDescription.filesToDelete:
                 # Delete any files that should already be deleted
-                logger.warning(f"Deleting file '{fileID}'. It is marked for deletion but has not yet been removed.")
+                logger.warning(
+                    f"Deleting file '{fileID}'. It is marked for deletion but has not yet been removed."
+                )
                 self.delete_file(fileID)
             # Delete the job from us and the cache
             deleteJob(str(jobDescription.jobStoreID))
 
-        jobDescriptionsReachableFromRoot = {id: getJobDescription(id) for id in reachable_from_root}
+        jobDescriptionsReachableFromRoot = {
+            id: getJobDescription(id) for id in reachable_from_root
+        }
 
         # Clean up any checkpoint jobs -- delete any successors it
         # may have launched, and restore the job to a pristine state
         jobsDeletedByCheckpoints = set()
-        for jobDescription in [desc for desc in jobDescriptionsReachableFromRoot.values() if isinstance(desc, CheckpointJobDescription)]:
+        for jobDescription in [
+            desc
+            for desc in jobDescriptionsReachableFromRoot.values()
+            if isinstance(desc, CheckpointJobDescription)
+        ]:
             if jobDescription.jobStoreID in jobsDeletedByCheckpoints:
                 # This is a checkpoint that was nested within an
                 # earlier checkpoint, so it and all its successors are
@@ -926,8 +767,10 @@ class AbstractJobStore(ABC):
             if len(jobDescription.filesToDelete) != 0:
                 # Delete any files that should already be deleted
                 for fileID in jobDescription.filesToDelete:
-                    logger.critical("Removing file in job store: %s that was "
-                                    "marked for deletion but not previously removed" % fileID)
+                    logger.critical(
+                        "Removing file in job store: %s that was "
+                        "marked for deletion but not previously removed" % fileID
+                    )
                     self.delete_file(fileID)
                 jobDescription.filesToDelete = []
                 changed[0] = True
@@ -940,6 +783,7 @@ class AbstractJobStore(ABC):
 
                 def stackSizeFn() -> int:
                     return len(list(jobDescription.allSuccessors()))
+
                 startStackSize = stackSizeFn()
                 # Remove deleted jobs
                 jobDescription.filterSuccessors(haveJob)
@@ -965,16 +809,25 @@ class AbstractJobStore(ABC):
                 assert isinstance(serviceJobDescription, ServiceJobDescription)
 
                 if flag == 1:
-                    logger.debug("Recreating a start service flag for job: %s, flag: %s",
-                                 jobStoreID, newFlag)
+                    logger.debug(
+                        "Recreating a start service flag for job: %s, flag: %s",
+                        jobStoreID,
+                        newFlag,
+                    )
                     serviceJobDescription.startJobStoreID = newFlag
                 elif flag == 2:
-                    logger.debug("Recreating a terminate service flag for job: %s, flag: %s",
-                                 jobStoreID, newFlag)
+                    logger.debug(
+                        "Recreating a terminate service flag for job: %s, flag: %s",
+                        jobStoreID,
+                        newFlag,
+                    )
                     serviceJobDescription.terminateJobStoreID = newFlag
                 else:
-                    logger.debug("Recreating a error service flag for job: %s, flag: %s",
-                                 jobStoreID, newFlag)
+                    logger.debug(
+                        "Recreating a error service flag for job: %s, flag: %s",
+                        jobStoreID,
+                        newFlag,
+                    )
                     assert flag == 3
                     serviceJobDescription.errorJobStoreID = newFlag
 
@@ -987,6 +840,7 @@ class AbstractJobStore(ABC):
 
             def servicesSizeFn() -> int:
                 return len(jobDescription.services)
+
             startServicesSize = servicesSizeFn()
 
             def replaceFlagsIfNeeded(serviceJobDescription: JobDescription) -> None:
@@ -1047,12 +901,14 @@ class AbstractJobStore(ABC):
 
         # Remove any crufty stats/logging files from the previous run
         logger.debug("Discarding old statistics and logs...")
+
         # We have to manually discard the stream to avoid getting
         # stuck on a blocking write from the job store.
         def discardStream(stream: Union[IO[bytes], IO[str]]) -> None:
             """Read the stream 4K at a time until EOF, discarding all input."""
             while len(stream.read(4096)) != 0:
                 pass
+
         self.read_logs(discardStream)
 
         logger.debug("Job store is clean")
@@ -1064,7 +920,7 @@ class AbstractJobStore(ABC):
     # existence of jobs
     ##########################################
 
-    @deprecated(new_function_name='assign_job_id')
+    @deprecated(new_function_name="assign_job_id")
     def assignID(self, jobDescription: JobDescription) -> None:
         return self.assign_job_id(jobDescription)
 
@@ -1079,16 +935,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @contextmanager
-    def batch(self) -> Iterator[None]:
-        """
-        If supported by the batch system, calls to create() with this context
-        manager active will be performed in a batch after the context manager
-        is released.
-        """
-        yield
-
-    @deprecated(new_function_name='create_job')
+    @deprecated(new_function_name="create_job")
     def create(self, jobDescription: JobDescription) -> JobDescription:
         return self.create_job(jobDescription)
 
@@ -1104,7 +951,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='job_exists')
+    @deprecated(new_function_name="job_exists")
     def exists(self, jobStoreID: str) -> bool:
         return self.job_exists(jobStoreID)
 
@@ -1120,7 +967,7 @@ class AbstractJobStore(ABC):
     # One year should be sufficient to finish any pipeline ;-)
     publicUrlExpiration = timedelta(days=365)
 
-    @deprecated(new_function_name='get_public_url')
+    @deprecated(new_function_name="get_public_url")
     def getPublicUrl(self, fileName: str) -> str:
         return self.get_public_url(fileName)
 
@@ -1139,7 +986,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='get_shared_public_url')
+    @deprecated(new_function_name="get_shared_public_url")
     def getSharedPublicUrl(self, sharedFileName: str) -> str:
         return self.get_shared_public_url(sharedFileName)
 
@@ -1161,7 +1008,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='load_job')
+    @deprecated(new_function_name="load_job")
     def load(self, jobStoreID: str) -> JobDescription:
         return self.load_job(jobStoreID)
 
@@ -1181,9 +1028,18 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='update_job')
+    @deprecated(new_function_name="update_job")
     def update(self, jobDescription: JobDescription) -> None:
         return self.update_job(jobDescription)
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """
+        If supported by the batch system, calls to create() with this context
+        manager active will be performed in a batch after the context manager
+        is released.
+        """
+        yield
 
     @abstractmethod
     def update_job(self, job_description: JobDescription) -> None:
@@ -1196,7 +1052,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='delete_job')
+    @deprecated(new_function_name="delete_job")
     def delete(self, jobStoreID: str) -> None:
         return self.delete_job(jobStoreID)
 
@@ -1233,12 +1089,19 @@ class AbstractJobStore(ABC):
     # associated with a given job.
     ##########################################
 
-    @deprecated(new_function_name='write_file')
-    def writeFile(self, localFilePath: str, jobStoreID: Optional[str] = None, cleanup: bool = False) -> str:
+    @deprecated(new_function_name="write_file")
+    def writeFile(
+        self,
+        localFilePath: str,
+        jobStoreID: Optional[str] = None,
+        cleanup: bool = False,
+    ) -> str:
         return self.write_file(localFilePath, jobStoreID, cleanup)
 
     @abstractmethod
-    def write_file(self, local_path: str, job_id: Optional[str] = None, cleanup: bool = False) -> str:
+    def write_file(
+        self, local_path: str, job_id: Optional[str] = None, cleanup: bool = False
+    ) -> str:
         """
         Takes a file (as a path) and places it in this job store. Returns an ID that can be used
         to retrieve the file at a later time.  The file is written in a atomic manner.  It will
@@ -1269,19 +1132,27 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='write_file_stream')
-    def writeFileStream(self, jobStoreID: Optional[str] = None, cleanup: bool = False, basename: Optional[str] = None,
-                        encoding: Optional[str] = None, errors: Optional[str] = None) -> ContextManager[Tuple[IO[bytes], str]]:
+    @deprecated(new_function_name="write_file_stream")
+    def writeFileStream(
+        self,
+        jobStoreID: Optional[str] = None,
+        cleanup: bool = False,
+        basename: Optional[str] = None,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> ContextManager[tuple[IO[bytes], str]]:
         return self.write_file_stream(jobStoreID, cleanup, basename, encoding, errors)
 
     @abstractmethod
     @contextmanager
-    def write_file_stream(self,
-                          job_id: Optional[str] = None,
-                          cleanup: bool = False,
-                          basename: Optional[str] = None,
-                          encoding: Optional[str] = None,
-                          errors: Optional[str] = None) -> Iterator[Tuple[IO[bytes], str]]:
+    def write_file_stream(
+        self,
+        job_id: Optional[str] = None,
+        cleanup: bool = False,
+        basename: Optional[str] = None,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> Iterator[tuple[IO[bytes], str]]:
         """
         Similar to writeFile, but returns a context manager yielding a tuple of
         1) a file handle which can be written to and 2) the ID of the resulting
@@ -1320,30 +1191,34 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='get_empty_file_store_id')
-    def getEmptyFileStoreID(self,
-                            jobStoreID: Optional[str] = None,
-                            cleanup: bool = False,
-                            basename: Optional[str] = None) -> str:
+    @deprecated(new_function_name="get_empty_file_store_id")
+    def getEmptyFileStoreID(
+        self,
+        jobStoreID: Optional[str] = None,
+        cleanup: bool = False,
+        basename: Optional[str] = None,
+    ) -> str:
         return self.get_empty_file_store_id(jobStoreID, cleanup, basename)
 
     @abstractmethod
-    def get_empty_file_store_id(self,
-                                job_id: Optional[str] = None,
-                                cleanup: bool = False,
-                                basename: Optional[str] = None) -> str:
+    def get_empty_file_store_id(
+        self,
+        job_id: Optional[str] = None,
+        cleanup: bool = False,
+        basename: Optional[str] = None,
+    ) -> str:
         """
         Creates an empty file in the job store and returns its ID.
         Call to fileExists(getEmptyFileStoreID(jobStoreID)) will return True.
 
-        :param str job_id: the id of a job, or None. If specified, the may be associated
+        :param job_id: the id of a job, or None. If specified, the may be associated
                with that job in a job-store-specific way. This may influence the returned ID.
 
-        :param bool cleanup: Whether to attempt to delete the file when the job
+        :param cleanup: Whether to attempt to delete the file when the job
                whose jobStoreID was given as jobStoreID is deleted with
                jobStore.delete(job). If jobStoreID was not given, does nothing.
 
-        :param str basename: If supported by the implementation, use the given
+        :param basename: If supported by the implementation, use the given
                file basename so that when searching the job store with a query
                matching that basename, the file will be detected.
 
@@ -1353,8 +1228,10 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='read_file')
-    def readFile(self, jobStoreFileID: str, localFilePath: str, symlink: bool = False) -> None:
+    @deprecated(new_function_name="read_file")
+    def readFile(
+        self, jobStoreFileID: str, localFilePath: str, symlink: bool = False
+    ) -> None:
         return self.read_file(jobStoreFileID, localFilePath, symlink)
 
     @abstractmethod
@@ -1382,7 +1259,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='read_file_stream')
+    @deprecated(new_function_name="read_file_stream")
     def readFileStream(
         self,
         jobStoreFileID: str,
@@ -1397,14 +1274,12 @@ class AbstractJobStore(ABC):
         file_id: Union[FileID, str],
         encoding: Literal[None] = None,
         errors: Optional[str] = None,
-    ) -> ContextManager[IO[bytes]]:
-        ...
+    ) -> ContextManager[IO[bytes]]: ...
 
     @overload
     def read_file_stream(
         self, file_id: Union[FileID, str], encoding: str, errors: Optional[str] = None
-    ) -> ContextManager[IO[str]]:
-        ...
+    ) -> ContextManager[IO[str]]: ...
 
     @abstractmethod
     def read_file_stream(
@@ -1430,7 +1305,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='delete_file')
+    @deprecated(new_function_name="delete_file")
     def deleteFile(self, jobStoreFileID: str) -> None:
         return self.delete_file(jobStoreFileID)
 
@@ -1444,7 +1319,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='file_exists')
+    @deprecated(new_function_name="file_exists")
     def fileExists(self, jobStoreFileID: str) -> bool:
         """Determine whether a file exists in this job store."""
         return self.file_exists(jobStoreFileID)
@@ -1458,7 +1333,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='get_file_size')
+    @deprecated(new_function_name="get_file_size")
     def getFileSize(self, jobStoreFileID: str) -> int:
         """Get the size of the given file in bytes."""
         return self.get_file_size(jobStoreFileID)
@@ -1478,7 +1353,7 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='update_file')
+    @deprecated(new_function_name="update_file")
     def updateFile(self, jobStoreFileID: str, localFilePath: str) -> None:
         """Replaces the existing version of a file in the job store."""
         return self.update_file(jobStoreFileID, localFilePath)
@@ -1499,19 +1374,20 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='update_file_stream')
-    def updateFileStream(self,
-                         jobStoreFileID: str,
-                         encoding: Optional[str] = None,
-                         errors: Optional[str] = None) -> ContextManager[IO[Any]]:
+    @deprecated(new_function_name="update_file_stream")
+    def updateFileStream(
+        self,
+        jobStoreFileID: str,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> ContextManager[IO[Any]]:
         return self.update_file_stream(jobStoreFileID, encoding, errors)
 
     @abstractmethod
     @contextmanager
-    def update_file_stream(self,
-                           file_id: str,
-                           encoding: Optional[str] = None,
-                           errors: Optional[str] = None) -> Iterator[IO[Any]]:
+    def update_file_stream(
+        self, file_id: str, encoding: Optional[str] = None, errors: Optional[str] = None
+    ) -> Iterator[IO[Any]]:
         """
         Replaces the existing version of a file in the job store. Similar to writeFile, but
         returns a context manager yielding a file handle which can be written to. The
@@ -1537,20 +1413,29 @@ class AbstractJobStore(ABC):
     # with specific jobs.
     ##########################################
 
-    sharedFileNameRegex = re.compile(r'^[a-zA-Z0-9._-]+$')
+    sharedFileNameRegex = re.compile(r"^[a-zA-Z0-9._-]+$")
 
-    @deprecated(new_function_name='write_shared_file_stream')
-    def writeSharedFileStream(self, sharedFileName: str, isProtected: Optional[bool] = None, encoding: Optional[str] = None,
-                                errors: Optional[str] = None) -> ContextManager[IO[bytes]]:
-        return self.write_shared_file_stream(sharedFileName, isProtected, encoding, errors)
+    @deprecated(new_function_name="write_shared_file_stream")
+    def writeSharedFileStream(
+        self,
+        sharedFileName: str,
+        isProtected: Optional[bool] = None,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> ContextManager[IO[bytes]]:
+        return self.write_shared_file_stream(
+            sharedFileName, isProtected, encoding, errors
+        )
 
     @abstractmethod
     @contextmanager
-    def write_shared_file_stream(self,
-                                 shared_file_name: str,
-                                 encrypted: Optional[bool] = None,
-                                 encoding: Optional[str] = None,
-                                 errors: Optional[str] = None) -> Iterator[IO[bytes]]:
+    def write_shared_file_stream(
+        self,
+        shared_file_name: str,
+        encrypted: Optional[bool] = None,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> Iterator[IO[bytes]]:
         """
         Returns a context manager yielding a writable file handle to the global file referenced
         by the given name.  File will be created in an atomic manner.
@@ -1575,19 +1460,45 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='read_shared_file_stream')
-    def readSharedFileStream(self,
-                             sharedFileName: str,
-                             encoding: Optional[str] = None,
-                             errors: Optional[str] = None) -> ContextManager[IO[bytes]]:
+    @deprecated(new_function_name="read_shared_file_stream")
+    def readSharedFileStream(
+        self,
+        sharedFileName: str,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> Union[ContextManager[IO[str]], ContextManager[IO[bytes]]]:
         return self.read_shared_file_stream(sharedFileName, encoding, errors)
+
+    @overload
+    @abstractmethod
+    @contextmanager
+    def read_shared_file_stream(
+        self,
+        shared_file_name: str,
+        encoding: str,
+        errors: Optional[str] = None,
+    ) -> Iterator[IO[str]]:
+        """If encoding is specified, then a text file handle is provided."""
+
+    @overload
+    @abstractmethod
+    @contextmanager
+    def read_shared_file_stream(
+        self,
+        shared_file_name: str,
+        encoding: Literal[None] = None,
+        errors: Optional[str] = None,
+    ) -> Iterator[IO[bytes]]:
+        """If no encoding is provided, then a bytest file handle is provided."""
 
     @abstractmethod
     @contextmanager
-    def read_shared_file_stream(self,
-                                shared_file_name: str,
-                                encoding: Optional[str] = None,
-                                errors: Optional[str] = None) -> Iterator[IO[bytes]]:
+    def read_shared_file_stream(
+        self,
+        shared_file_name: str,
+        encoding: Optional[str] = None,
+        errors: Optional[str] = None,
+    ) -> Union[Iterator[IO[str]], Iterator[IO[bytes]]]:
         """
         Returns a context manager yielding a readable file handle to the global file referenced
         by the given name.
@@ -1602,11 +1513,10 @@ class AbstractJobStore(ABC):
                 are the same as for open(). Defaults to 'strict' when an encoding is specified.
 
         :return: a context manager yielding a readable file handle
-        :rtype: Iterator[IO[bytes]]
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='write_logs')
+    @deprecated(new_function_name="write_logs")
     def writeStatsAndLogging(self, statsAndLoggingString: str) -> None:
         return self.write_logs(statsAndLoggingString)
 
@@ -1622,8 +1532,10 @@ class AbstractJobStore(ABC):
         """
         raise NotImplementedError()
 
-    @deprecated(new_function_name='read_logs')
-    def readStatsAndLogging(self, callback: Callable[..., Any], readAll: bool = False) -> int:
+    @deprecated(new_function_name="read_logs")
+    def readStatsAndLogging(
+        self, callback: Callable[..., Any], readAll: bool = False
+    ) -> int:
         return self.read_logs(callback, readAll)
 
     @abstractmethod
@@ -1658,8 +1570,8 @@ class AbstractJobStore(ABC):
         this method. Other methods will rely on always having the most current
         pid available. So far there is no reason to store any old pids.
         """
-        with self.write_shared_file_stream('pid.log') as f:
-            f.write(str(os.getpid()).encode('utf-8'))
+        with self.write_shared_file_stream("pid.log") as f:
+            f.write(str(os.getpid()).encode("utf-8"))
 
     def read_leader_pid(self) -> int:
         """
@@ -1667,7 +1579,7 @@ class AbstractJobStore(ABC):
 
         :raise NoSuchFileException: If the PID file doesn't exist.
         """
-        with self.read_shared_file_stream('pid.log') as f:
+        with self.read_shared_file_stream("pid.log") as f:
             return int(f.read().strip())
 
     def write_leader_node_id(self) -> None:
@@ -1676,7 +1588,7 @@ class AbstractJobStore(ABC):
         by the leader.
         """
         with self.write_shared_file_stream("leader_node_id.log") as f:
-            f.write(getNodeID().encode('utf-8'))
+            f.write(getNodeID().encode("utf-8"))
 
     def read_leader_node_id(self) -> str:
         """
@@ -1685,7 +1597,7 @@ class AbstractJobStore(ABC):
         :raise NoSuchFileException: If the node ID file doesn't exist.
         """
         with self.read_shared_file_stream("leader_node_id.log") as f:
-            return f.read().decode('utf-8').strip()
+            return f.read().decode("utf-8").strip()
 
     def write_kill_flag(self, kill: bool = False) -> None:
         """
@@ -1698,7 +1610,7 @@ class AbstractJobStore(ABC):
         workers are expected to be cleaned up by the leader.
         """
         with self.write_shared_file_stream("_toil_kill_flag") as f:
-            f.write(("YES" if kill else "NO").encode('utf-8'))
+            f.write(("YES" if kill else "NO").encode("utf-8"))
 
     def read_kill_flag(self) -> bool:
         """
@@ -1739,25 +1651,40 @@ class AbstractJobStore(ABC):
         if not cls._validateSharedFileName(sharedFileName):
             raise ValueError("Not a valid shared file name: '%s'." % sharedFileName)
 
-class JobStoreSupport(AbstractJobStore, metaclass=ABCMeta):
+
+class JobStoreSupport(AbstractJobStore, URLAccess, metaclass=ABCMeta):
     """
     A mostly fake JobStore to access URLs not really associated with real job
     stores.
     """
 
     @classmethod
+    def _setup_ftp(cls) -> FtpFsAccess:
+        # FTP connections are not reused. Ideally, a thread should watch any reused FTP connections
+        # and close them when necessary
+        return FtpFsAccess()
+
+    @classmethod
     def _supports_url(cls, url: ParseResult, export: bool = False) -> bool:
-        return url.scheme.lower() in ('http', 'https', 'ftp') and not export
+        return url.scheme.lower() in ("http", "https", "ftp") and not export
 
     @classmethod
     def _url_exists(cls, url: ParseResult) -> bool:
+        # Deal with FTP first to support user/password auth
+        if url.scheme.lower() == "ftp":
+            ftp = cls._setup_ftp()
+            return ftp.exists(url.geturl())
+
         try:
-            # TODO: Figure out how to HEAD instead of this.
-            with cls._open_url(url):
+            with closing(urlopen(Request(url.geturl(), method="HEAD"))):
                 return True
-        except:
-            pass
-        return False
+        except HTTPError as e:
+            if e.code in (404, 410):
+                return False
+            else:
+                raise
+        # Any other errors we should pass through because something really went
+        # wrong (e.g. server is broken today but file may usually exist)
 
     @classmethod
     @retry(
@@ -1767,17 +1694,19 @@ class JobStoreSupport(AbstractJobStore, metaclass=ABCMeta):
         ]
     )
     def _get_size(cls, url: ParseResult) -> Optional[int]:
-        if url.scheme.lower() == 'ftp':
-            return None
-        with closing(urlopen(url.geturl())) as readable:
-            # just read the header for content length
-            size = readable.info().get('content-length')
-            return int(size) if size is not None else None
+        if url.scheme.lower() == "ftp":
+            ftp = cls._setup_ftp()
+            return ftp.size(url.geturl())
+
+        # just read the header for content length
+        resp = urlopen(Request(url.geturl(), method="HEAD"))
+        size = resp.info().get("content-length")
+        return int(size) if size is not None else None
 
     @classmethod
     def _read_from_url(
         cls, url: ParseResult, writable: Union[IO[bytes], IO[str]]
-    ) -> Tuple[int, bool]:
+    ) -> tuple[int, bool]:
         # We can't actually retry after we start writing.
         # TODO: Implement retry with byte range requests
         with cls._open_url(url) as readable:
@@ -1786,8 +1715,10 @@ class JobStoreSupport(AbstractJobStore, metaclass=ABCMeta):
             # nested function can modify it without creating its own
             # local with the same name.
             size = [0]
+
             def count(l: int) -> None:
                 size[0] += l
+
             counter = WriteWatchingStream(writable)
             counter.onWrite(count)
 
@@ -1799,18 +1730,32 @@ class JobStoreSupport(AbstractJobStore, metaclass=ABCMeta):
     @retry(
         errors=[
             BadStatusLine,
-            ErrorCondition(error=HTTPError, error_codes=[408, 500, 503]),
+            ErrorCondition(error=HTTPError, error_codes=[408, 429, 500, 502, 503]),
         ]
     )
     def _open_url(cls, url: ParseResult) -> IO[bytes]:
+        # Deal with FTP first so we support user/password auth
+        if url.scheme.lower() == "ftp":
+            ftp = cls._setup_ftp()
+            # we open in read mode as write mode is not supported
+            return ftp.open(url.geturl(), mode="r")
+
         try:
             return cast(IO[bytes], closing(urlopen(url.geturl())))
         except HTTPError as e:
-            if e.code == 404:
+            if e.code in (404, 410):
                 # Translate into a FileNotFoundError for detecting
-                # un-importable files
+                # known nonexistent files
                 raise FileNotFoundError(str(url)) from e
             else:
+                # Other codes indicate a real problem with the server; we don't
+                # want to e.g. run a workflow without an optional input that
+                # the user specified a path to just because the server was
+                # busy.
+
+                # Sometimes we expect to see this when polling existence for
+                # inputs at guessed paths, so don't complain *too* loudly here.
+                logger.debug("Unusual status %d for URL %s", e.code, str(url))
                 raise
 
     @classmethod
@@ -1819,6 +1764,6 @@ class JobStoreSupport(AbstractJobStore, metaclass=ABCMeta):
         return False
 
     @classmethod
-    def _list_url(cls, url: ParseResult) -> List[str]:
+    def _list_url(cls, url: ParseResult) -> list[str]:
         # TODO: Implement HTTP index parsing and FTP directory listing
         raise NotImplementedError("HTTP and FTP URLs cannot yet be listed")

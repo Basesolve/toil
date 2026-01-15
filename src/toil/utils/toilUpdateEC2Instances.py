@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright (C) 2015-2021 Regents of the University of California
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,7 +32,9 @@ def internet_connection() -> bool:
 
 def main() -> None:
     if not internet_connection():
-        raise RuntimeError('No internet.  Updating the EC2 Instance list requires internet.')
+        raise RuntimeError(
+            "No internet.  Updating the EC2 Instance list requires internet."
+        )
     updateStaticEC2Instances()
 
 

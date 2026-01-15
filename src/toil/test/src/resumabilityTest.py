@@ -12,28 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
+from pathlib import Path
 
 from toil.exceptions import FailedJobsException
-from toil.job import Job
+from toil.job import Job, JobFunctionWrappingJob
 from toil.jobStores.abstractJobStore import NoSuchFileException
-from toil.test import ToilTest, slow
+from toil.test import pslow as slow
+
+import pytest
 
 
-class ResumabilityTest(ToilTest):
+class TestResumability:
     """
     https://github.com/BD2KGenomics/toil/issues/808
     """
+
     @slow
-    def test(self):
+    @pytest.mark.slow
+    def test(self, tmp_path: Path) -> None:
         """
         Tests that a toil workflow that fails once can be resumed without a NoSuchJobException.
         """
-        options = Job.Runner.getDefaultOptions(self._getTestJobStorePath())
+        options = Job.Runner.getDefaultOptions(tmp_path / "jobstore")
         options.logLevel = "INFO"
         options.retryCount = 0
         root = Job.wrapJobFn(parent)
-        with self.assertRaises(FailedJobsException):
+        with pytest.raises(FailedJobsException):
             # This one is intended to fail.
             Job.Runner.startToil(root, options)
 
@@ -43,34 +47,36 @@ class ResumabilityTest(ToilTest):
         # system code notices that the job has been deleted despite
         # the failure and avoids the failure.
         options.restart = True
-        tempDir = self._createTempDir()
-        options.logFile = os.path.join(tempDir, "log.txt")
+        tempDir = tmp_path / "tempdir"
+        tempDir.mkdir()
+        options.logFile = str(tempDir / "log.txt")
         Job.Runner.startToil(root, options)
         with open(options.logFile) as f:
             logString = f.read()
             # We are looking for e.g. "Batch system is reporting that
             # the jobGraph with batch system ID: 1 and jobGraph
             # store ID: n/t/jobwbijqL failed with exit value 1"
-            self.assertTrue("failed with exit value" not in logString)
+            assert "failed with exit value" not in logString
 
-    def test_chaining(self):
+    def test_chaining(self, tmp_path: Path) -> None:
         """
         Tests that a job which is chained to and fails can resume and succeed.
         """
 
-        options = Job.Runner.getDefaultOptions(self._getTestJobStorePath())
+        options = Job.Runner.getDefaultOptions(tmp_path / "jobstore")
         options.logLevel = "DEBUG"
         options.retryCount = 0
-        tempDir = self._createTempDir()
-        options.logFile = os.path.join(tempDir, "log.txt")
+        tempDir = tmp_path / "tempdir"
+        tempDir.mkdir()
+        options.logFile = str(tempDir / "log.txt")
 
         root = Job.wrapJobFn(chaining_parent)
 
-        with self.assertRaises(FailedJobsException):
+        with pytest.raises(FailedJobsException):
             # This one is intended to fail.
             Job.Runner.startToil(root, options)
 
-        with open(options.logFile, 'r') as f:
+        with open(options.logFile) as f:
             log_content = f.read()
             # Make sure we actually did do chaining
             assert "Chaining from" in log_content
@@ -81,7 +87,8 @@ class ResumabilityTest(ToilTest):
         options.restart = True
         Job.Runner.startToil(root, options)
 
-def parent(job):
+
+def parent(job: Job) -> None:
     """
     Set up a bunch of dummy child jobs, and a bad job that needs to be
     restarted as the follow on.
@@ -90,19 +97,22 @@ def parent(job):
         job.addChildJobFn(goodChild)
     job.addFollowOnJobFn(badChild)
 
-def chaining_parent(job):
+
+def chaining_parent(job: Job) -> None:
     """
     Set up a failing job to chain to.
     """
     job.addFollowOnJobFn(badChild)
 
-def goodChild(job):
+
+def goodChild(job: Job) -> None:
     """
     Does nothing.
     """
     return
 
-def badChild(job):
+
+def badChild(job: JobFunctionWrappingJob) -> None:
     """
     Fails the first time it's run, succeeds the second time.
     """
@@ -110,6 +120,8 @@ def badChild(job):
         with job.fileStore.jobStore.read_shared_file_stream("alreadyRun") as fileHandle:
             fileHandle.read()
     except NoSuchFileException as ex:
-        with job.fileStore.jobStore.write_shared_file_stream("alreadyRun", encrypted=False) as fileHandle:
+        with job.fileStore.jobStore.write_shared_file_stream(
+            "alreadyRun", encrypted=False
+        ) as fileHandle:
             fileHandle.write(b"failed once\n")
         raise RuntimeError(f"this is an expected error: {str(ex)}")

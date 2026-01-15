@@ -25,11 +25,11 @@ python = f'python{sys.version_info[0]}.{sys.version_info[1]}'
 pip = f'{python} -m pip'
 
 # Debian and Ubuntu don't package ensurepip by default so the python-venv package must be installed
-python_packages = {'python3.8': ['python3.8-distutils', 'python3.8-venv'],
-                   'python3.9': ['python3.9-distutils', 'python3.9-venv'],
+python_packages = {'python3.9': ['python3.9-distutils', 'python3.9-venv'],
                    'python3.10': ['python3.10-distutils', 'python3.10-venv'],
                    'python3.11': ['python3.11-distutils', 'python3.11-venv'],
-                   'python3.12': ['python3.12-distutils', 'python3.12-venv']}
+                   'python3.12': ['python3.12-venv'],
+                   'python3.13': ['python3.13-venv']}  # python3.13 removed distutils
 
 dependencies = ' '.join(python_packages[python] +
                         ['libffi-dev',  # For client side encryption for extras with PyNACL
@@ -72,6 +72,21 @@ dependencies = ' '.join(python_packages[python] +
                          # Dependencies for singularity on kubernetes
                          'tzdata'])
 
+# pymesos's http-parser dependency can't build on Python later than 3.10, as
+# released in 0.9.0. The upstream pymesos can, but we write it out of Toil's
+# dependencies on later Python versions, since a working http-parser is not
+# available in PyPI. So we need to manually inject a working http-parser, and
+# pymesos, into the Docker images.
+extra_mesos_python_modules = {
+    'python3.9': [],
+    'python3.10': [],
+    'python3.11': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15'],
+    'python3.12': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15'],
+    'python3.13': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15']
+}
+
+extra_python_modules = " ".join(extra_mesos_python_modules[python])
+
 
 def heredoc(s):
     s = textwrap.dedent(s).format(**globals())
@@ -80,11 +95,10 @@ def heredoc(s):
 
 motd = heredoc('''
 
-    This is the Toil appliance. You can run your Toil script directly on the appliance.
-    Run toil <workflow>.py --help to see all options for running your workflow.
+    This is the Toil appliance. You can run your Toil workflow directly on the appliance.
     For more information see http://toil.readthedocs.io/en/latest/
 
-    Copyright (C) 2015-2022 Regents of the University of California
+    Copyright (C) 2015-2025 Regents of the University of California
 
     Version: {applianceSelf}
 
@@ -111,11 +125,12 @@ print(heredoc('''
     # Find a repo with a Mesos build.
     # This one was archived like:
     # mkdir mesos-repo && cd mesos-repo
-    # wget --recursive --restrict-file-names=windows -k --convert-links --no-parent --page-requisites https://rpm.aventer.biz/Ubuntu/ https://www.aventer.biz/assets/support_aventer.asc https://rpm.aventer.biz/README.txt
+    # wget --recursive --restrict-file-names=windows -k --convert-links --no-parent --page-requisites -m https://rpm.aventer.biz/Ubuntu/ https://www.aventer.biz/assets/support_aventer.asc https://rpm.aventer.biz/README.txt
     # ipfs add -r .
-    RUN echo "deb https://public.gi.ucsc.edu/~anovak/outbox/toil/ipfs/QmeaErHzK4Dajz2mCMd36eUDQp7GX2bSECVRpGfrqdragR/rpm.aventer.biz/Ubuntu/focal focal main" \
+    # It contains a GPG key that will expire 2026-09-28
+    RUN echo "deb https://public.gi.ucsc.edu/~anovak/outbox/toil/ipfs/QmRXnGNiWk523zgNkuamENVkghMJ2zJtinVfgjHbc4Dcpr/rpm.aventer.biz/Ubuntu/focal focal main" \
         > /etc/apt/sources.list.d/mesos.list \
-        && curl https://public.gi.ucsc.edu/~anovak/outbox/toil/ipfs/QmeaErHzK4Dajz2mCMd36eUDQp7GX2bSECVRpGfrqdragR/www.aventer.biz/assets/support_aventer.asc | apt-key add -
+        && curl https://public.gi.ucsc.edu/~anovak/outbox/toil/ipfs/QmRXnGNiWk523zgNkuamENVkghMJ2zJtinVfgjHbc4Dcpr/www.aventer.biz/assets/support_aventer.asc | apt-key add -
 
     RUN apt-get -y update --fix-missing && \
         DEBIAN_FRONTEND=noninteractive apt-get -y upgrade && \
@@ -181,18 +196,22 @@ print(heredoc('''
     # The stock pip is too old and can't install from sdist with extras
     RUN curl -sS https://bootstrap.pypa.io/get-pip.py | {python}
 
-    # Include virtualenv, as it is still the recommended way to deploy pipelines
-    RUN {pip} install --upgrade virtualenv==20.25.1
+    # Include virtualenv, as it is still the recommended way to deploy
+    # pipelines.
+    #
+    # We need to --ignore-installed here to allow shadowing system packages
+    # from apt in /usr/lib/python3/dist-packages when the installed package
+    # needs newer versions. We just hope that doesn't break the Ubuntu system
+    # too badly when we're actually on the system Python, or if Toil needs to
+    # upgrade a distutils or setuptools dependency. On the deadsnakes Pythons,
+    # installations into the version-specific package directory won't be seen
+    # by the system Python which is a different version.
+    #
+    # TODO: Change to nested virtual environments and .pth files and teach Toil
+    # to just ship the user-level one for hot deploy.
+    RUN {pip} install --ignore-installed --upgrade 'virtualenv>=20.25.1,<21'
 
-    # Install s3am (--never-download prevents silent upgrades to pip, wheel and setuptools)
-    # Install setuptools within the virtual environment to properly access distutils due to PEP 632 and gh-95299 in Python 3.12 release notes
-    # https://docs.python.org/3/whatsnew/3.12.html#summary-release-highlights
-    RUN virtualenv --python {python} --never-download /home/s3am \
-        && /home/s3am/bin/pip install setuptools \
-        && /home/s3am/bin/pip install s3am==2.0 \
-        && ln -s /home/s3am/bin/s3am /usr/local/bin/
-    
-    RUN {pip} install --upgrade setuptools==69.2.0
+    RUN {pip} install --ignore-installed --upgrade 'setuptools>=80,<81'
 
     # Fix for https://issues.apache.org/jira/browse/MESOS-3793
     ENV MESOS_LAUNCHER=posix
@@ -221,7 +240,7 @@ print(heredoc('''
 
     # This component changes most frequently and keeping it last maximizes Docker cache hits.
     COPY {sdistName} .
-    RUN {pip} install {sdistName}[all]
+    RUN {pip} install --ignore-installed --upgrade {sdistName}[all] {extra_python_modules}
     RUN rm {sdistName}
 
     # We intentionally inherit the default ENTRYPOINT and CMD from the base image, to the effect

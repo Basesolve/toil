@@ -65,7 +65,7 @@ the appliance images to, for example:
 You might also want to build just for one architecture and load into your
 Docker daemon. We have a 'load_docker' target for this.
 
-    make load_docker arch=amd64
+    make load_docker arch=linux/amd64
 
 If Docker is not installed, Docker-related targets tasks and tests will be skipped. The
 same can be achieved by setting TOIL_DOCKER_REGISTRY to an empty string.
@@ -85,9 +85,13 @@ help:
 
 # This Makefile uses bash features like printf and <()
 SHELL=bash
-tests=src/toil/test
+# We need the default tests to include the doctests, but not htcondor which isn't on mac.
+tests=src/toil --ignore src/toil/batchSystems/htcondor.py
 arch=linux/amd64,linux/arm64
-cov="--cov=toil"
+cov=--cov=toil
+logging=--log-format="%(asctime)s %(levelname)s %(message)s" --log-level DEBUG -o log_cli=true --log-cli-level INFO
+verbose=-vv
+durations=--durations=0
 extras=
 # You can say make develop packages=xxx to install packages in the same Python
 # environment as Toil itself without creating dependency conflicts with Toil
@@ -105,12 +109,28 @@ marker=""
 # Number of tests to run in parallel.
 threads:="auto"
 
+dist:="worksteal"
+pytest_args:="--randomly-dont-reorganize"
+
+# Only pass the threading options if running parallel tests. Otherwise we lose
+# live logging. See <https://stackoverflow.com/q/62533239>
+ifeq "$(threads)" "auto"
+	threadopts=-n $(threads) --dist $(dist)
+else
+ifeq "$(threads)" "1"
+	threadopts=
+else
+	threadopts=-n $(threads) --dist $(dist)
+endif
+endif
+
 develop: check_venv
+	python3 setup.py check
 	pip install -e .$(extras) $(packages)
 
 clean_develop: check_venv
 	- rm -rf src/*.egg-info
-	- rm src/toil/version.py
+	- rm -f src/toil/version.py
 
 uninstall:
 	- pip uninstall -y toil
@@ -130,16 +150,40 @@ dist/$(sdist_name):
 
 clean_sdist:
 	- rm -rf dist
-	- rm src/toil/version.py
+	- rm -f src/toil/version.py
+
+download_cwl_spec:
+	git clone https://github.com/common-workflow-language/cwl-v1.2.git src/toil/test/cwl/spec_v12 || true && cd src/toil/test/cwl/spec_v12 && git checkout 0d538a0dbc5518f3c6083ce4571926f65cb84f76
+	git clone https://github.com/common-workflow-language/cwl-v1.1.git src/toil/test/cwl/spec_v11 || true && cd src/toil/test/cwl/spec_v11 && git checkout 664835e83eb5e57eee18a04ce7b05fb9d70d77b7
+	git clone https://github.com/common-workflow-language/common-workflow-language.git src/toil/test/cwl/spec || true && cd src/toil/test/cwl/spec && git checkout 6a955874ade22080b8ef962b4e0d6e408112c1ef
+	# Add .cwltest to filenames so the Pytest plugin can see them
+	cp src/toil/test/cwl/spec_v12/conformance_tests.yaml src/toil/test/cwl/spec_v12/conformance_tests.cwltest.yaml
+	cp src/toil/test/cwl/spec_v11/conformance_tests.yaml src/toil/test/cwl/spec_v11/conformance_tests.cwltest.yaml
+	cp src/toil/test/cwl/spec/v1.0/conformance_test_v1.0.yaml src/toil/test/cwl/spec/v1.0/conformance_test_v1.0.cwltest.yaml
+
+
+### pytest options, see also setup.cfg, section "[tool:pytest]" (which can be overriden using 'pytest_args=--color=no' or similar)
 
 # Setting SET_OWNER_TAG will tag cloud resources so that UCSC's cloud murder bot won't kill them.
 test: check_venv check_build_reqs
 	TOIL_OWNER_TAG="shared" \
-	    python -m pytest --log-format="%(asctime)s %(levelname)s %(message)s" --durations=0 --strict-markers --log-level DEBUG --log-cli-level INFO -r s $(cov) -n $(threads) --dist loadscope $(tests) -m "$(marker)" --color=yes
+	TOIL_HISTORY=0 \
+	    python -m pytest $(verbose) $(durations) $(threadopts) -m "$(marker)" $(logging) $(cov) $(tests) $(pytest_args)
+
+# When running doctests, we need to not capture output, because on CI we can
+# get failures where doctest saw no output and we report captured output, as in
+# <https://ucsc-ci.com/databiosphere/toil/-/jobs/96131>. doctest and pytest's
+# captures might not work properly together.
+doctest: check_venv check_build_reqs
+	TOIL_OWNER_TAG="shared" \
+	TOIL_HISTORY=0 \
+	    python -m pytest --capture=no $(verbose) $(durations) $(threadopts) -m "$(marker)" $(logging) $(cov) $(tests) --ignore src/toil/test $(pytest_args)
 
 test_debug: check_venv check_build_reqs
+	# Don't include threadopts to make sure we can see our live logging.
 	TOIL_OWNER_TAG="$(whoami)" \
-	    python -m pytest --log-format="%(asctime)s %(levelname)s %(message)s" --durations=0 --strict-markers --log-level DEBUG -s -o log_cli=true --log-cli-level DEBUG -r s $(tests) -m "$(marker)" --tb=native --maxfail=1 --color=yes
+	TOIL_HISTORY=0 \
+	    python -m pytest $(verbose) $(durations) -m "$(marker)" $(logging) $(tests) $(pytest_args) --maxfail=1
 
 
 # This target will skip building docker and all docker based tests
@@ -148,12 +192,15 @@ test_offline: check_venv check_build_reqs
 	@printf "$(cyan)All docker related tests will be skipped.$(normal)\n"
 	TOIL_SKIP_DOCKER=True \
 	TOIL_SKIP_ONLINE=True \
-	    python -m pytest --log-format="%(asctime)s %(levelname)s %(message)s" -vv --timeout=600 --strict-markers --log-level DEBUG --log-cli-level INFO $(cov) -n $(threads) --dist loadscope $(tests) -m "$(marker)" --color=yes
+	TOIL_HISTORY=0 \
+	    python -m pytest $(verbose) $(durations) $(threadopts) -m "$(marker)" $(logging) $(cov) $(tests) $(pytest_args)
 
-# This target will run about 1 minute of tests, and stop at the first failure
+# This target will run about 1 minute of tests, and stop at the first failure.
+# There can be more than one failure because of parallel execution.
 test_1min: check_venv check_build_reqs
-	TOIL_SKIP_DOCKER=True \
-	    python -m pytest --log-format="%(asctime)s %(levelname)s %(message)s" -vv --timeout=10 --strict-markers --log-level DEBUG --log-cli-level INFO --maxfail=1 src/toil/test/batchSystems/batchSystemTest.py::SingleMachineBatchSystemTest::test_run_jobs src/toil/test/batchSystems/batchSystemTest.py::KubernetesBatchSystemBenchTest src/toil/test/server/serverTest.py::ToilWESServerBenchTest::test_get_service_info src/toil/test/cwl/cwlTest.py::CWLWorkflowTest::test_run_colon_output src/toil/test/jobStores/jobStoreTest.py::FileJobStoreTest::testUpdateBehavior -m "$(marker)" --color=yes
+	TOIL_SKIP_DOCKER=False \
+	TOIL_HISTORY=0 \
+	    python -m pytest $(verbose) $(durations) $(threadopts) -m "$(marker)" $(logging) --timeout=30 --maxfail=1 $(pytest_args) src/toil/test/batchSystems/batchSystemTest.py::SingleMachineBatchSystemTest::test_run_jobs src/toil/test/batchSystems/batchSystemTest.py::KubernetesBatchSystemBenchTest src/toil/test/server/serverTest.py::ToilWESServerBenchTest::test_get_service_info src/toil/test/cwl/cwlTest.py::TestCWLWorkflow::test_run_colon_output src/toil/test/jobStores/jobStoreTest.py::FileJobStoreTest::testUpdateBehavior
 
 ifdef TOIL_DOCKER_REGISTRY
 
@@ -171,7 +218,7 @@ endef
 
 docker: toil_docker prometheus_docker grafana_docker mtail_docker
 
-toil_docker: docker/Dockerfile
+toil_docker: docker/Dockerfile src/toil/version.py
 	mkdir -p .docker_cache
 	@set -ex \
 	; cd docker \
@@ -329,7 +376,7 @@ diff_mypy:
 	diff-cover --fail-under=100 --compare-branch origin/master cobertura.xml
 
 pyupgrade: $(PYSOURCES)
-	pyupgrade --exit-zero-even-if-changed --py37-plus $^
+	pyupgrade --exit-zero-even-if-changed --py39-plus $^
 
 flake8: $(PYSOURCES)
 	flake8 --ignore=E501,W293,W291,E265,E302,E722,E126,E303,E261,E201,E202,W503,W504,W391,E128,E301,E127,E502,E129,E262,E111,E117,E306,E203,E231,E226,E741,E122,E251,E305,E701,E222,E225,E241,E305,E123,E121,E703,E704,E125,E402 $^
@@ -341,7 +388,8 @@ preflight: mypy touched_pylint
 		check_cpickle \
 		develop clean_develop \
 		sdist clean_sdist \
-		test test_offline test_1min \
+		download_cwl_spec \
+		test doctest test_offline test_1min \
 		docs clean_docs \
 		clean \
 		sort_imports remove_unused_imports remove_trailing_whitespace \

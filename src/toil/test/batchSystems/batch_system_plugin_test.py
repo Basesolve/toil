@@ -12,16 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-from typing import Optional, Dict, List, Type
+from typing import Optional
+
 from configargparse import ArgParser, ArgumentParser
 
-from toil.batchSystems.abstractBatchSystem import (AbstractBatchSystem, UpdatedBatchJobInfo)
+from toil.batchSystems.abstractBatchSystem import (
+    AbstractBatchSystem,
+    UpdatedBatchJobInfo,
+)
 from toil.batchSystems.cleanup_support import BatchSystemCleanupSupport
 from toil.batchSystems.options import OptionSetter
 from toil.batchSystems.registry import add_batch_system_factory
 from toil.common import Toil, addOptions
 from toil.job import JobDescription
 from toil.test import ToilTest
+from toil.lib.plugins import remove_plugin
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +36,21 @@ class FakeBatchSystem(BatchSystemCleanupSupport):
     def supportsAutoDeployment(cls) -> bool:
         pass
 
-    def issueBatchJob(self, command: str, job_desc: JobDescription, job_environment: Optional[Dict[str, str]] = None) -> int:
+    def issueBatchJob(
+        self,
+        command: str,
+        job_desc: JobDescription,
+        job_environment: Optional[dict[str, str]] = None,
+    ) -> int:
         pass
 
-    def killBatchJobs(self, jobIDs: List[int]) -> None:
+    def killBatchJobs(self, jobIDs: list[int]) -> None:
         pass
 
-    def getIssuedBatchJobIDs(self) -> List[int]:
+    def getIssuedBatchJobIDs(self) -> list[int]:
         pass
 
-    def getRunningBatchJobIDs(self) -> Dict[int, float]:
+    def getRunningBatchJobIDs(self) -> dict[int, float]:
         pass
 
     def getUpdatedBatchJob(self, maxWait: int) -> Optional[UpdatedBatchJobInfo]:
@@ -57,14 +67,22 @@ class FakeBatchSystem(BatchSystemCleanupSupport):
     def setOptions(cls, setOption: OptionSetter) -> None:
         setOption("fake_argument")
 
+
 class BatchSystemPluginTest(ToilTest):
+    def tearDown(self) -> None:
+        # Restore plugin state
+        remove_plugin("batch_system", "fake")
+        super().tearDown()
+
     def test_batchsystem_plugin_installable(self):
         """
         Test that installing a batch system plugin works.
         :return:
         """
-        def fake_batch_system_factory() -> Type[AbstractBatchSystem]:
+
+        def fake_batch_system_factory() -> type[AbstractBatchSystem]:
             return FakeBatchSystem
+        
 
         add_batch_system_factory("fake", fake_batch_system_factory)
 

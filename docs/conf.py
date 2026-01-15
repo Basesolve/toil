@@ -82,11 +82,26 @@ rst_epilog = """
 
 
 def skip(app, what, name, obj, skip, options):
+    """
+    Decide what to automatically generate documentation for.
+    """
+
+    # See
+    # <https://sphinx-autoapi.readthedocs.io/en/latest/reference/config.html#event-autoapi-skip-member>
+
+    # TODO: It's not clear that the contidions used here are a good idea. Why
+    # are they like this?
+
+    # Always document __init__
     return name != "__init__" and (
         skip
+        # But don't document classes
         or inspect.isclass(obj)
-        or name.startswith("_")
-        and not inspect.ismodule(obj)
+        # Or things starting with _ that aren't modules
+        or (
+            name.startswith("_")
+            and not inspect.ismodule(obj)
+        )
     )
 
 
@@ -145,13 +160,13 @@ autodoc_member_order = "bysource"
 autoapi_dirs = ["../src/toil"]
 autodoc_typehints = "description"
 autoapi_keep_files = True
-autoapi_ignore = ["*.pyi", "*/test/cwl/spec*/*.py", "*/fake_mpi_run.py", "*/tutorial_*.py", "*/example_*.py", "*/mkFile.py", "*/debugWorkflow.py"]
+autoapi_ignore = ["*.pyi", "*/test/cwl/spec*/*.py", "*/fake_mpi_run.py", "*/tutorial_*.py", "*/example_*.py", "*/mkFile.py", "*/debugWorkflow.py",
+                  "*/test/wdl/wdl-conformance-tests/*"]
 autoapi_options = [
     "members",
     "undoc-members",
     "show-inheritance",
     "show-module-summary",
-    "imported-members",
     "special-members",
 ]
 always_document_param_types = True

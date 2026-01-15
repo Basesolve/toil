@@ -15,6 +15,10 @@
 # 5.14.2018: copied into Toil from https://github.com/BD2KGenomics/bd2k-python-lib
 
 import sys
+from typing import Optional
+import logging
+from urllib.parse import ParseResult
+from types import TracebackType
 
 
 # TODO: isn't this built in to Python 3 now?
@@ -38,21 +42,22 @@ class panic:
     the primary exception will be reraised.
     """
 
-    def __init__( self, log=None ):
-        super().__init__( )
+    def __init__(self, log: Optional[logging.Logger] = None) -> None:
+        super().__init__()
         self.log = log
         self.exc_info = None
 
-    def __enter__( self ):
-        self.exc_info = sys.exc_info( )
+    def __enter__(self) -> None:
+        self.exc_info = sys.exc_info()
 
-    def __exit__( self, *exc_info ):
-        if self.log is not None and exc_info and exc_info[ 0 ]:
-            self.log.warning( "Exception during panic", exc_info=exc_info )
+    def __exit__(self, *exc_info) -> None:
+        if self.log is not None and exc_info and exc_info[0]:
+            self.log.warning("Exception during panic", exc_info=exc_info)
         exc_type, exc_value, traceback = self.exc_info
         raise_(exc_type, exc_value, traceback)
 
-def raise_(exc_type, exc_value, traceback) -> None:
+
+def raise_(exc_type: Optional[type[BaseException]], exc_value: Optional[BaseException], traceback: Optional[TracebackType]) -> None:
     if exc_value is not None:
         exc = exc_value
     else:
@@ -60,3 +65,20 @@ def raise_(exc_type, exc_value, traceback) -> None:
     if exc.__traceback__ is not traceback:
         raise exc.with_traceback(traceback)
     raise exc
+
+
+class UnimplementedURLException(RuntimeError):
+    def __init__(self, url: ParseResult, operation: str) -> None:
+        """
+        Make a new exception to report that a URL scheme is not implemented, or
+        that the implementation can't be loaded because its dependencies are
+        not installed.
+
+        :param url: The given URL
+        :param operation: Whether we are trying to 'import' or 'export'
+        """
+        super().__init__(
+            f"No available job store implementation can {operation} the URL "
+            f"'{url.geturl()}'. Ensure Toil has been installed "
+            f"with the appropriate extras."
+        )

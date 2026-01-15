@@ -17,7 +17,7 @@ import datetime
 import re
 from functools import lru_cache, wraps
 from threading import Lock
-from typing import Any, Callable, Dict, Tuple, TypeVar
+from typing import Any, Callable, TypeVar
 
 memoize = lru_cache(maxsize=None)
 """
@@ -31,13 +31,14 @@ more than once with the same arguments.
 MAT = TypeVar("MAT")
 MRT = TypeVar("MRT")
 
+
 def sync_memoize(f: Callable[[MAT], MRT]) -> Callable[[MAT], MRT]:
     """
     Like memoize, but guarantees that decorated function is only called once, even when multiple
     threads are calling the decorating function with multiple parameters.
     """
     # TODO: Think about an f that is recursive
-    memory: Dict[Tuple[Any, ...], Any] = {}
+    memory: dict[tuple[Any, ...], Any] = {}
     lock = Lock()
 
     @wraps(f)
@@ -53,41 +54,58 @@ def sync_memoize(f: Callable[[MAT], MRT]) -> Callable[[MAT], MRT]:
                     r = f(*args)
                     memory[args] = r
                     return r
+
     return new_f
 
 
 def parse_iso_utc(s: str) -> datetime.datetime:
     """
-    Parses an ISO time with a hard-coded Z for zulu-time (UTC) at the end. Other timezones are
-    not supported. Returns a timezone-naive datetime object. 
+    Parses an RFC 3339 ISO 8601 time in the UTC timezone.
+
+    Other timezones are not supported. Returns a timezone-aware UTC datetime
+    object.
 
     :param s: The ISO-formatted time
 
-    :return: A timezone-naive datetime object
+    :return: A timezone-aware UTC datetime object
+
+    :raises ValueError: if the string is not in the correct format or is not in
+        the UTC timezone.
 
     >>> parse_iso_utc('2016-04-27T00:28:04.000Z')
-    datetime.datetime(2016, 4, 27, 0, 28, 4)
+    datetime.datetime(2016, 4, 27, 0, 28, 4, tzinfo=datetime.timezone.utc)
     >>> parse_iso_utc('2016-04-27T00:28:04Z')
-    datetime.datetime(2016, 4, 27, 0, 28, 4)
+    datetime.datetime(2016, 4, 27, 0, 28, 4, tzinfo=datetime.timezone.utc)
     >>> parse_iso_utc('2016-04-27T00:28:04X')
     Traceback (most recent call last):
     ...
     ValueError: Not a valid ISO datetime in UTC: 2016-04-27T00:28:04X
     """
-    rfc3339_datetime = re.compile(r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$')
+    rfc3339_datetime = re.compile(
+        r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:\d{2})$"
+    )
     m = rfc3339_datetime.match(s)
     if not m:
-        raise ValueError(f'Not a valid ISO datetime in UTC: {s}')
+        raise ValueError(f"Not a valid ISO datetime in UTC: {s}")
     else:
-        fmt = '%Y-%m-%dT%H:%M:%S' + ('.%f' if m.group(7) else '') + 'Z'
-        return datetime.datetime.strptime(s, fmt)
+        if m.group(8) != "Z" and not m.group(8).endswith("00:00"):
+            raise ValueError(f"Not in the UTC time zone: {s}")
+        if m.group(8) == "Z":
+            # Convert to an offset for parsing
+            s = s[:-1] + "-00:00"
+
+        fmt = "%Y-%m-%dT%H:%M:%S" + (".%f" if m.group(7) else "") + "%z"
+        parsed = datetime.datetime.strptime(s, fmt)
+        # We should have guaranteed that this is in UTC
+        assert parsed.tzinfo is not None
+        return parsed
 
 
 def strict_bool(s: str) -> bool:
     """Variant of bool() that only accepts two possible string values."""
-    if s == 'True':
+    if s == "True":
         return True
-    elif s == 'False':
+    elif s == "False":
         return False
     else:
         raise ValueError(s)

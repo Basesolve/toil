@@ -22,7 +22,8 @@ sys.path.insert(0, pkg_root)  # noqa
 
 from src.toil.lib import aws
 from src.toil.lib.aws import session
-from src.toil.lib.aws.utils import delete_iam_role, delete_iam_instance_profile, delete_s3_bucket, delete_sdb_domain
+from src.toil.lib.aws.iam import delete_iam_instance_profile, delete_iam_role
+from src.toil.lib.aws.utils import delete_s3_bucket, delete_sdb_domain
 from src.toil.lib.generatedEC2Lists import regionDict
 
 # put us-west-2 first as our default test region; that way anything with a universal region shows there
@@ -69,8 +70,11 @@ def contains_toil_test_patterns(string):
 
 
 def matches(resource_name):
-    if (resource_name.endswith('--files') or resource_name.endswith('--jobs') or resource_name.endswith('_toil')
-            or resource_name.endswith('--internal') or resource_name.startswith('toil-s3test-')):
+    if (
+        resource_name.endswith('--files') or resource_name.endswith('--jobs')
+        or resource_name.endswith('--toil') or resource_name.endswith('_toil')
+        or resource_name.endswith('--internal') or resource_name.startswith('toil-s3test-')
+    ):
         if contains_toil_test_patterns(resource_name):
             return resource_name
 

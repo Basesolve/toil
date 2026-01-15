@@ -21,19 +21,162 @@ import fcntl
 import logging
 import math
 import os
+import platform
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Dict, Iterator, Optional, Union, cast
+from typing import Optional, Union, cast
 
 import psutil
 
 from toil.lib.exceptions import raise_
 from toil.lib.io import robust_rmtree
+from toil.lib.misc import StrPath
 
 logger = logging.getLogger(__name__)
+
+
+def ensure_filesystem_lockable(
+    path: StrPath, timeout: float = 30, hint: Optional[str] = None
+) -> None:
+    """
+    Make sure that the filesystem used at the given path is one where locks are safe to use.
+
+    File locks are not safe to use on Ceph. See
+    <https://github.com/DataBiosphere/toil/issues/4972>.
+
+    Raises an exception if the filesystem is detected as one where using locks
+    is known to trigger bugs in the filesystem implementation. Also raises an
+    exception if the given path does not exist, or if attempting to determine
+    the filesystem type takes more than the timeout in seconds.
+
+    If the filesystem type cannot be determined, does nothing.
+
+    :param hint: Extra text to include in an error, if raised, telling the user
+        how to change the offending path.
+    """
+
+    if not os.path.exists(path):
+        # Raise a normal-looking FileNotFoundError. See <https://stackoverflow.com/a/36077407>
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), path)
+
+    if platform.system() == "Linux":
+        # We know how to find the filesystem here.
+
+        try:
+            # Start a child process to stat the path. See <https://unix.stackexchange.com/a/402236>.
+            # We really should call statfs but no bindings for it are in PyPI.
+            completed = subprocess.run(
+                ["stat", "-f", "-c", "%T", str(path)],
+                check=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            # The subprocess itself is Too Slow
+            raise RuntimeError(
+                f"Polling filesystem type at {path} took more than {timeout} seconds; is your filesystem working?"
+            ) from e
+        except subprocess.CalledProcessError as e:
+            # Stat didn't work. Maybe we don't have the right version of stat installed?
+            logger.warning(
+                "Could not determine filesystem type at %s because of: %s",
+                str(path),
+                e.stderr.decode("utf-8", errors="replace").strip(),
+            )
+            # If we don't know the filesystem type, keep going anyway.
+            return
+
+        filesystem_type = completed.stdout.decode("utf-8", errors="replace").strip()
+
+        if filesystem_type == "ceph":
+            # Ceph is known to deadlock the MDS and break the parent directory when locking.
+            message = [
+                f"Refusing to use {path} because file locks are known to break {filesystem_type} filesystems."
+            ]
+            if hint:
+                # Hint the user how to fix this.
+                message.append(hint)
+            raise RuntimeError(" ".join(message))
+        else:
+            # Other filesystem types are fine (even though NFS is sometimes
+            # flaky with regard to locks actually locking anything).
+            logger.debug(
+                "Detected that %s has lockable filesystem type: %s",
+                str(path),
+                filesystem_type,
+            )
+
+    # Other platforms (Mac) probably aren't mounting Ceph and also don't
+    # usually use the same stat binary implementation.
+
+
+def safe_lock(fd: int, block: bool = True, shared: bool = False) -> None:
+    """
+    Get an fcntl lock, while retrying on IO errors.
+
+    Raises OSError with EACCES or EAGAIN when a nonblocking lock is not
+    immediately available.
+    """
+
+    # Set up retry logic. TODO: Use @retry instead.
+    error_backoff = 1
+    MAX_ERROR_TRIES = 10
+    error_tries = 0
+
+    while True:
+        try:
+            # Wait until we can exclusively lock it.
+            lock_mode = (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | (
+                fcntl.LOCK_NB if not block else 0
+            )
+            fcntl.flock(fd, lock_mode)
+            return
+        except OSError as e:
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                # Nonblocking lock not available.
+                raise
+            elif e.errno == errno.EIO:
+                # Sometimes Ceph produces IO errors when talking to lock files.
+                # Back off and try again.
+                # TODO: Should we eventually give up if the disk really is
+                # broken? If so we should use the retry system.
+                if error_tries < MAX_ERROR_TRIES:
+                    logger.error(
+                        "IO error talking to lock file. Retrying after %s seconds.",
+                        error_backoff,
+                    )
+                    time.sleep(error_backoff)
+                    error_backoff = min(60, error_backoff * 2)
+                    error_tries += 1
+                    continue
+                else:
+                    logger.critical(
+                        "Too many IO errors talking to lock file. If using Ceph, check for MDS deadlocks. See <https://tracker.ceph.com/issues/62123>."
+                    )
+                    raise
+            else:
+                raise
+
+
+def safe_unlock_and_close(fd: int) -> None:
+    """
+    Release an fcntl lock and close the file descriptor, while handling fcntl IO errors.
+    """
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError as e:
+        if e.errno != errno.EIO:
+            raise
+        # Sometimes Ceph produces EIO. We don't need to retry then because
+        # we're going to close the FD and after that the file can't remain
+        # locked by us.
+    os.close(fd)
 
 
 class ExceptionalThread(threading.Thread):
@@ -65,6 +208,7 @@ class ExceptionalThread(threading.Thread):
     AssertionError
 
     """
+
     exc_info = None
 
     def run(self) -> None:
@@ -82,7 +226,7 @@ class ExceptionalThread(threading.Thread):
         if not self.is_alive() and self.exc_info is not None:
             exc_type, exc_value, traceback = self.exc_info
             self.exc_info = None
-            raise_(exc_type, exc_value, traceback)
+            raise_(exc_type, exc_value, traceback) 
 
 
 def cpu_count() -> int:
@@ -103,21 +247,23 @@ def cpu_count() -> int:
     :rtype: int
     """
 
-    cached = getattr(cpu_count, 'result', None)
+    cached = getattr(cpu_count, "result", None)
     if cached is not None:
         # We already got a CPU count.
         return cast(int, cached)
 
     # Get the fallback answer of all the CPUs on the machine
-    psutil_cpu_count = cast(Optional[int], psutil.cpu_count(logical=True))
+    psutil_cpu_count = psutil.cpu_count(logical=True)
     if psutil_cpu_count is None:
-        logger.debug('Could not retrieve the logical CPU count.')
+        logger.debug("Could not retrieve the logical CPU count.")
 
-    total_machine_size: Union[float, int] = psutil_cpu_count if psutil_cpu_count is not None else float('inf')
-    logger.debug('Total machine size: %s core(s)', total_machine_size)
+    total_machine_size: Union[float, int] = (
+        psutil_cpu_count if psutil_cpu_count is not None else float("inf")
+    )
+    logger.debug("Total machine size: %s core(s)", total_machine_size)
 
     # cgroups may limit the size
-    cgroup_size: Union[float, int] = float('inf')
+    cgroup_size: Union[float, int] = float("inf")
 
     try:
         # See if we can fetch these and use them
@@ -125,13 +271,13 @@ def cpu_count() -> int:
         period: Optional[int] = None
 
         # CGroups v1 keeps quota and period separate
-        CGROUP1_QUOTA_FILE = '/sys/fs/cgroup/cpu/cpu.cfs_quota_us'
-        CGROUP1_PERIOD_FILE = '/sys/fs/cgroup/cpu/cpu.cfs_period_us'
+        CGROUP1_QUOTA_FILE = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+        CGROUP1_PERIOD_FILE = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
         # CGroups v2 keeps both in one file, space-separated, quota first
-        CGROUP2_COMBINED_FILE = '/sys/fs/cgroup/cpu.max'
+        CGROUP2_COMBINED_FILE = "/sys/fs/cgroup/cpu.max"
 
         if os.path.exists(CGROUP1_QUOTA_FILE) and os.path.exists(CGROUP1_PERIOD_FILE):
-            logger.debug('CPU quota and period available from cgroups v1')
+            logger.debug("CPU quota and period available from cgroups v1")
             with open(CGROUP1_QUOTA_FILE) as stream:
                 # Read the quota
                 quota = int(stream.read())
@@ -140,56 +286,58 @@ def cpu_count() -> int:
                 # Read the period in which we are allowed to burn the quota
                 period = int(stream.read())
         elif os.path.exists(CGROUP2_COMBINED_FILE):
-            logger.debug('CPU quota and period available from cgroups v2')
+            logger.debug("CPU quota and period available from cgroups v2")
             with open(CGROUP2_COMBINED_FILE) as stream:
                 # Read the quota and the period together
-                quota, period = (int(part) for part in stream.read().split(' '))
+                quota, period = (int(part) for part in stream.read().split(" "))
         else:
-            logger.debug('CPU quota/period not available from cgroups v1 or cgroups v2')
+            logger.debug("CPU quota/period not available from cgroups v1 or cgroups v2")
 
         if quota is not None and period is not None:
             # We got a quota and a period.
-            logger.debug('CPU quota: %d period: %d', quota, period)
+            logger.debug("CPU quota: %d period: %d", quota, period)
 
             if quota == -1:
                 # But the quota can be -1 for unset.
                 # Assume we can use the whole machine.
-                cgroup_size = float('inf')
+                cgroup_size = float("inf")
             else:
                 # The thread count is how many multiples of a wall clock period we
                 # can burn in that period.
-                cgroup_size = int(math.ceil(float(quota)/float(period)))
+                cgroup_size = int(math.ceil(float(quota) / float(period)))
 
-            logger.debug('Control group size in cores: %s', cgroup_size)
+            logger.debug("Control group size in cores: %s", cgroup_size)
     except:
         # We can't actually read these cgroup fields. Maybe we are a mac or something.
-        logger.debug('Could not inspect cgroup: %s', traceback.format_exc())
+        logger.debug("Could not inspect cgroup: %s", traceback.format_exc())
 
     # CPU affinity may limit the size
-    affinity_size: Union[float, int] = float('inf')
-    if hasattr(os, 'sched_getaffinity'):
+    affinity_size: Union[float, int] = float("inf")
+    if hasattr(os, "sched_getaffinity"):
         try:
-            logger.debug('CPU affinity available')
+            logger.debug("CPU affinity available")
             affinity_size = len(os.sched_getaffinity(0))
-            logger.debug('CPU affinity is restricted to %d cores', affinity_size)
+            logger.debug("CPU affinity is restricted to %d cores", affinity_size)
         except:
-             # We can't actually read this even though it exists.
-            logger.debug('Could not inspect scheduling affinity: %s', traceback.format_exc())
+            # We can't actually read this even though it exists.
+            logger.debug(
+                "Could not inspect scheduling affinity: %s", traceback.format_exc()
+            )
     else:
-        logger.debug('CPU affinity not available')
+        logger.debug("CPU affinity not available")
 
-    limit: Union[float, int] = float('inf')
+    limit: Union[float, int] = float("inf")
     # Apply all the limits to take the smallest
     limit = min(limit, total_machine_size)
     limit = min(limit, cgroup_size)
     limit = min(limit, affinity_size)
-    if limit < 1 or limit == float('inf'):
+    if limit < 1 or limit == float("inf"):
         # Fall back to 1 if we can't get a size
         limit = 1
     result = int(limit)
-    logger.debug('cpu_count: %s', result)
+    logger.debug("cpu_count: %s", result)
     # Make sure to remember it for the next call
-    setattr(cpu_count, 'result', result)
+    setattr(cpu_count, "result", result)
     return result
 
 
@@ -211,7 +359,8 @@ def cpu_count() -> int:
 current_process_name_lock = threading.Lock()
 # And a global dict from work directory to name in that work directory.
 # We also have a file descriptor per work directory but it is just leaked.
-current_process_name_for: Dict[str, str] = {}
+current_process_name_for: dict[str, str] = {}
+
 
 def collect_process_name_garbage() -> None:
     """
@@ -235,6 +384,7 @@ def collect_process_name_garbage() -> None:
     for base_dir in missing:
         del current_process_name_for[base_dir]
 
+
 def destroy_all_process_names() -> None:
     """
     Delete all our process name files because our process is going away.
@@ -249,8 +399,10 @@ def destroy_all_process_names() -> None:
     for base_dir, name in current_process_name_for.items():
         robust_rmtree(os.path.join(base_dir, name))
 
+
 # Run the cleanup at exit
 atexit.register(destroy_all_process_names)
+
 
 def get_process_name(base_dir: str) -> str:
     """
@@ -280,10 +432,16 @@ def get_process_name(base_dir: str) -> str:
 
         # Lock the file. The lock will automatically go away if our process does.
         try:
-            fcntl.lockf(nameFD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            safe_lock(nameFD, block=False)
         except OSError as e:
-            # Someone else might have locked it even though they should not have.
-            raise RuntimeError(f"Could not lock process name file {nameFileName}: {str(e)}")
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                # Someone else locked it even though they should not have.
+                raise RuntimeError(
+                    f"Could not lock process name file {nameFileName}"
+                ) from e
+            else:
+                # Something else is wrong
+                raise
 
         # Save the basename
         current_process_name_for[base_dir] = os.path.basename(nameFileName)
@@ -321,20 +479,24 @@ def process_name_exists(base_dir: str, name: str) -> bool:
         # If the file is gone, the process can't exist.
         return False
 
-
     nameFD = None
     try:
         try:
             # Otherwise see if we can lock it shared, for which we need an FD, but
             # only for reading.
             nameFD = os.open(nameFileName, os.O_RDONLY)
-            fcntl.lockf(nameFD, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except FileNotFoundError as e:
             # File has vanished
             return False
+        try:
+            safe_lock(nameFD, block=False, shared=True)
         except OSError as e:
-            # Could not lock. Process is alive.
-            return True
+            if e.errno in (errno.EACCES, errno.EAGAIN):
+                # Could not lock. Process is alive.
+                return True
+            else:
+                # Something else went wrong
+                raise
         else:
             # Could lock. Process is dead.
             # Remove the file. We race to be the first to do so.
@@ -342,8 +504,8 @@ def process_name_exists(base_dir: str, name: str) -> bool:
                 os.remove(nameFileName)
             except:
                 pass
-            # Unlock
-            fcntl.lockf(nameFD, fcntl.LOCK_UN)
+            safe_unlock_and_close(nameFD)
+            nameFD = None
             # Report process death
             return False
     finally:
@@ -353,10 +515,11 @@ def process_name_exists(base_dir: str, name: str) -> bool:
             except:
                 pass
 
+
 # Similar to the process naming system above, we define a global mutex system
 # for critical sections, based just around file locks.
 @contextmanager
-def global_mutex(base_dir: str, mutex: str) -> Iterator[None]:
+def global_mutex(base_dir: StrPath, mutex: str) -> Iterator[None]:
     """
     Context manager that locks a mutex. The mutex is identified by the given
     name, and scoped to the given directory. Works across all containers that
@@ -365,28 +528,41 @@ def global_mutex(base_dir: str, mutex: str) -> Iterator[None]:
 
     Only works between processes, NOT between threads.
 
-    :param str base_dir: Base directory to work in. Defines the shared namespace.
+    :param base_dir: Base directory to work in. Defines the shared namespace.
     :param str mutex: Mutex to lock. Must be a permissible path component.
     """
 
     if not os.path.isdir(base_dir):
         raise RuntimeError(f"Directory {base_dir} for mutex does not exist")
 
-    # Define a filename
-    lock_filename = os.path.join(base_dir, 'toil-mutex-' + mutex)
+    # TODO: We don't know what CLI option controls where to put this mutex, so
+    # we aren't very helpful if the location is bad.
+    ensure_filesystem_lockable(
+        base_dir, hint=f"Specify a different place to put the {mutex} mutex."
+    )
 
-    logger.debug('PID %d acquiring mutex %s', os.getpid(), lock_filename)
+    # Define a filename
+    lock_filename = os.path.join(base_dir, "toil-mutex-" + mutex)
+
+    logger.debug("PID %d acquiring mutex %s", os.getpid(), lock_filename)
 
     # We can't just create/open and lock a file, because when we clean up
     # there's a race where someone can open the file before we unlink it and
     # get a lock on the deleted file.
 
+    error_backoff = 1
+
     while True:
         # Try to create the file, ignoring if it exists or not.
         fd = os.open(lock_filename, os.O_CREAT | os.O_WRONLY)
 
-        # Wait until we can exclusively lock it.
-        fcntl.lockf(fd, fcntl.LOCK_EX)
+        try:
+            # Wait until we can exclusively lock it, handling error retry.
+            safe_lock(fd)
+        except:
+            # Something went wrong
+            os.close(fd)
+            raise
 
         # Holding the lock, make sure we are looking at the same file on disk still.
         try:
@@ -394,16 +570,14 @@ def global_mutex(base_dir: str, mutex: str) -> Iterator[None]:
             fd_stats = os.fstat(fd)
         except OSError as e:
             if e.errno == errno.ESTALE:
-                # The file handle has gone stale, because somebody removed the file.
+                # The file handle has gone stale, because somebody removed the
+                # file.
                 # Try again.
-                try:
-                    fcntl.lockf(fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
-                os.close(fd)
+                safe_unlock_and_close(fd)
                 continue
             else:
                 # Something else broke
+                os.close(fd)
                 raise
 
         try:
@@ -412,13 +586,16 @@ def global_mutex(base_dir: str, mutex: str) -> Iterator[None]:
         except FileNotFoundError:
             path_stats = None
 
-        if path_stats is None or fd_stats.st_dev != path_stats.st_dev or fd_stats.st_ino != path_stats.st_ino:
+        if (
+            path_stats is None
+            or fd_stats.st_dev != path_stats.st_dev
+            or fd_stats.st_ino != path_stats.st_ino
+        ):
             # The file we have a lock on is not the file linked to the name (if
             # any). This usually happens, because before someone releases a
             # lock, they delete the file. Go back and contend again. TODO: This
             # allows a lot of queue jumping on our mutex.
-            fcntl.lockf(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            safe_unlock_and_close(fd)
             continue
         else:
             # We have a lock on the file that the name points to. Since we
@@ -428,12 +605,12 @@ def global_mutex(base_dir: str, mutex: str) -> Iterator[None]:
 
     try:
         # When we have it, do the thing we are protecting.
-        logger.debug('PID %d now holds mutex %s', os.getpid(), lock_filename)
+        logger.debug("PID %d now holds mutex %s", os.getpid(), lock_filename)
         yield
     finally:
         # Delete it while we still own it, so we can't delete it from out from
         # under someone else who thinks they are holding it.
-        logger.debug('PID %d releasing mutex %s', os.getpid(), lock_filename)
+        logger.debug("PID %d releasing mutex %s", os.getpid(), lock_filename)
 
         # We have had observations in the wild of the lock file not exisiting
         # when we go to unlink it, causing a crash on mutex release. See
@@ -451,23 +628,36 @@ def global_mutex(base_dir: str, mutex: str) -> Iterator[None]:
 
         # Check to make sure it still looks locked before we unlink.
         if path_stats is None:
-            logger.error('PID %d had mutex %s disappear while locked! Mutex system is not working!', os.getpid(), lock_filename)
-        elif fd_stats.st_dev != path_stats.st_dev or fd_stats.st_ino != path_stats.st_ino:
-            logger.error('PID %d had mutex %s get replaced while locked! Mutex system is not working!', os.getpid(), lock_filename)
+            logger.error(
+                "PID %d had mutex %s disappear while locked! Mutex system is not working!",
+                os.getpid(),
+                lock_filename,
+            )
+        elif (
+            fd_stats.st_dev != path_stats.st_dev or fd_stats.st_ino != path_stats.st_ino
+        ):
+            logger.error(
+                "PID %d had mutex %s get replaced while locked! Mutex system is not working!",
+                os.getpid(),
+                lock_filename,
+            )
 
         if path_stats is not None:
             try:
                 # Unlink the file
                 os.unlink(lock_filename)
             except FileNotFoundError:
-                logger.error('PID %d had mutex %s disappear between stat and unlink while unlocking! Mutex system is not working!', os.getpid(), lock_filename)
+                logger.error(
+                    "PID %d had mutex %s disappear between stat and unlink while unlocking! Mutex system is not working!",
+                    os.getpid(),
+                    lock_filename,
+                )
 
         # Note that we are unlinking it and then unlocking it; a lot of people
         # might have opened it before we unlinked it and will wake up when they
         # get the worthless lock on the now-unlinked file. We have to do some
         # stat gymnastics above to work around this.
-        fcntl.lockf(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        safe_unlock_and_close(fd)
 
 
 class LastProcessStandingArena:
@@ -485,7 +675,7 @@ class LastProcessStandingArena:
     Consider using a try/finally; this class is not a context manager.
     """
 
-    def __init__(self, base_dir: str, name: str) -> None:
+    def __init__(self, base_dir: StrPath, name: str) -> None:
         """
         Connect to the arena specified by the given base_dir and name.
 
@@ -494,22 +684,22 @@ class LastProcessStandingArena:
 
         Doesn't enter or leave the arena.
 
-        :param str base_dir: Base directory to work in. Defines the shared namespace.
-        :param str name: Name of the arena. Must be a permissible path component.
+        :param base_dir: Base directory to work in. Defines the shared namespace.
+        :param name: Name of the arena. Must be a permissible path component.
         """
 
         # Save the base_dir which namespaces everything
-        self.base_dir = base_dir
+        self.base_dir = str(base_dir)
 
         # We need a mutex name to allow only one process to be entering or
         # leaving at a time.
-        self.mutex = name + '-arena-lock'
+        self.mutex = name + "-arena-lock"
 
         # We need a way to track who is actually in, and who was in but died.
         # So everybody gets a locked file (again).
         # TODO: deduplicate with the similar logic for process names, and also
         # deferred functions.
-        self.lockfileDir = os.path.join(base_dir, name + '-arena-members')
+        self.lockfileDir = os.path.join(base_dir, name + "-arena-members")
 
         # When we enter the arena, we fill this in with the FD of the locked
         # file that represents our presence.
@@ -525,7 +715,7 @@ class LastProcessStandingArena:
         You may not enter the arena again before leaving it.
         """
 
-        logger.debug('Joining arena %s', self.lockfileDir)
+        logger.debug("Joining arena %s", self.lockfileDir)
 
         # Make sure we're not in it already.
         if self.lockfileName is not None or self.lockfileFD is not None:
@@ -540,19 +730,23 @@ class LastProcessStandingArena:
             except FileExistsError:
                 pass
             except Exception as e:
-                raise RuntimeError("Could not make lock file directory " + self.lockfileDir) from e
+                raise RuntimeError(
+                    "Could not make lock file directory " + self.lockfileDir
+                ) from e
 
             # Make ourselves a file in it and lock it to prove we are alive.
             try:
-                self.lockfileFD, self.lockfileName = tempfile.mkstemp(dir=self.lockfileDir) # type: ignore
+                self.lockfileFD, self.lockfileName = tempfile.mkstemp(dir=self.lockfileDir)  # type: ignore
             except Exception as e:
-                raise RuntimeError("Could not make lock file in " + self.lockfileDir) from e
+                raise RuntimeError(
+                    "Could not make lock file in " + self.lockfileDir
+                ) from e
             # Nobody can see it yet, so lock it right away
-            fcntl.lockf(self.lockfileFD, fcntl.LOCK_EX) # type: ignore
+            safe_lock(self.lockfileFD)  # type: ignore
 
             # Now we're properly in, so release the global mutex
 
-        logger.debug('Now in arena %s', self.lockfileDir)
+        logger.debug("Now in arena %s", self.lockfileDir)
 
     def leave(self) -> Iterator[bool]:
         """
@@ -572,7 +766,7 @@ class LastProcessStandingArena:
         if self.lockfileName is None or self.lockfileFD is None:
             raise RuntimeError("This process is not in the arena.")
 
-        logger.debug('Leaving arena %s', self.lockfileDir)
+        logger.debug("Leaving arena %s", self.lockfileDir)
 
         with global_mutex(self.base_dir, self.mutex):
             # Now nobody else should also be trying to join or leave.
@@ -583,8 +777,7 @@ class LastProcessStandingArena:
             except:
                 pass
             self.lockfileName = None
-            fcntl.lockf(self.lockfileFD, fcntl.LOCK_UN)
-            os.close(self.lockfileFD)
+            safe_unlock_and_close(self.lockfileFD)
             self.lockfileFD = None
 
             for item in os.listdir(self.lockfileDir):
@@ -598,32 +791,42 @@ class LastProcessStandingArena:
                     continue
 
                 try:
-                    fcntl.lockf(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    safe_lock(fd, block=False, shared=True)
                 except OSError as e:
-                    # Could not lock. It's alive!
-                    break
+                    if e.errno in (errno.EACCES, errno.EAGAIN):
+                        # Could not lock. It's alive!
+                        break
+                    else:
+                        # Something else is wrong
+                        os.close(fd)
+                        raise
                 else:
                     # Could lock. Process is dead.
                     try:
                         os.remove(full_path)
                     except:
                         pass
-                    fcntl.lockf(fd, fcntl.LOCK_UN)
+                    safe_unlock_and_close(fd)
                     # Continue with the loop normally.
             else:
                 # Nothing alive was found. Nobody will come in while we hold
                 # the global mutex, so we are the Last Process Standing.
-                logger.debug('We are the Last Process Standing in arena %s', self.lockfileDir)
+                logger.debug(
+                    "We are the Last Process Standing in arena %s", self.lockfileDir
+                )
                 yield True
 
                 try:
                     # Delete the arena directory so as to leave nothing behind.
                     os.rmdir(self.lockfileDir)
                 except:
-                    logger.warning('Could not clean up arena %s completely: %s',
-                                   self.lockfileDir, traceback.format_exc())
+                    logger.warning(
+                        "Could not clean up arena %s completely: %s",
+                        self.lockfileDir,
+                        traceback.format_exc(),
+                    )
 
             # Now we're done, whether we were the last one or not, and can
             # release the mutex.
 
-        logger.debug('Now out of arena %s', self.lockfileDir)
+        logger.debug("Now out of arena %s", self.lockfileDir)

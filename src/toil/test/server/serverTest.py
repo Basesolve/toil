@@ -21,7 +21,7 @@ import uuid
 import zipfile
 from abc import abstractmethod
 from io import BytesIO
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlparse
 
 try:
@@ -33,10 +33,11 @@ except ImportError:
     # extra wasn't installed. We'll then skip them all.
     pass
 
-from toil.test import ToilTest, needs_aws_s3, needs_celery_broker, needs_server
+from toil.test import ToilTest, needs_aws_s3, needs_celery_broker, needs_cwl, needs_server, integrative
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
 
 @needs_server
 class ToilServerUtilsTest(ToilTest):
@@ -51,9 +52,11 @@ class ToilServerUtilsTest(ToilTest):
         away without flipping the state.
         """
 
-        from toil.server.utils import (MemoryStateStore,
-                                       WorkflowStateMachine,
-                                       WorkflowStateStore)
+        from toil.server.utils import (
+            MemoryStateStore,
+            WorkflowStateMachine,
+            WorkflowStateStore,
+        )
 
         store = WorkflowStateStore(MemoryStateStore(), "test-workflow")
 
@@ -69,6 +72,7 @@ class ToilServerUtilsTest(ToilTest):
 
         # Make sure it is now CANCELED due to timeout
         self.assertEqual(state_machine.get_current_state(), "CANCELED")
+
 
 class hidden:
     # Hide abstract tests from the test loader
@@ -89,7 +93,6 @@ class hidden:
 
             raise NotImplementedError()
 
-
         def test_state_store(self) -> None:
             """
             Make sure that the state store under test can store and load keys.
@@ -98,45 +101,46 @@ class hidden:
             store = self.get_state_store()
 
             # Should start None
-            self.assertEqual(store.get('id1', 'key1'), None)
+            self.assertEqual(store.get("id1", "key1"), None)
 
             # Should hold a value
-            store.set('id1', 'key1', 'value1')
-            self.assertEqual(store.get('id1', 'key1'), 'value1')
+            store.set("id1", "key1", "value1")
+            self.assertEqual(store.get("id1", "key1"), "value1")
 
             # Should distinguish by ID and key
-            self.assertEqual(store.get('id2', 'key1'), None)
-            self.assertEqual(store.get('id1', 'key2'), None)
+            self.assertEqual(store.get("id2", "key1"), None)
+            self.assertEqual(store.get("id1", "key2"), None)
 
-            store.set('id2', 'key1', 'value2')
-            store.set('id1', 'key2', 'value3')
-            self.assertEqual(store.get('id1', 'key1'), 'value1')
-            self.assertEqual(store.get('id2', 'key1'), 'value2')
-            self.assertEqual(store.get('id1', 'key2'), 'value3')
+            store.set("id2", "key1", "value2")
+            store.set("id1", "key2", "value3")
+            self.assertEqual(store.get("id1", "key1"), "value1")
+            self.assertEqual(store.get("id2", "key1"), "value2")
+            self.assertEqual(store.get("id1", "key2"), "value3")
 
             # Should allow replacement
-            store.set('id1', 'key1', 'value4')
-            self.assertEqual(store.get('id1', 'key1'), 'value4')
-            self.assertEqual(store.get('id2', 'key1'), 'value2')
-            self.assertEqual(store.get('id1', 'key2'), 'value3')
+            store.set("id1", "key1", "value4")
+            self.assertEqual(store.get("id1", "key1"), "value4")
+            self.assertEqual(store.get("id2", "key1"), "value2")
+            self.assertEqual(store.get("id1", "key2"), "value3")
 
             # Should show up in another state store
             store2 = self.get_state_store()
-            self.assertEqual(store2.get('id1', 'key1'), 'value4')
-            self.assertEqual(store2.get('id2', 'key1'), 'value2')
-            self.assertEqual(store2.get('id1', 'key2'), 'value3')
+            self.assertEqual(store2.get("id1", "key1"), "value4")
+            self.assertEqual(store2.get("id2", "key1"), "value2")
+            self.assertEqual(store2.get("id1", "key2"), "value3")
 
             # Should allow clearing
-            store.set('id1', 'key1', None)
-            self.assertEqual(store.get('id1', 'key1'), None)
-            self.assertEqual(store.get('id2', 'key1'), 'value2')
-            self.assertEqual(store.get('id1', 'key2'), 'value3')
+            store.set("id1", "key1", None)
+            self.assertEqual(store.get("id1", "key1"), None)
+            self.assertEqual(store.get("id2", "key1"), "value2")
+            self.assertEqual(store.get("id1", "key2"), "value3")
 
-            store.set('id2', 'key1', None)
-            store.set('id1', 'key2', None)
-            self.assertEqual(store.get('id1', 'key1'), None)
-            self.assertEqual(store.get('id2', 'key1'), None)
-            self.assertEqual(store.get('id1', 'key2'), None)
+            store.set("id2", "key1", None)
+            store.set("id1", "key2", None)
+            self.assertEqual(store.get("id1", "key1"), None)
+            self.assertEqual(store.get("id2", "key1"), None)
+            self.assertEqual(store.get("id1", "key2"), None)
+
 
 class FileStateStoreTest(hidden.AbstractStateStoreTest):
     """
@@ -158,6 +162,7 @@ class FileStateStoreTest(hidden.AbstractStateStoreTest):
 
         return FileStateStore(self.state_store_dir)
 
+
 class FileStateStoreURLTest(hidden.AbstractStateStoreTest):
     """
     Test file-based state storage using URLs instead of local paths.
@@ -167,7 +172,7 @@ class FileStateStoreURLTest(hidden.AbstractStateStoreTest):
 
     def setUp(self) -> None:
         super().setUp()
-        self.state_store_dir = 'file://' + self._createTempDir()
+        self.state_store_dir = "file://" + self._createTempDir()
 
     def get_state_store(self) -> AbstractStateStore:
         """
@@ -178,24 +183,21 @@ class FileStateStoreURLTest(hidden.AbstractStateStoreTest):
 
         return FileStateStore(self.state_store_dir)
 
+
 @needs_aws_s3
+@integrative
 class BucketUsingTest(ToilTest):
     """
     Base class for tests that need a bucket.
     """
 
-    try:
-        # We need the class to be evaluateable without the AWS modules, if not
-        # runnable
+    if TYPE_CHECKING:
         from mypy_boto3_s3 import S3ServiceResource
         from mypy_boto3_s3.service_resource import Bucket
-    except ImportError:
-        pass
-
 
     region: Optional[str]
-    s3_resource: Optional['S3ServiceResource']
-    bucket: Optional['Bucket']
+    s3_resource: Optional["S3ServiceResource"]
+    bucket: Optional["Bucket"]
     bucket_name: Optional[str]
 
     @classmethod
@@ -218,14 +220,14 @@ class BucketUsingTest(ToilTest):
     @classmethod
     def tearDownClass(cls) -> None:
         from toil.lib.aws.utils import delete_s3_bucket
+
         if cls.bucket_name:
             delete_s3_bucket(cls.s3_resource, cls.bucket_name, cls.region)
         super().tearDownClass()
 
+
 class AWSStateStoreTest(hidden.AbstractStateStoreTest, BucketUsingTest):
-    """
-    Test AWS-based state storage.
-    """
+    """Test AWS-based state storage."""
 
     from toil.server.utils import AbstractStateStore
 
@@ -238,7 +240,7 @@ class AWSStateStoreTest(hidden.AbstractStateStoreTest, BucketUsingTest):
 
         from toil.server.utils import S3StateStore
 
-        return S3StateStore('s3://' + self.bucket_name + '/' + self.bucket_path)
+        return S3StateStore("s3://" + self.bucket_name + "/" + self.bucket_path)
 
     def test_state_store_paths(self) -> None:
         """
@@ -253,17 +255,48 @@ class AWSStateStoreTest(hidden.AbstractStateStoreTest, BucketUsingTest):
         store = self.get_state_store()
 
         # Should hold a value
-        store.set('testid', 'testkey', 'testvalue')
-        self.assertEqual(store.get('testid', 'testkey'), 'testvalue')
+        store.set("testid", "testkey", "testvalue")
+        self.assertEqual(store.get("testid", "testkey"), "testvalue")
 
-        expected_url = urlparse('s3://' + self.bucket_name + '/' +
-            os.path.join(self.bucket_path, 'testid', 'testkey'))
+        expected_url = urlparse(
+            "s3://"
+            + self.bucket_name
+            + "/"
+            + os.path.join(self.bucket_path, "testid", "testkey")
+        )
 
         obj = get_object_for_url(expected_url, True)
-        self.assertEqual(obj.content_length, len('testvalue'))
+        self.assertEqual(obj.content_length, len("testvalue"))
 
 
+# Problem: httpx (which the Connexion test client uses the API of)
+# automatically decides whether to send posts in
+# application/x-www-form-urlencoded or multipart/form-data format
+# based on whether they are uploading any files. But the GA4GH WES
+# API run workflow endpoint only accepts multipart/form-data. It takes
+# workflow_attachment as an array of binary strings officially, but this is
+# actually how Swagger takes multiple-file upload fields. See
+# <https://swagger.io/docs/specification/v2_0/file-upload/#multiple-upload>.
+# (httpx doesn't seem to support actually sending multiple files to one field
+# either, but if we send just one file it ends up as the only value in
+# Swagger's array.)
+#
+# The apparently-official workaround for forcing multipart encoding is to
+# construct an empty dict-saped data structure that is truthy, and pass that as
+# your file list. See
+# <https://github.com/encode/httpx/discussions/2399#discussioncomment-3814186>
+class TrueDict(dict):
+    """
+    Dict that is truthy even when empty.
 
+    Used as a workaround to set httpx post request encoding as recommended in
+    <https://github.com/encode/httpx/discussions/2399#discussioncomment-3814186>.
+    """
+    def __bool__(self) -> bool:
+        """
+        Always say the object is truthy.
+        """
+        return True
 
 @needs_server
 class AbstractToilWESServerTest(ToilTest):
@@ -286,17 +319,22 @@ class AbstractToilWESServerTest(ToilTest):
         self.temp_dir = self._createTempDir()
 
         from toil.server.app import create_app, parser_with_server_options
+
         parser = parser_with_server_options()
-        args = parser.parse_args(self._server_args + ["--work_dir", os.path.join(self.temp_dir, "workflows")])
+        args = parser.parse_args(
+            self._server_args + ["--work_dir", os.path.join(self.temp_dir, "workflows")]
+        )
 
         # Make the FlaskApp
-        server_app = create_app(args)
+        self.app = create_app(args)
 
-        # Fish out the actual Flask
-        self.app: Flask = server_app.app
-        self.app.testing = True
+        # Neither <https://flask.palletsprojects.com/en/stable/testing/> nor
+        # <https://connexion.readthedocs.io/en/latest/testing.html#testing>
+        # suggests setting a testing flag on the Connexion app or its internal
+        # Flask app, so we don't.
 
-        self.example_cwl = textwrap.dedent("""
+        self.example_cwl = textwrap.dedent(
+            """
             cwlVersion: v1.0
             class: CommandLineTool
             baseCommand: echo
@@ -309,9 +347,11 @@ class AbstractToilWESServerTest(ToilTest):
             outputs:
               output:
                 type: stdout
-            """)
+            """
+        )
 
-        self.slow_cwl = textwrap.dedent("""
+        self.slow_cwl = textwrap.dedent(
+            """
             cwlVersion: v1.0
             class: CommandLineTool
             baseCommand: sleep
@@ -324,7 +364,8 @@ class AbstractToilWESServerTest(ToilTest):
             outputs:
               output:
                 type: stdout
-            """)
+            """
+        )
 
     def tearDown(self) -> None:
         super().tearDown()
@@ -335,7 +376,6 @@ class AbstractToilWESServerTest(ToilTest):
         """
         rv = client.get(f"/ga4gh/wes/v1/runs/{run_id}")
         self.assertEqual(rv.status_code, 200)
-        self.assertTrue(rv.is_json)
         return rv
 
     def _check_successful_log(self, client: "FlaskClient", run_id: str) -> None:
@@ -344,16 +384,16 @@ class AbstractToilWESServerTest(ToilTest):
         The workflow should succeed, it should have some tasks, and they should have all succeeded.
         """
         rv = self._fetch_run_log(client, run_id)
-        logger.debug('Log info: %s', rv.json)
-        self.assertIn("run_log", rv.json)
-        run_log = rv.json.get("run_log")
+        rv_json = rv.json()
+        logger.debug("Log info: %s", rv.json)
+        run_log = rv_json.get("run_log")
         self.assertEqual(type(run_log), dict)
         if "exit_code" in run_log:
             # The workflow succeeded if it has an exit code
             self.assertEqual(run_log["exit_code"], 0)
         # The workflow is complete
-        self.assertEqual(rv.json.get("state"), "COMPLETE")
-        task_logs = rv.json.get("task_logs")
+        self.assertEqual(rv_json.get("state"), "COMPLETE")
+        task_logs = rv_json.get("task_logs")
         # There are tasks reported
         self.assertEqual(type(task_logs), list)
         self.assertGreater(len(task_logs), 0)
@@ -363,22 +403,15 @@ class AbstractToilWESServerTest(ToilTest):
             self.assertEqual(task_log.get("exit_code"), 0)
 
     def _report_log(self, client: "FlaskClient", run_id: str) -> None:
-        """
-        Report the log for the given workflow run.
-        """
+        """Report the log for the given workflow run."""
         rv = self._fetch_run_log(client, run_id)
-        self.assertIn("run_log", rv.json)
-        run_log = rv.json.get("run_log")
+        logger.debug(f"Report log response: {rv.json}")
+        run_log = rv.json().get("run_log")
         self.assertEqual(type(run_log), dict)
-        self.assertIn("stdout", run_log)
-        stdout = run_log.get("stdout")
-        self.assertEqual(type(stdout), str)
-        self.assertIn("stderr", run_log)
-        stderr = run_log.get("stderr")
-        self.assertEqual(type(stderr), str)
-        logger.info("Got stdout %s and stderr %s", stdout, stderr)
-        self._report_absolute_url(client, stdout)
-        self._report_absolute_url(client, stderr)
+        self.assertEqual(type(run_log.get("stdout")), str)
+        self.assertEqual(type(run_log.get("stderr")), str)
+        self._report_absolute_url(client, run_log.get("stdout"))
+        self._report_absolute_url(client, run_log.get("stderr"))
 
     def _report_absolute_url(self, client: "FlaskClient", url: str):
         """
@@ -393,25 +426,32 @@ class AbstractToilWESServerTest(ToilTest):
         logger.info("Fetch %s", url)
         rv = client.get(url)
         self.assertEqual(rv.status_code, 200)
-        logger.info("Got %s:\n%s", url, rv.data.decode('utf-8'))
+        logger.info("Got %s:\n%s", url, rv.content.decode("utf-8"))
 
     def _start_slow_workflow(self, client: "FlaskClient") -> str:
         """
         Start a slow workflow and return its ID.
         """
-        rv = client.post("/ga4gh/wes/v1/runs", data={
-            "workflow_url": "slow.cwl",
-            "workflow_type": "CWL",
-            "workflow_type_version": "v1.0",
-            "workflow_params": json.dumps({"delay": "5"}),
-            "workflow_attachment": [
-                (BytesIO(self.slow_cwl.encode()), "slow.cwl"),
-            ],
-        })
+
+        rv = client.post(
+            "/ga4gh/wes/v1/runs",
+            data={
+                "workflow_url": "slow.cwl",
+                "workflow_type": "CWL",
+                "workflow_type_version": "v1.0",
+                "workflow_params": json.dumps({"delay": "5"}),
+            },
+            files={
+                "workflow_attachment": (
+                    "slow.cwl",
+                    BytesIO(self.slow_cwl.encode()),
+                    "application/octet-stream",
+                ),
+            },
+        )
         # workflow is submitted successfully
         self.assertEqual(rv.status_code, 200)
-        self.assertTrue(rv.is_json)
-        run_id = rv.json.get("run_id")
+        run_id = rv.json().get("run_id")
         self.assertIsNotNone(run_id)
 
         return run_id
@@ -423,21 +463,35 @@ class AbstractToilWESServerTest(ToilTest):
 
         rv = client.get(f"/ga4gh/wes/v1/runs/{run_id}/status")
         self.assertEqual(rv.status_code, 200)
-        self.assertTrue(rv.is_json)
-        self.assertIn("run_id", rv.json)
-        self.assertEqual(rv.json.get("run_id"), run_id)
-        self.assertIn("state", rv.json)
-        state = rv.json.get("state")
-        self.assertIn(state, ["UNKNOWN", "QUEUED", "INITIALIZING", "RUNNING",
-                              "PAUSED", "COMPLETE", "EXECUTOR_ERROR", "SYSTEM_ERROR",
-                              "CANCELED", "CANCELING"])
+        rv_json = rv.json()
+        self.assertIn("run_id", rv_json)
+        self.assertEqual(rv_json.get("run_id"), run_id)
+        self.assertIn("state", rv_json)
+        state = rv_json.get("state")
+        self.assertIn(
+            state,
+            [
+                "UNKNOWN",
+                "QUEUED",
+                "INITIALIZING",
+                "RUNNING",
+                "PAUSED",
+                "COMPLETE",
+                "EXECUTOR_ERROR",
+                "SYSTEM_ERROR",
+                "CANCELED",
+                "CANCELING",
+            ],
+        )
         return state
 
     def _cancel_workflow(self, client: "FlaskClient", run_id: str) -> None:
         rv = client.post(f"/ga4gh/wes/v1/runs/{run_id}/cancel")
         self.assertEqual(rv.status_code, 200)
 
-    def _wait_for_status(self, client: "FlaskClient", run_id: str, target_status: str) -> None:
+    def _wait_for_status(
+        self, client: "FlaskClient", run_id: str, target_status: str
+    ) -> None:
         """
         Wait for the given workflow run to reach the given state. If it reaches
         a different terminal state, raise an exception.
@@ -470,23 +524,26 @@ class ToilWESServerBenchTest(AbstractToilWESServerTest):
     """
 
     def test_home(self) -> None:
-        """ Test the homepage endpoint."""
+        """Test the homepage endpoint."""
         with self.app.test_client() as client:
             rv = client.get("/")
-        self.assertEqual(rv.status_code, 302)
+        # The client will follow the redirect and populate the url on the response
+        self.assertEqual(rv.url.path, "/ga4gh/wes/v1/service-info")
+        # We see the final 200 OK status code
+        self.assertEqual(rv.status_code, 200)
 
     def test_health(self) -> None:
-        """ Test the health check endpoint."""
+        """Test the health check endpoint."""
         with self.app.test_client() as client:
             rv = client.get("/engine/v1/status")
         self.assertEqual(rv.status_code, 200)
 
     def test_get_service_info(self) -> None:
-        """ Test the GET /service-info endpoint."""
+        """Test the GET /service-info endpoint."""
         with self.app.test_client() as client:
             rv = client.get("/ga4gh/wes/v1/service-info")
         self.assertEqual(rv.status_code, 200)
-        service_info = json.loads(rv.data)
+        service_info = rv.json()
 
         self.assertIn("version", service_info)
         self.assertIn("workflow_type_versions", service_info)
@@ -500,12 +557,15 @@ class ToilWESServerBenchTest(AbstractToilWESServerTest):
         self.assertIn("system_state_counts", service_info)
         self.assertIn("tags", service_info)
 
+@needs_cwl
 class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
     """
     Tests of the WES server running workflows.
     """
 
-    def run_zip_workflow(self, zip_path: str, include_message: bool = True, include_params: bool = True) -> None:
+    def run_zip_workflow(
+        self, zip_path: str, include_message: bool = True, include_params: bool = True
+    ) -> None:
         """
         We have several zip file tests; this submits a zip file and makes sure it ran OK.
 
@@ -518,17 +578,18 @@ class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
         post_data = {
             "workflow_url": "file://" + zip_path,
             "workflow_type": "CWL",
-            "workflow_type_version": "v1.0"
+            "workflow_type_version": "v1.0",
         }
         if include_params or include_message:
             # We need workflow_params too
-            post_data["workflow_params"] = json.dumps({"message": "Hello, world!"} if include_message else {})
+            post_data["workflow_params"] = json.dumps(
+                {"message": "Hello, world!"} if include_message else {}
+            )
         with self.app.test_client() as client:
-            rv = client.post("/ga4gh/wes/v1/runs", data=post_data)
+            rv = client.post("/ga4gh/wes/v1/runs", data=post_data, files=TrueDict())
             # workflow is submitted successfully
             self.assertEqual(rv.status_code, 200)
-            self.assertTrue(rv.is_json)
-            run_id = rv.json.get("run_id")
+            run_id = rv.json().get("run_id")
             self.assertIsNotNone(run_id)
 
             # Check status
@@ -539,51 +600,66 @@ class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
     def test_run_workflow_relative_url_no_attachments_fails(self) -> None:
         """Test run example CWL workflow from relative workflow URL but with no attachments."""
         with self.app.test_client() as client:
-            rv = client.post("/ga4gh/wes/v1/runs", data={
-                "workflow_url": "example.cwl",
-                "workflow_type": "CWL",
-                "workflow_type_version": "v1.0",
-                "workflow_params": "{}"
-            })
+            rv = client.post(
+                "/ga4gh/wes/v1/runs",
+                data={
+                    "workflow_url": "example.cwl",
+                    "workflow_type": "CWL",
+                    "workflow_type_version": "v1.0",
+                    "workflow_params": "{}",
+                },
+                files=TrueDict(),
+            )
             self.assertEqual(rv.status_code, 400)
-            self.assertTrue(rv.is_json)
-            self.assertEqual(rv.json.get("msg"), "Relative 'workflow_url' but missing 'workflow_attachment'")
+            self.assertEqual(
+                rv.json().get("msg"),
+                "Relative 'workflow_url' but missing 'workflow_attachment'",
+            )
 
     def test_run_workflow_relative_url(self) -> None:
         """Test run example CWL workflow from relative workflow URL."""
         with self.app.test_client() as client:
-            rv = client.post("/ga4gh/wes/v1/runs", data={
-                "workflow_url": "example.cwl",
-                "workflow_type": "CWL",
-                "workflow_type_version": "v1.0",
-                "workflow_params": json.dumps({"message": "Hello, world!"}),
-                "workflow_attachment": [
-                    (BytesIO(self.example_cwl.encode()), "example.cwl"),
-                ],
-            })
+            rv = client.post(
+                "/ga4gh/wes/v1/runs",
+                data={
+                    "workflow_url": "example.cwl",
+                    "workflow_type": "CWL",
+                    "workflow_type_version": "v1.0",
+                    "workflow_params": json.dumps({"message": "Hello, world!"}),
+                },
+                files={
+                    "workflow_attachment": (
+                        "example.cwl",
+                        BytesIO(self.example_cwl.encode()),
+                        "application/octet-stream",
+                    ),
+                },
+            )
             # workflow is submitted successfully
             self.assertEqual(rv.status_code, 200)
-            self.assertTrue(rv.is_json)
-            run_id = rv.json.get("run_id")
+            run_id = rv.json().get("run_id")
             self.assertIsNotNone(run_id)
 
             # Check status
             self._wait_for_success(client, run_id)
 
+    @integrative
     def test_run_workflow_https_url(self) -> None:
         """Test run example CWL workflow from the Internet."""
         with self.app.test_client() as client:
-            rv = client.post("/ga4gh/wes/v1/runs", data={
-                "workflow_url": "https://raw.githubusercontent.com/DataBiosphere/toil/releases/5.4.x/src/toil"
-                                "/test/cwl/echo.cwl",
-                "workflow_type": "CWL",
-                "workflow_type_version": "v1.2",
-                "workflow_params": json.dumps({"message": "Hello, world!"}),
-            })
+            rv = client.post(
+                "/ga4gh/wes/v1/runs",
+                data={
+                    "workflow_url": "https://raw.githubusercontent.com/DataBiosphere/toil/4cb5bb3871ac21a9793f638b83775926ed94a226/src/toil/test/cwl/echo.cwl",
+                    "workflow_type": "CWL",
+                    "workflow_type_version": "v1.2",
+                    "workflow_params": json.dumps({"message": "Hello, world!"}),
+                },
+                files=TrueDict(),
+            )
             # workflow is submitted successfully
             self.assertEqual(rv.status_code, 200)
-            self.assertTrue(rv.is_json)
-            run_id = rv.json.get("run_id")
+            run_id = rv.json().get("run_id")
             self.assertIsNotNone(run_id)
 
             # Check status
@@ -592,57 +668,63 @@ class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
     def test_run_workflow_single_file_zip(self) -> None:
         """Test run example CWL workflow from single-file ZIP."""
         workdir = self._createTempDir()
-        zip_path = os.path.abspath(os.path.join(workdir, 'workflow.zip'))
-        with zipfile.ZipFile(zip_path, 'w') as zip_file:
-            zip_file.writestr('example.cwl', self.example_cwl)
+        zip_path = os.path.abspath(os.path.join(workdir, "workflow.zip"))
+        with zipfile.ZipFile(zip_path, "w") as zip_file:
+            zip_file.writestr("example.cwl", self.example_cwl)
         self.run_zip_workflow(zip_path)
 
     def test_run_workflow_multi_file_zip(self) -> None:
         """Test run example CWL workflow from multi-file ZIP."""
         workdir = self._createTempDir()
-        zip_path = os.path.abspath(os.path.join(workdir, 'workflow.zip'))
-        with zipfile.ZipFile(zip_path, 'w') as zip_file:
-            zip_file.writestr('main.cwl', self.example_cwl)
-            zip_file.writestr('distraction.cwl', "Don't mind me")
+        zip_path = os.path.abspath(os.path.join(workdir, "workflow.zip"))
+        with zipfile.ZipFile(zip_path, "w") as zip_file:
+            zip_file.writestr("main.cwl", self.example_cwl)
+            zip_file.writestr("distraction.cwl", "Don't mind me")
         self.run_zip_workflow(zip_path)
 
     def test_run_workflow_manifest_zip(self) -> None:
         """Test run example CWL workflow from ZIP with manifest."""
         workdir = self._createTempDir()
-        zip_path = os.path.abspath(os.path.join(workdir, 'workflow.zip'))
-        with zipfile.ZipFile(zip_path, 'w') as zip_file:
-            zip_file.writestr('actual.cwl', self.example_cwl)
-            zip_file.writestr('distraction.cwl', self.example_cwl)
-            zip_file.writestr('MANIFEST.json', json.dumps({"mainWorkflowURL": "actual.cwl"}))
+        zip_path = os.path.abspath(os.path.join(workdir, "workflow.zip"))
+        with zipfile.ZipFile(zip_path, "w") as zip_file:
+            zip_file.writestr("actual.cwl", self.example_cwl)
+            zip_file.writestr("distraction.cwl", self.example_cwl)
+            zip_file.writestr(
+                "MANIFEST.json", json.dumps({"mainWorkflowURL": "actual.cwl"})
+            )
         self.run_zip_workflow(zip_path)
-
 
     def test_run_workflow_inputs_zip(self) -> None:
         """Test run example CWL workflow from ZIP without manifest but with inputs."""
         workdir = self._createTempDir()
-        zip_path = os.path.abspath(os.path.join(workdir, 'workflow.zip'))
-        with zipfile.ZipFile(zip_path, 'w') as zip_file:
-            zip_file.writestr('main.cwl', self.example_cwl)
-            zip_file.writestr('inputs.json', json.dumps({"message": "Hello, world!"}))
+        zip_path = os.path.abspath(os.path.join(workdir, "workflow.zip"))
+        with zipfile.ZipFile(zip_path, "w") as zip_file:
+            zip_file.writestr("main.cwl", self.example_cwl)
+            zip_file.writestr("inputs.json", json.dumps({"message": "Hello, world!"}))
         self.run_zip_workflow(zip_path, include_message=False)
 
     def test_run_workflow_manifest_and_inputs_zip(self) -> None:
         """Test run example CWL workflow from ZIP with manifest and inputs."""
         workdir = self._createTempDir()
-        zip_path = os.path.abspath(os.path.join(workdir, 'workflow.zip'))
-        with zipfile.ZipFile(zip_path, 'w') as zip_file:
-            zip_file.writestr('actual.cwl', self.example_cwl)
-            zip_file.writestr('data.json', json.dumps({"message": "Hello, world!"}))
-            zip_file.writestr('MANIFEST.json', json.dumps({"mainWorkflowURL": "actual.cwl", "inputFileURLs": ["data.json"]}))
+        zip_path = os.path.abspath(os.path.join(workdir, "workflow.zip"))
+        with zipfile.ZipFile(zip_path, "w") as zip_file:
+            zip_file.writestr("actual.cwl", self.example_cwl)
+            zip_file.writestr("data.json", json.dumps({"message": "Hello, world!"}))
+            zip_file.writestr(
+                "MANIFEST.json",
+                json.dumps(
+                    {"mainWorkflowURL": "actual.cwl", "inputFileURLs": ["data.json"]}
+                ),
+            )
         self.run_zip_workflow(zip_path, include_message=False)
 
     def test_run_workflow_no_params_zip(self) -> None:
         """Test run example CWL workflow from ZIP without workflow_params."""
         workdir = self._createTempDir()
-        zip_path = os.path.abspath(os.path.join(workdir, 'workflow.zip'))
-        with zipfile.ZipFile(zip_path, 'w') as zip_file:
-            zip_file.writestr('main.cwl', self.example_cwl)
-            zip_file.writestr('inputs.json', json.dumps({"message": "Hello, world!"}))
+        zip_path = os.path.abspath(os.path.join(workdir, "workflow.zip"))
+        with zipfile.ZipFile(zip_path, "w") as zip_file:
+            zip_file.writestr("main.cwl", self.example_cwl)
+            zip_file.writestr("inputs.json", json.dumps({"message": "Hello, world!"}))
         # Don't even bother sending workflow_params
         self.run_zip_workflow(zip_path, include_message=False, include_params=False)
 
@@ -684,9 +766,12 @@ class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
             cancel_seconds = cancel_complete - cancel_sent
             logger.info("Cancellation took %s seconds to complete", cancel_seconds)
             from toil.server.wes.tasks import WAIT_FOR_DEATH_TIMEOUT
+
             self.assertLess(cancel_seconds, WAIT_FOR_DEATH_TIMEOUT)
 
+
 @needs_celery_broker
+@integrative
 class ToilWESServerCeleryWorkflowTest(ToilWESServerWorkflowTest):
     """
     End-to-end workflow-running tests against Celery.
@@ -699,8 +784,11 @@ class ToilWESServerCeleryWorkflowTest(ToilWESServerWorkflowTest):
         super().__init__(*args, **kwargs)
         self._server_args = []
 
+
 @needs_celery_broker
-class ToilWESServerCeleryS3StateWorkflowTest(ToilWESServerWorkflowTest, BucketUsingTest):
+class ToilWESServerCeleryS3StateWorkflowTest(
+    ToilWESServerWorkflowTest, BucketUsingTest
+):
     """
     Test the server with Celery and state stored in S3.
     """
@@ -709,6 +797,7 @@ class ToilWESServerCeleryS3StateWorkflowTest(ToilWESServerWorkflowTest, BucketUs
         # Overwrite server args from __init__. The bucket name isn't available when __init__ runs.
         self._server_args = ["--state_store", "s3://" + self.bucket_name + "/state"]
         super().setUp()
+
 
 if __name__ == "__main__":
     unittest.main()
