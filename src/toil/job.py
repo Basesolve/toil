@@ -134,6 +134,7 @@ class DebugStoppingPointReached(BaseException):
     """
 
 
+
 class FilesDownloadedStoppingPointReached(DebugStoppingPointReached):
     """
     Raised when a job stops because it was asked to download its files, and the files are downloaded.
@@ -156,10 +157,10 @@ class TemporaryID:
     Needs to be held:
         * By JobDescription objects to record normal relationships.
         * By Jobs to key their connected-component registries and to record
-          predecessor relationships to facilitate EncapsulatedJob adding
-          itself as a child.
+            predecessor relationships to facilitate EncapsulatedJob adding
+            itself as a child.
         * By Services to tie back to their hosting jobs, so the service
-          tree can be built up from Service objects.
+            tree can be built up from Service objects.
     """
 
     def __init__(self) -> None:
@@ -417,10 +418,21 @@ class RequirementsDict(TypedDict):
     disk: NotRequired[int]
     accelerators: NotRequired[list[AcceleratorRequirement]]
     preemptible: NotRequired[bool]
+    comment: NotRequired[str]
+    usePreferredPartition: NotRequired[bool]
+
 
 
 # These must be all the key names in RequirementsDict
-REQUIREMENT_NAMES = ["disk", "memory", "cores", "accelerators", "preemptible"]
+REQUIREMENT_NAMES = [
+    "disk",
+    "memory",
+    "cores",
+    "accelerators",
+    "preemptible",
+    "comment",
+    "usePreferredPartition",
+]
 
 # This is the supertype of all value types in RequirementsDict
 ParsedRequirement = Union[int, float, bool, list[AcceleratorRequirement]]
@@ -727,6 +739,26 @@ class Requirer:
             "preemptible", val
         )
 
+    @property
+    def usePreferredPartition(self) -> bool:
+        """Whether to use preferred partitions for job."""
+        return cast(bool, self._fetchRequirement("usePreferredPartition"))
+
+    @usePreferredPartition.setter
+    def usePreferredPartition(self, val: ParseableFlag) -> None:
+        self._requirementOverrides["usePreferredPartition"] = Requirer._parseResource(
+            "usePreferredPartition", val
+        )
+
+    @property
+    def comment(self) -> str:
+        """Get job comment"""
+        return cast(str, self._fetchRequirement("comment"))
+
+    @comment.setter
+    def comment(self, val: str) -> None:
+        self._requirementOverrides["comment"] = Requirer._parseResource("comment", val)
+
     @deprecated(new_function_name="preemptible")
     def preemptable(self, val: ParseableFlag) -> None:
         self._requirementOverrides["preemptible"] = Requirer._parseResource(
@@ -821,6 +853,8 @@ class JobDescription(Requirer):
         displayName: Optional[str] = "",
         local: Optional[bool] = None,
         files: Optional[set[FileID]] = None,
+        usePreferredPartition: Optional[bool] = True,
+        comment: Optional[str] = "",
     ) -> None:
         """
         Create a new JobDescription.
@@ -844,6 +878,8 @@ class JobDescription(Requirer):
             sensitive to execution latency, and so should be executed by the
             leader.
         :param files: Set of FileID objects that the job plans to use.
+        :param usePreferredPartition: Whether to use preferred partitions for job.
+        :param comment: Job comment.
         """
         # Set requirements
         super().__init__(requirements)
@@ -862,6 +898,8 @@ class JobDescription(Requirer):
         self.jobName = makeString(jobName)
         self.unitName = makeString(unitName)
         self.displayName = makeString(displayName)
+        self.usePreferredPartition: Optional[bool] = usePreferredPartition
+        self.comment = makeString(comment)
 
         # Set properties that are not fully filled in on creation.
 
@@ -1390,6 +1428,65 @@ class JobDescription(Requirer):
                 self,
                 self.jobStoreID,
             )
+        elif (
+            exit_reason in (
+                BatchJobExitReason.MEMLIMIT,
+                BatchJobExitReason.PARTITION,
+                BatchJobExitReason.KILLED,
+                BatchJobExitReason.OVERUSE,
+                BatchJobExitReason.CONTAINER_MEMLIMIT,
+            )
+            or exit_status in (137, 143, 9)
+        ) and self._config.doubleMem:
+            # 137 = 128 + 9 - occurs when a job is killed due to memory limit by kernel on oom-killer invoked
+            # 143 occurs when a container based job is killed due to memory limit by kernel on oom-killer invoked
+            logger.info(
+                "Not reducing try count (%s) as doubling of memory is enabled for job %s with ID %s",
+                self.remainingTryCount,
+                self,
+                self.jobStoreID,
+            )
+            self.memory = self.memory * 2
+            max_memory_possible = 0
+            try:
+                max_memory_possible = int(
+                    os.popen(
+                        "scontrol show node -o | egrep -o 'RealMemory=[0-9]+' | cut -d '=' -f2 | sort -u | head -1"
+                    )
+                    .read()
+                    .strip()
+                ) * (10**6)
+            except ValueError:
+                logger.warning(
+                    "Double Memory enabled, but could not determine max possible memory in specified batchSystem. Memory limiting is not possible"
+                )
+                self.remainingTryCount = max(0, self.remainingTryCount - 1)
+                logger.warning(
+                    "Due to failure in determining max memory possible we are reducing the remaining try count of job %s with ID %s to %s",
+                    self,
+                    self.jobStoreID,
+                    self.remainingTryCount,
+                )
+            if max_memory_possible:
+                if self.memory > max_memory_possible:
+                    logger.warning(
+                        "The memory doubled value %s is greater than the max memory possible %s, setting memory to max memory possible",
+                        self.memory,
+                        max_memory_possible,
+                    )
+                    self.memory = max_memory_possible
+                    self.remainingTryCount = max(0, self.remainingTryCount - 1)
+                    logger.warning(
+                        "As the doubled memory is more than the max memory possible we are reducing the remaining try count of job %s with ID %s to %s",
+                        self,
+                        self.jobStoreID,
+                        self.remainingTryCount,
+                    )
+            logger.warning(
+                "We have doubled the memory of the failed job %s to %s GB due to doubleMem flag",
+                self,
+                round((self.memory / (1024 * 1024 * 1024)), 2),
+            )
         else:
             self.remainingTryCount = max(0, self.remainingTryCount - 1)
             logger.warning(
@@ -1398,22 +1495,24 @@ class JobDescription(Requirer):
                 self.jobStoreID,
                 self.remainingTryCount,
             )
+        if (
+            exit_reason == BatchJobExitReason.BADCONSTRAINTS
+            and self._config.enableBadConstraintGpuHandling
+        ):
+            self.accelerators = []
+            logger.warning(
+                "We have removed accelerators if any for the failed job %s to try fixing incompatibility",
+                self,
+            )
         # Set the default memory to be at least as large as the default, in
         # case this was a malloc failure (we do this because of the combined
         # batch system)
-        if exit_reason == BatchJobExitReason.MEMLIMIT and self._config.doubleMem:
-            self.memory = self.memory * 2
-            logger.warning(
-                "We have doubled the memory of the failed job %s to %s bytes due to doubleMem flag",
-                self,
-                self.memory,
-            )
         if self.memory < self._config.defaultMemory:
             self.memory = self._config.defaultMemory
             logger.warning(
-                "We have increased the default memory of the failed job %s to %s bytes",
+                "We have increased the default memory of the failed job %s to %s GB",
                 self,
-                self.memory,
+                round((self.memory / (1024 * 1024 * 1024)), 2),
             )
 
         if self.disk < self._config.defaultDisk:
@@ -1660,6 +1759,8 @@ class Job:
         descriptionClass: Optional[type] = None,
         local: Optional[bool] = None,
         files: Optional[set[FileID]] = None,
+        usePreferredPartition: Optional[bool] = True,
+        comment: Optional[str] = "",
     ) -> None:
         """
         Job initializer.
@@ -1681,6 +1782,8 @@ class Job:
         :param descriptionClass: Override for the JobDescription class used to describe the job.
         :param local: if the job can be run on the leader.
         :param files: Set of Files that the job will want to use.
+        :param usePreferredPartition: Whether to use preferred partitions for job.
+        :param comment: Job comment.
 
         :type memory: int or string convertible by toil.lib.conversions.human2bytes to an int
         :type cores: float, int, or string convertible by toil.lib.conversions.human2bytes to an int
@@ -1727,6 +1830,8 @@ class Job:
             displayName=displayName,
             local=local,
             files=files,
+            usePreferredPartition=usePreferredPartition,
+            comment=comment,
         )
 
         # Private class variables needed to actually execute a job, in the worker.
@@ -2586,7 +2691,9 @@ class Job:
             accelerators: Optional[ParseableAcceleratorRequirement] = None,
             preemptible: Optional[ParseableFlag] = None,
             unitName: Optional[str] = "",
-        ) -> None:
+            usePreferredPartition: Optional[ParseableFlag] = None,
+            comment: Optional[str] = "",
+        ):
             """
             Memory, core and disk requirements are specified identically to as in \
             :func:`toil.job.Job.__init__`.
@@ -2599,6 +2706,7 @@ class Job:
                     "disk": disk,
                     "accelerators": accelerators,
                     "preemptible": preemptible,
+                    "comment": comment,
                 }
             )
 
@@ -3102,7 +3210,6 @@ class Job:
 
         # Open and unpickle
         with manager as file_handle:
-
             job = cls._unpickle(user_module, file_handle, requireInstanceOf=Job)
             # Fill in the current description
             job._description = job_description
@@ -3380,6 +3487,8 @@ class FunctionWrappingJob(Job):
             preemptible=resolve("preemptible"),
             checkpoint=resolve("checkpoint", default=False),
             unitName=resolve("name", default=None),
+            usePreferredPartition=resolve("usePreferredPartition", default=True),
+            comment=resolve("comment", default=""),
         )
 
         self.userFunctionModule = ModuleDescriptor.forModule(

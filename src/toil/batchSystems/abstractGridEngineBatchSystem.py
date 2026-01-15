@@ -91,6 +91,13 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 self.boss.config.state_polling_timeout
                 or self.boss.config.statePollingWait * 10
             )
+            try:
+                self.batchSystemResources = self.boss.assessBatchResources()
+            except NotImplementedError as err:
+                logger.warning(
+                    "Cannot assess batch system resources. Possibly running on non-slurm batch system. Error: %s",
+                    err
+                )
             self.newJobsQueue = newJobsQueue
             self.updatedJobsQueue = updatedJobsQueue
             self.killQueue = killQueue
@@ -130,6 +137,7 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             """
             with self.runningJobsLock:
                 self.runningJobs.remove(jobID)
+                self.killJob(jobID)
             del self.batchJobIDs[jobID]
 
         def createJobs(self, newJob: JobTuple) -> bool:
@@ -147,16 +155,17 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 self.boss.config.max_jobs
             ):
                 activity = True
-                jobID, cpu, memory, command, jobName, environment, gpus = (
+                jobID, cpu, memory, command, jobName, environment, gpus, usePreferredPartition, comment = (
                     self.waitingJobs.pop(0)
                 )
                 if self.boss.config.memory_is_product and cpu > 1:
                     memory = memory // cpu
                 # prepare job submission command
                 subLine = self.prepareSubmission(
-                    cpu, memory, jobID, command, jobName, environment, gpus
+                    cpu, memory, jobID, command, jobName, environment, gpus,
+                    usePreferredPartition, comment
                 )
-                logger.debug("Running %r", subLine)
+                logger.info("Running %r", subLine)
                 batchJobID = self.boss.with_retries(self.submitJob, subLine)
                 if self.boss._outbox is not None:
                     # JobID corresponds to the toil version of the jobID,
@@ -279,6 +288,9 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                 if isinstance(status, int):
                     code = status
                     reason = None
+                elif isinstance(status, BatchJobExitReason):
+                    code = 1
+                    reason = status
                 else:
                     code, reason = status
                 self.updatedJobsQueue.put(
@@ -359,12 +371,14 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             self,
             cpu: int,
             memory: int,
+            accelerators: Optional[list[AcceleratorRequirement]],
             jobID: int,
             command: str,
             jobName: str,
             job_environment: Optional[dict[str, str]] = None,
             gpus: Optional[int] = None,
-        ) -> list[str]:
+            usePreferredPartition: Optional[bool] = True,
+            comment: Optional[str] = "") -> list[str]:
             """
             Preparation in putting together a command-line string
             for submitting to batch system (via submitJob().)
@@ -375,6 +389,8 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
             :param: string subLine: the command line string to be called
             :param: string jobName: the name of the Toil job, to provide metadata to batch systems if desired
             :param: dict job_environment: the environment variables to be set on the worker
+            :param: bool usePreferredPartition: override prefferred partition selection for the job
+            :param: string comment: set a job comment
 
             :rtype: List[str]
             """
@@ -499,13 +515,16 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
                     get_job_kind(job_desc.get_names()),
                     job_environment,
                     gpus,
+                    job_desc.usePreferredPartition,
+                    job_desc.comment
                 )
             )
-            logger.debug(
-                "Issued the job command: %s with job id: %s and job name %s",
+            logger.debug("Issued the job command: %s with job id: %s and job name %s on spot capacity: %s with comment %s",
                 command,
                 str(job_id),
                 get_job_kind(job_desc.get_names()),
+                job_desc.usePreferredPartition,
+                job_desc.comment
             )
         return job_id
 
@@ -626,6 +645,12 @@ class AbstractGridEngineBatchSystem(BatchSystemCleanupSupport):
     @classmethod
     def getWaitDuration(self):
         return 1
+
+    @classmethod
+    def assessBatchResources(self):
+        '''Profile batch system resources for deeper job submission control
+        '''
+        raise NotImplementedError()
 
     def sleepSeconds(self, sleeptime=1):
         """Helper function to drop on all state-querying functions to avoid over-querying."""

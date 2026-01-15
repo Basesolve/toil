@@ -844,6 +844,21 @@ def add_base_toil_options(
             "max", "disk", disk_mem_note, bytes2human(SYS_MAX_SIZE)
         ),
     )
+    resource_options.add_argument(
+        "--defaultComment",
+        dest="defaultComment",
+        default="",
+        type=str,
+        help="A comment to be added to the batch job description.",
+    )
+    resource_options.add_argument(
+        "--defaultUsePreferredPartition",
+        dest="defaultUsePreferredPartition",
+        metavar="BOOL",
+        type=strtobool,
+        default=True,
+        help="Use preferred partition types for jobs.",
+    )
 
     # Retrying/rescuing jobs
     job_options = parser.add_argument_group(
@@ -919,6 +934,15 @@ def add_base_toil_options(
         metavar="FLOAT",
         help=f"Maximum time (in seconds) to wait for a job's update to the job store "
         f"before declaring it failed. default=%(default)s",
+    )
+    job_options.add_argument(
+        "--enableBadConstraintGpuHandling",
+        dest="enableBadConstraintGpuHandling",
+        type=strtobool,
+        default=False,
+        metavar="BOOL",
+        help="If set, batch jobs which die to unsupported gpu requirements on batch schedulers "
+        "will be resubmitted with no gpu requirements.",
     )
 
     # Log management options

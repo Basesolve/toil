@@ -40,24 +40,30 @@ EXIT_STATUS_UNAVAILABLE_VALUE = 255
 
 
 class BatchJobExitReason(enum.IntEnum):
-    FINISHED = 1
+    FINISHED: int = 1
     """Successfully finished."""
-    FAILED = 2
+    FAILED: int = 2
     """Job finished, but failed."""
-    LOST = 3
+    LOST: int = 3
     """Preemptable failure (job's executing host went away)."""
-    KILLED = 4
+    KILLED: int = 4
     """Job killed before finishing."""
-    ERROR = 5
+    ERROR: int = 5
     """Internal error."""
-    MEMLIMIT = 6
+    MEMLIMIT: int = 6
     """Job hit batch system imposed memory limit."""
-    MISSING = 7
+    MISSING: int = 7
     """Job disappeared from the scheduler without actually stopping, so Toil killed it."""
-    MAXJOBDURATION = 8
+    MAXJOBDURATION: int = 8
     """Job ran longer than --maxJobDuration, so Toil killed it."""
-    PARTITION = 9
+    PARTITION: int = 9
     """Job was not able to talk to the leader via the job store, so Toil declared it failed."""
+    BADCONSTRAINTS: int = 257
+    """Job landed on a node with incompatible resources"""
+    OVERUSE: int = 253
+    """Process was killed by scheduler due constraints"""
+    CONTAINER_MEMLIMIT: int = 137
+    """Container memory limit is exceeded"""
 
     @classmethod
     def to_string(cls, value: int) -> str:
@@ -93,6 +99,7 @@ class UpdatedBatchJobInfo:
     """
     The identifier for the job in the backing scheduler, if available.
     """
+
 
 
 # Information required for worker cleanup on shutdown of the batch system.
@@ -155,7 +162,7 @@ class AbstractBatchSystem(ABC):
         otherwise it will raise an exception.
 
         :param userScript: the resource object representing the user script
-               or module and the modules it depends on.
+            or module and the modules it depends on.
         """
         raise NotImplementedError()
 
@@ -236,9 +243,9 @@ class AbstractBatchSystem(ABC):
         :param maxWait: the number of seconds to block, waiting for a result
 
         :return: If a result is available, returns UpdatedBatchJobInfo.
-                 Otherwise it returns None. wallTime is the number of seconds (a strictly
-                 positive float) in wall-clock time the job ran for, or None if this
-                 batch system does not support tracking wall time.
+                Otherwise it returns None. wallTime is the number of seconds (a strictly
+                positive float) in wall-clock time the job ran for, or None if this
+                batch system does not support tracking wall time.
         """
         raise NotImplementedError()
 
@@ -324,17 +331,17 @@ class BatchSystemSupport(AbstractBatchSystem):
         Initialize initial state of the object.
 
         :param toil.common.Config config: object is setup by the toilSetup script and
-          has configuration parameters for the jobtree. You can add code
-          to that script to get parameters for your batch system.
+        has configuration parameters for the jobtree. You can add code
+        to that script to get parameters for your batch system.
 
         :param float maxCores: the maximum number of cores the batch system can
-          request for any one job
+        request for any one job
 
         :param int maxMemory: the maximum amount of memory the batch system can
-          request for any one job, in bytes
+        request for any one job, in bytes
 
         :param int maxDisk: the maximum amount of disk space the batch system can
-          request for any one job, in bytes
+        request for any one job, in bytes
         """
         super().__init__()
         self.config = config
@@ -364,7 +371,7 @@ class BatchSystemSupport(AbstractBatchSystem):
         :param str detail: Batch-system-specific message to include in the error.
 
         :raise InsufficientSystemResources: raised when a resource is requested in an amount
-               greater than allowed
+            greater than allowed
         """
         try:
             for resource, requested, available in [

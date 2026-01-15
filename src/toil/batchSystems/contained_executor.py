@@ -19,7 +19,7 @@ Useful for Kubernetes batch system and TES batch system plugin.
 import base64
 import logging
 import os
-import pickle
+import dill as pickle
 import subprocess
 import sys
 from typing import Any, Optional

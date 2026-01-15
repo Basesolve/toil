@@ -13,10 +13,12 @@
 # limitations under the License.
 from __future__ import annotations
 
+import configparser
 import errno
 import logging
 import math
 import os
+from queue import Empty
 import sys
 import shlex
 
@@ -28,6 +30,7 @@ from toil.batchSystems.abstractBatchSystem import (
     EXIT_STATUS_UNAVAILABLE_VALUE,
     BatchJobExitReason,
     InsufficientSystemResources,
+    UpdatedBatchJobInfo,
 )
 from toil.batchSystems.abstractGridEngineBatchSystem import (
     AbstractGridEngineBatchSystem,
@@ -307,11 +310,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             jobName: str,
             job_environment: dict[str, str] | None = None,
             gpus: int | None = None,
+            usePreferredPartition: Optional[bool] = True,
+            comment: Optional[str] = "",
         ) -> list[str]:
             # Make sure to use exec so we can get Slurm's signals in the Toil
             # worker instead of having an intervening Bash
             return self.prepareSbatch(
-                cpu, memory, jobID, jobName, job_environment, gpus
+                cpu, memory, jobID, jobName, job_environment, gpus, usePreferredPartition, comment
             ) + [f"--wrap=exec {command}"]
 
         def submitJob(self, subLine: list[str]) -> int:
@@ -341,7 +346,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 output = call_command(subLine, env=no_session_environment)
                 # sbatch prints a line like 'Submitted batch job 2954103'
                 result = int(output.strip().split()[-1])
-                logger.debug("sbatch submitted job %d", result)
+                logger.info("sbatch submitted job %d", result)
                 return result
             except OSError as e:
                 logger.error(f"sbatch command failed with error: {e}")
@@ -390,6 +395,27 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             status_dict = self._get_job_details([job_id])
             status = status_dict[job_id]
             return self._get_job_return_code(status)
+
+        def getUpdatedBatchJob(self, maxWait):
+            try:
+                logger.debug("getUpdatedBatchJob: Job updates")
+                item = self.updatedJobsQueue.get(timeout=maxWait)
+                self.updatedJobsQueue.task_done()
+                jobID, retcode, exit_reason = (
+                    self.jobIDs[item.jobID],
+                    item.exitStatus,
+                    item.exit_reason,
+                )
+                self.currentjobs -= {self.jobIDs[item.jobID]}
+            except Empty:
+                logger.debug("getUpdatedBatchJob: Job queue is empty")
+            else:
+                return UpdatedBatchJobInfo(
+                    jobID=jobID,
+                    exitStatus=retcode,
+                    wallTime=None,
+                    exitReason=exit_reason,
+                )
 
         def _get_job_details(
             self, job_id_list: list[int]
@@ -472,9 +498,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param status: tuple containing the job's state and it's return code from Slurm.
             :return: the job's return code for Toil if it's completed, otherwise None.
             """
-            state, rc = status
+            state, rc, reason = status
 
             if state not in TERMINAL_STATES:
+                if reason == "BadConstraints":
+                    logger.warning("[SlurmJobHandler] Bad Constrains reason detected.")
+                    return BatchJobExitReason.BADCONSTRAINTS
                 # Don't treat the job as exited yet
                 return None
 
@@ -486,14 +515,147 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 # pass along the code it has.
                 return (rc, exit_reason)  # type: ignore[return-value] # mypy doesn't understand enums well
 
+            if exit_reason == BatchJobExitReason.LOST:
+                # logger.debug(
+                #     "[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition."
+                # )
+                return None
+
             if rc == 0:
                 # The job claims to be in a state other than COMPLETED, but
                 # also to have not encountered a problem. Say the exit status
                 # is unavailable.
                 return (EXIT_STATUS_UNAVAILABLE_VALUE, exit_reason)
-
             # If the code is nonzero, pass it along.
             return (rc, exit_reason)  # type: ignore[return-value] # mypy doesn't understand enums well
+
+        def get_last_partition_switch_details(self, comment):
+            """Get last partition switch time if comment contains it and the switch was done before 2 min
+
+            :param comment: Job comment
+            :type comment: str
+
+            :return: Last partition switch time
+            :rtype: tuple
+            """
+            # A job might contain user comments at times.
+            # We would like to store swtich count and time.
+            # Format: <user_comments>;ToilSlurmPartitionSwtich:<switch_count>+<swtich_time>
+            last_switch_time, switch_count = (None, None)
+            if comment:
+                if comment.__contains__("ToilSlurmPartitionSwitch"):
+                    switch_details = (
+                        next(filter(lambda x: x.startswith("Toil"), comment.split(";")))
+                        .split(":")[1]
+                        .split("+")
+                    )
+                    switch_count = int(switch_details[0])
+                    last_switch_time = int(switch_details[1])
+                    updated_comment = f"ToilSlurmPartitionSwitch:{switch_count + 1}+{int(time.time())}"
+                else:
+                    updated_comment = (
+                        f"{comment};ToilSlurmPartitionSwitch:1+{int(time.time())}"
+                    )
+            else:
+                updated_comment = f"ToilSlurmPartitionSwitch:1+{int(time.time())}"
+            logger.debug("Updated Comment: %s", updated_comment)
+            return (last_switch_time, switch_count, updated_comment)
+
+        def check_and_change_partition(self, job_details, restart_threshold=5):
+            """Get the job restart count and switch partition.
+            TODO: restart_threshold=-1 implies node count per partition.
+
+            :param job_id: pending jobs id
+            :type job_id: int
+            :param restart_threshold: number of restarts to wait for before updating partition, defaults to 5
+            :type restart_threshold: int, optional
+            """
+            # logger.debug("Slurm job details: %s", job_details)
+            # comment would not be available if not definied during submission
+            job_id = job_details.get("JobId")
+            comment = job_details.get("Comment")
+            restart_count = int(job_details.get("Restarts"))
+            partition = job_details.get("Partition")
+            alternate_partition = (
+                os.popen(
+                    f"""
+                scontrol -o show partition {partition} |
+                sed 's/ /\\n/g' |
+                grep 'Alternate' |
+                cut -d "=" -f2
+                """
+                )
+                .read()
+                .strip()
+            )
+            if alternate_partition:
+                partition_state = (
+                    os.popen(
+                        f"""
+                    scontrol -o show partition {partition} |
+                    sed 's/ /\\n/g' |
+                    grep State |
+                    cut -d "=" -f2
+                    """
+                    )
+                    .read()
+                    .strip()
+                )
+                if partition_state != "UP":
+                    logger.debug(
+                        "Cannot switch partition: Configured alternate partition %s is %s",
+                        alternate_partition,
+                        partition_state,
+                    )
+                    return
+            else:
+                logger.debug(
+                    "Cannot switch partition: No alternate partition configured for %s",
+                    partition,
+                )
+                return
+
+            # set max_possible restart threshold
+            # if restart_threshold == -1:
+            #     restart_threshold = total_nodes
+            last_switch_time, switch_count, updated_comment = (
+                self.get_last_partition_switch_details(comment)
+            )
+            if last_switch_time:
+                if (int(time.time()) - last_switch_time) < 300000:
+                    logger.debug(
+                        "Seems like last patition switch happened just 5 min before. Skipping switch for now"
+                    )
+                    return
+                restart_threshold *= switch_count + 1
+                logger.debug(
+                    "Partition was already switched for the job, doubling the restart threshold to %s",
+                    restart_threshold,
+                )
+            if int(restart_count) >= restart_threshold:
+                # make sure comment is not none and contains the partition switch term
+                logger.info(
+                    "Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
+                    job_id,
+                    restart_threshold,
+                    alternate_partition,
+                )
+                switch_command = f'scontrol update jobid={job_id} partition={alternate_partition} comment="{updated_comment}"'
+                logger.info(f"Executing: {switch_command}")
+                switch_exit_code = os.system(switch_command)
+                if switch_exit_code == 0:
+                    logger.info(
+                        "Job: %s has been swithced to alternate partition: %s",
+                        job_id,
+                        alternate_partition,
+                    )
+                else:
+                    logger.warning(
+                        "Job: %s could not be swithced to alternate partition: %s, Error Code: %s",
+                        job_id,
+                        alternate_partition,
+                        switch_exit_code,
+                    )
 
         def _canonicalize_state(self, state: str) -> str:
             """
@@ -679,7 +841,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     raise
 
             for job_id in job_id_list:
-                job_statuses[job_id] = (None, None)
+                job_statuses[job_id] = (None, None, None)
 
             for line in stdout.splitlines():
                 values = line.strip().split("|")
@@ -699,6 +861,49 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 status: int
                 signal: int
                 status, signal = (int(n) for n in exitcode.split(":"))
+                reason = ""
+                if state == "PENDING":
+                    # sacct does not report the job pending reason in realtime. but scontrol does.
+                    job_details = (
+                        os.popen(
+                            f"""
+                        scontrol -o show job {job_id} |
+                        sed 's/ /\\n/g'
+                        """
+                        )
+                        .read()
+                        .strip()
+                        .splitlines()
+                    )
+                    # 'Reason|Comment|Restarts|Partition'
+                    jdict = {}
+                    for item in job_details:
+                        bits = item.split("=", 1)
+                        if len(bits) == 1:
+                            jdict[key] += " " + bits[0]
+                        else:
+                            key = bits[0]
+                            jdict[key] = bits[1]
+                    reason = jdict.get("Reason")
+                    if reason == "BadConstraints":
+                        status = 7
+                    if reason == "BeginTime":
+                        logger.debug(
+                            "Job: %s is in %s state. Checking if alternate partition to be used.",
+                            job_id,
+                            state,
+                        )
+                        user_slurm_restart_thresh = int(
+                            os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5)
+                        )
+                        logger.debug(
+                            "User override value for slurm job restart: %i",
+                            user_slurm_restart_thresh,
+                        )
+                        self.check_and_change_partition(
+                            job_details=jdict,
+                            restart_threshold=user_slurm_restart_thresh,
+                        )
                 if signal > 0:
                     # A non-zero signal may indicate e.g. an out-of-memory killed job
                     status = 128 + signal
@@ -710,7 +915,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     exitcode,
                     status,
                 )
-                job_statuses[job_id] = state, status
+                job_statuses[job_id] = state, status, reason
             logger.log(TRACE, "%s returning job statuses: %s", args[0], job_statuses)
             return job_statuses
 
@@ -743,7 +948,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             job_statuses: dict[int, tuple[str | None, int | None]] = {}
             job_id: int | None
             for job_id in job_id_list:
-                job_statuses[job_id] = (None, None)
+                job_statuses[job_id] = (None, None, None)
 
             # `scontrol` will report "No jobs in the system", if there are no jobs in the system,
             # and if no job-id was passed as argument to `scontrol`.
@@ -778,6 +983,27 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     continue
                 state = job["JobState"]
                 state = self._canonicalize_state(state)
+                reason = ""
+                if state == "PENDING":
+                    reason = job.get("Reason")
+                    if reason == "BadConstraints":
+                        job["ExitCode"] = 7
+                    if reason == "BeginTime":
+                        logger.debug(
+                            "Job: %s is in %s state. Checking if alternate partition to be used.",
+                            job_id,
+                            state,
+                        )
+                        user_slurm_restart_thresh = int(
+                            os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5)
+                        )
+                        logger.debug(
+                            "User override value for slurm job restart: %i",
+                            user_slurm_restart_thresh,
+                        )
+                        self.check_and_change_partition(
+                            job_details=job, restart_threshold=user_slurm_restart_thresh
+                        )
                 logger.log(TRACE, "%s state of job %s is %s", args[0], job_id, state)
                 try:
                     exitcode = job["ExitCode"]
@@ -806,6 +1032,95 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ###
         ### Implementation-specific helper methods
         ###
+        def select_partition(self, cpus, mem, accelerators, preferred=True):
+            """Select suitable slurm partition based on requirements. Checks state of partition.
+
+            :param cpus: required cps
+            :type cpus: int
+            :param mem: required memory
+            :type mem: integer
+            :param preferred: respect partition preference, defaults to True
+            :type preferred: bool, optional
+            :return: suitable partition for the requirements
+            :rtype: str
+            """
+            gpu = True if accelerators else False
+            logger.info("GPU Required: %s", gpu)
+            # Intentionally we check here if gpu nodes exist and choose them if required.
+            # This is because we need an approach to ignore accelerator specification if gpu partition not found.
+            usable_resources = self.batchSystemResources
+            logger.info(
+                "Detected Cluster Partitions: %s", usable_resources.partitions.unique()
+            )
+            if gpu:
+                if not any(self.batchSystemResources["gpu"]):
+                    logger.warning("""
+                    Ignoring specified accelerator requirements, as there are no gpu nodes available in the cluster.
+                    """)
+                else:
+                    usable_resources = self.batchSystemResources[
+                        self.batchSystemResources["gpu"]
+                    ]
+            else:
+                usable_resources = self.batchSystemResources[
+                    ~self.batchSystemResources["gpu"]
+                ]
+            if "preference" in self.batchSystemResources.columns:
+                possible_partitions = usable_resources.partitions[
+                    (self.batchSystemResources["cputot"] >= cpus)
+                    & (self.batchSystemResources["realmemory"] >= mem)
+                    & (self.batchSystemResources["preference"] == preferred)
+                ].values
+            else:
+                possible_partitions = usable_resources.partitions[
+                    (self.batchSystemResources["cputot"] >= cpus)
+                    & (self.batchSystemResources["realmemory"] >= mem)
+                ].values
+            if len(possible_partitions) != 0:
+                usable_partitions = []
+                logger.info("Feasible Partitions: %s", possible_partitions)
+                for partition in possible_partitions:
+                    partition_state = (
+                        os.popen(
+                            f"""
+                        scontrol -o show partition {partition} |
+                        sed 's/ /\\n/g' |
+                        grep State |
+                        cut -d "=" -f2
+                        """
+                        )
+                        .read()
+                        .strip()
+                    )
+                    if partition_state == "UP":
+                        usable_partitions.append(partition)
+                    else:
+                        logger.info(
+                            "Skipping partition: %s, due to state being %s",
+                            partition,
+                            partition_state,
+                        )
+                logger.info("Selectable Partitions: %s", usable_partitions)
+                return usable_partitions[0]
+
+            if "preference" in self.batchSystemResources.columns:
+                logger.warning(
+                    "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s and preferred type: %s",
+                    cpus,
+                    mem,
+                    accelerators,
+                    preferred,
+                )
+                logger.info("Trying with preferred type: %s", not preferred)
+                return self.select_partition(cpus, mem, accelerators, not preferred)
+            else:
+                logger.error(
+                    "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s",
+                    cpus,
+                    mem,
+                    accelerators,
+                )
+                return
 
         def prepareSbatch(
             self,
@@ -815,13 +1130,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             jobName: str,
             job_environment: dict[str, str] | None,
             gpus: int | None,
+            usePreferredPartition: Optional[bool],
+            comment: Optional[str],
         ) -> list[str]:
             """
             Returns the sbatch command line to run to queue the job.
             """
-
+            timeout = os.getenv("TOIL_SLURM_JOB_TIMEOUT", "02:30:00")
             # Start by naming the job
-            sbatch_line = ["sbatch", "-J", f"toil_job_{jobID}_{jobName}"]
+            sbatch_line = ["sbatch", "-t", timeout, "-J", f"toil_job_{jobID}_{jobName}"]
 
             # Make sure the job gets a signal before it disappears so that e.g.
             # container cleanup finally blocks can run. Ask for SIGINT so we
@@ -835,7 +1152,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # TODO: Add a way to detect when the job failed because it
             # responded to this signal and use the right exit reason for it.
             sbatch_line.append("--signal=B:INT@30")
-
+            if gpus:
+                sbatch_line = sbatch_line[:1] + [f"--gres=gpu:{gpus}"] + sbatch_line[1:]
             environment = {}
             environment.update(self.boss.environment)
             if job_environment:
@@ -1001,17 +1319,43 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     )
             if mem is not None and self.boss.config.slurm_allocate_mem:  # type: ignore[attr-defined]
                 # memory passed in is in bytes, but slurm expects megabytes
-                sbatch_line.append(f"--mem={math.ceil(mem / 2 ** 20)}")
+                slurm_mem = math.ceil(mem / 2**20)
+                sbatch_line.append(f"--mem={slurm_mem}")
+            else:
+                slurm_mem = None
             if cpu is not None:
-                sbatch_line.append(f"--cpus-per-task={math.ceil(cpu)}")
+                slurm_cpu = math.ceil(cpu)
+                sbatch_line.append(f"--cpus-per-task={slurm_cpu}")
             if time_limit is not None:
                 # Put all the seconds in the seconds slot
                 sbatch_line.append(f"--time=0:{time_limit}")
 
+            if slurm_mem and slurm_cpu:
+                partition = self.select_partition(
+                    slurm_cpu,
+                    slurm_mem,
+                    accelerators=gpus,
+                    preferred=usePreferredPartition,
+                )
+                logger.info(
+                    "Selected partition: %s based on cpus: %s and memory: %s of preferred type: %s",
+                    partition,
+                    slurm_cpu,
+                    slurm_mem,
+                    usePreferredPartition,
+                )
+                sbatch_line.append(f"--partition={partition}")
+            else:
+                logger.info(
+                    "Skipping slurm partition selection as mem and cpu are not specified."
+                )
+
+            if comment is not None:
+                sbatch_line.append(f"--comment={comment}")
+
             stdoutfile: str = self.boss.format_std_out_err_path(jobID, "%j", "out")
             stderrfile: str = self.boss.format_std_out_err_path(jobID, "%j", "err")
             sbatch_line.extend(["-o", stdoutfile, "-e", stderrfile])
-
             return sbatch_line
 
     def __init__(
@@ -1083,6 +1427,81 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     ###
     ### The interface for SLURM
     ###
+    @classmethod
+    def _check_accelerator_request(self, requirer: Requirer) -> None:
+        for accelerator in requirer.accelerators:
+            if accelerator["kind"] != "gpu":
+                # We can only provide GPUs, and of those only nvidia ones.
+                raise InsufficientSystemResources(
+                    requirer,
+                    "accelerators",
+                    details=[
+                        f"The accelerator {accelerator} could not be provided.",
+                        "Slurm can only provide gpu accelerators.",
+                    ],
+                )
+            # if not any(self.batchSystemResources['gputot'] >= accelerator['count']):
+            #     raise InsufficientSystemResources(requirer, 'accelerators', details=[
+            #         f'The requested number of accelerators {accelerator} could not be provided.',
+            #         f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
+            #     ])
+
+    @classmethod
+    def assessBatchResources(cls):
+        slurm_partition_configs = (
+            os.popen(
+                r"""
+            scontrol show node -o |
+            sed 's/\[.*//g' |
+            sed 's/NodeName=/\[/' |
+            sed 's/ /\] /' |
+            sed 's/ \+/\n/g' |
+            sed 's/(null)//g' |
+            egrep "=|\["
+            """
+            )
+            .read()
+            .strip()
+        )
+        # print(slurm_partition_configs)
+        config = configparser.ConfigParser()
+        config.read_string(slurm_partition_configs)
+        config_dicts = []
+        for section, val in config._sections.items():
+            cdict = {"NodeName": section}
+            for k, v in val.items():
+                cdict[k] = v
+            config_dicts.append(cdict)
+
+        config_data = pd.DataFrame.from_dict(config_dicts)
+        # print(config_data)
+        req_configs = config_data[
+            [
+                "partitions",
+                "cputot",
+                "realmemory",
+                "gres",
+            ]
+        ]
+        slurm_resources = req_configs.groupby("partitions").max().reset_index()
+        slurm_resources["gputot"] = slurm_resources.gres.apply(
+            lambda x: int(x.split(":")[2]) if x else None
+        )
+        slurm_resources["gpu"] = ~slurm_resources.gputot.isnull()
+        slurm_resources.drop(columns="gres", inplace=True)
+        preference = os.getenv("TOIL_SLURM_PARTITON_PREFERED")
+        if preference:
+            logger.info("Setting slurm partition preference: %s", preference)
+            slurm_resources["preference"] = slurm_resources.partitions.str.contains(
+                preference, case=False
+            )
+        else:
+            logger.info("No slurm partition preference set")
+        slurm_resources[["cputot", "realmemory"]] = slurm_resources[
+            ["cputot", "realmemory"]
+        ].astype(int)
+        slurm_resources.sort_values(["cputot", "realmemory"], inplace=True)
+        return slurm_resources
 
     # `scontrol show config` can get us the slurm config, and there are values
     # SchedulerTimeSlice and AcctGatherNodeFreq in there, but

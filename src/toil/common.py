@@ -198,6 +198,8 @@ class Config:
     deadlockCheckInterval: Union[float, int]
 
     # Resource requirements
+    defaultComment: str
+    defaultUsePreferredPartition: bool
     defaultMemory: int
     defaultCores: Union[float, int]
     defaultDisk: int
@@ -215,6 +217,7 @@ class Config:
     stop_on_first_failure: bool
     enableUnlimitedPreemptibleRetries: bool
     doubleMem: bool
+    enableBadConstraintGpuHandling: bool
     maxJobDuration: int
     rescueJobsFrequency: int
     job_store_timeout: float
@@ -380,6 +383,8 @@ class Config:
             set_option("deadlockWait")
             set_option("deadlockCheckInterval")
 
+        set_option("defaultUsePreferredPartition")
+        set_option("defaultComment")
         set_option("defaultMemory")
         set_option("defaultCores")
         set_option("defaultDisk")
@@ -394,6 +399,7 @@ class Config:
         set_option("stop_on_first_failure")
         set_option("enableUnlimitedPreemptibleRetries")
         set_option("doubleMem")
+        set_option("enableBadConstraintGpuHandling")
         set_option("maxJobDuration")
         set_option("rescueJobsFrequency")
         set_option("job_store_timeout")
@@ -1107,6 +1113,9 @@ class Toil(ContextManager["Toil"]):
                     if self.config.restart and not self._inRestart:
                         pass
                     else:
+                        # if self.config.batchSystem == "slurm":
+                        #     self._batchSystem.killBatchJobs(self._batchSystem.getIssuedBatchJobIDs())
+                        #     logger.info("Succesfully cancelled all orphan slurm jobs")
                         self._jobStore.destroy()
                         logger.info(
                             "Successfully deleted the job store: %s"

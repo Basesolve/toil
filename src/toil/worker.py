@@ -17,7 +17,7 @@ import copy
 import json
 import logging
 import os
-import pickle
+import dill as pickle
 import random
 import shutil
 import signal

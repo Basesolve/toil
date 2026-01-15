@@ -15,7 +15,7 @@ import json
 import logging
 import os
 import os.path
-import pickle
+import dill as pickle
 import random
 import resource
 import signal
