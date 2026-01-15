@@ -1403,13 +1403,17 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     get_job_kind(job_desc.get_names()),
                     job_environment,
                     gpus,
+                    job_desc.usePreferredPartition,
+                    job_desc.comment,
                 )
             )
             logger.debug(
-                "Issued the job command: %s with job id: %s and job name %s",
+                "Issued the job command: %s with job id: %s and job name %s on spot capacity: %s with comment %s",
                 command,
                 str(job_id),
                 get_job_kind(job_desc.get_names()),
+                job_desc.usePreferredPartition,
+                job_desc.comment
             )
         return job_id
 
