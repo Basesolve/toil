@@ -48,6 +48,9 @@ from toil.statsAndLogging import TRACE
 
 logger = logging.getLogger(__name__)
 
+# (state, exit code, pending reason from scontrol/sacct)
+JobStatusDetail = tuple[str | None, int | None, str | None]
+
 # We have a complete list of Slurm states. States not in one of these aren't
 # allowed. See <https://slurm.schedmd.com/squeue.html#SECTION_JOB-STATE-CODES>
 
@@ -455,7 +458,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
         def _get_job_details(
             self, job_id_list: list[int]
-        ) -> dict[int, tuple[str | None, int | None]]:
+        ) -> dict[int, JobStatusDetail]:
             """
             Helper function for `getJobExitCode` and `coalesce_job_exit_codes`.
             Fetch job details from Slurm's accounting system or job control system.
@@ -503,14 +506,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     # Neither approach worked at all
                     raise
 
-            # One of the methods worked, so we have at least (None, None)
+            # One of the methods worked, so we have at least (None, None, None)
             # values filled in for all jobs.
             assert len(status_dict) == len(job_id_list)
 
             return status_dict
 
         def _get_job_return_code(
-            self, status: tuple[str | None, int | None]
+            self, status: JobStatusDetail
         ) -> int | tuple[int, BatchJobExitReason | None] | None:
             """
             Given a Slurm return code, status pair, summarize them into a Toil return code, exit reason pair.
@@ -530,7 +533,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             will not return a successful return code.
 
             Helper function for `getJobExitCode` and `coalesce_job_exit_codes`.
-            :param status: tuple containing the job's state and it's return code from Slurm.
+            :param status: tuple containing the job's state, return code, and reason from Slurm.
             :return: the job's return code for Toil if it's completed, otherwise None.
             """
             state, rc, reason = status
@@ -716,23 +719,23 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         def _remaining_jobs(
             self,
             job_id_list: list[int],
-            job_details: dict[int, tuple[str | None, int | None]],
+            job_details: dict[int, JobStatusDetail],
         ) -> list[int]:
             """
-            Given a list of job IDs and a list of job details (state and exit
-            code), get the list of job IDs where the details are (None, None)
-            (or are missing).
+            Given a list of job IDs and a list of job details (state, exit
+            code, reason), get the list of job IDs where the details are
+            (None, None, None) (or are missing).
             """
             return [
                 j
                 for j in job_id_list
-                if job_details.get(j, (None, None)) == (None, None)
+                if job_details.get(j, (None, None, None)) == (None, None, None)
             ]
 
         def _getJobDetailsFromSacct(
             self,
             job_id_list: list[int],
-        ) -> dict[int, tuple[str | None, int | None]]:
+        ) -> dict[int, JobStatusDetail]:
             """
             Get SLURM job exit codes for the jobs in `job_id_list` by running `sacct`.
 
@@ -744,8 +747,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
             :param job_id_list: list of integer batch job IDs.
             :return: dict of job statuses, where key is the job-id, and value
-                is a tuple containing the job's state and exit code. Jobs with
-                no information reported from Slurm will have (None, None).
+                is a tuple containing the job's state, exit code, and reason.
+                Jobs with no information reported from Slurm will have
+                (None, None, None).
             """
 
             # Pick a now
@@ -759,10 +763,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 end_time += timedelta(days=1)
             # If we don't go around the loop at least once, we might end up
             # with an empty dict being returned, which shouldn't happen. We
-            # need the (None, None) entries for jobs we can't find.
+            # need the (None, None, None) entries for jobs we can't find.
             assert end_time >= self.boss.start_time
 
-            results: dict[int, tuple[str | None, int | None]] = {}
+            results: dict[int, JobStatusDetail] = {}
 
             while len(job_id_list) > 0 and end_time >= self.boss.start_time:
                 # There are still jobs to look for and our search isn't
@@ -797,7 +801,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             job_id_list: list[int],
             begin_time: datetime,
             end_time: datetime,
-        ) -> dict[int, tuple[str | None, int | None]]:
+        ) -> dict[int, JobStatusDetail]:
             """
             Get SLURM job exit codes for the jobs in `job_id_list` by running `sacct`.
 
@@ -808,8 +812,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param begin_time: An aware datetime of the earliest time to search
             :param end_time: An aware datetime of the latest time to search
             :return: dict of job statuses, where key is the job-id, and value
-                is a tuple containing the job's state and exit code. Jobs with
-                no information reported from Slurm will have (None, None).
+                is a tuple containing the job's state, exit code, and reason.
+                Jobs with no information reported from Slurm will have
+                (None, None, None).
             """
 
             assert begin_time.tzinfo is not None, "begin_time must be aware"
@@ -843,7 +848,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
             # Collect the job statuses in a dict; key is the job-id, value is a tuple containing
             # job state and exit status. Initialize dict before processing output of `sacct`.
-            job_statuses: dict[int, tuple[str | None, int | None]] = {}
+            job_statuses: dict[int, JobStatusDetail] = {}
 
             try:
                 stdout = call_command(args, quiet=True)
@@ -952,7 +957,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
         def _getJobDetailsFromScontrol(
             self, job_id_list: list[int]
-        ) -> dict[int, tuple[str | None, int | None]]:
+        ) -> dict[int, JobStatusDetail]:
             """
             Get SLURM job exit codes for the jobs in `job_id_list` by running `scontrol`.
             :param job_id_list: list of integer batch job IDs.
@@ -976,7 +981,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
             # Collect the job statuses in a dict; key is the job-id, value is a tuple containing
             # job state and exit status. Initialize dict before processing output of `scontrol`.
-            job_statuses: dict[int, tuple[str | None, int | None]] = {}
+            job_statuses: dict[int, JobStatusDetail] = {}
             job_id: int | None
             for job_id in job_id_list:
                 job_statuses[job_id] = (None, None, None)
@@ -1056,7 +1061,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         rc = None
                 except KeyError:
                     rc = None
-                job_statuses[job_id] = (state, rc)
+                job_statuses[job_id] = (state, rc, reason)
             logger.log(TRACE, "%s returning job statuses: %s", args[0], job_statuses)
             return job_statuses
 

@@ -333,24 +333,24 @@ class SlurmTest(ToilTest):
 
     def test_getJobDetailsFromSacct_one_exists(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sacct)
-        expected_result = {785023: ("FAILED", 127)}
+        expected_result = {785023: ("FAILED", 127, "")}
         result = self.worker._getJobDetailsFromSacct(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
     def test_getJobDetailsFromSacct_one_not_exists(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sacct)
-        expected_result = {1234: (None, None)}
+        expected_result = {1234: (None, None, None)}
         result = self.worker._getJobDetailsFromSacct(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
     def test_getJobDetailsFromSacct_many_all_exist(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sacct)
         expected_result = {
-            754725: ("TIMEOUT", 0),
-            789456: ("FAILED", 1),
-            789724: ("RUNNING", 0),
-            789868: ("PENDING", 0),
-            789869: ("COMPLETED", 0),
+            754725: ("TIMEOUT", 0, ""),
+            789456: ("FAILED", 1, ""),
+            789724: ("RUNNING", 0, ""),
+            789868: ("PENDING", 0, ""),
+            789869: ("COMPLETED", 0, ""),
         }
         result = self.worker._getJobDetailsFromSacct(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
@@ -358,24 +358,28 @@ class SlurmTest(ToilTest):
     def test_getJobDetailsFromSacct_many_some_exist(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sacct)
         expected_result = {
-            609663: ("FAILED", 130),
-            767925: ("FAILED", 2),
-            1234: (None, None),
-            1235: (None, None),
-            765096: ("FAILED", 137),
+            609663: ("FAILED", 130, ""),
+            767925: ("FAILED", 2, ""),
+            1234: (None, None, None),
+            1235: (None, None, None),
+            765096: ("FAILED", 137, ""),
         }
         result = self.worker._getJobDetailsFromSacct(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
     def test_getJobDetailsFromSacct_many_none_exist(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sacct)
-        expected_result = {1234: (None, None), 1235: (None, None), 1236: (None, None)}
+        expected_result = {
+            1234: (None, None, None),
+            1235: (None, None, None),
+            1236: (None, None, None),
+        }
         result = self.worker._getJobDetailsFromSacct(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
     def test_getJobDetailsFromSacct_argument_list_too_big(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sacct)
-        expected_result = {i: (None, None) for i in range(2000)}
+        expected_result = {i: (None, None, None) for i in range(2000)}
         result = self.worker._getJobDetailsFromSacct(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
@@ -383,9 +387,14 @@ class SlurmTest(ToilTest):
     #### tests for _getJobDetailsFromScontrol()
     ####
 
+    def test_get_job_return_code_accepts_scontrol_status_tuple(self):
+        """Regression: scontrol must return 3-tuples like sacct (_get_job_return_code)."""
+        status = ("RUNNING", 0, "")
+        assert self.worker._get_job_return_code(status) is None
+
     def test_getJobDetailsFromScontrol_one_exists(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_scontrol)
-        expected_result = {789724: ("RUNNING", 0)}
+        expected_result = {789724: ("RUNNING", 0, "")}
         result = self.worker._getJobDetailsFromScontrol(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
@@ -395,7 +404,7 @@ class SlurmTest(ToilTest):
         raise an exception.
         """
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_scontrol)
-        expected_result = {1234: (None, None)}
+        expected_result = {1234: (None, None, None)}
         try:
             _ = self.worker._getJobDetailsFromScontrol(list(expected_result))
         except CalledProcessErrorStderr:
@@ -406,9 +415,9 @@ class SlurmTest(ToilTest):
     def test_getJobDetailsFromScontrol_many_all_exist(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_scontrol)
         expected_result = {
-            787204: ("COMPLETED", 0),
-            789724: ("RUNNING", 0),
-            789728: ("PENDING", 0),
+            787204: ("COMPLETED", 0, ""),
+            789724: ("RUNNING", 0, ""),
+            789728: ("PENDING", 0, ""),
         }
         result = self.worker._getJobDetailsFromScontrol(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
@@ -416,16 +425,20 @@ class SlurmTest(ToilTest):
     def test_getJobDetailsFromScontrol_many_some_exist(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_scontrol)
         expected_result = {
-            787204: ("COMPLETED", 0),
-            789724: ("RUNNING", 0),
-            1234: (None, None),
+            787204: ("COMPLETED", 0, ""),
+            789724: ("RUNNING", 0, ""),
+            1234: (None, None, None),
         }
         result = self.worker._getJobDetailsFromScontrol(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
     def test_getJobDetailsFromScontrol_many_none_exist(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_scontrol)
-        expected_result = {1234: (None, None), 1235: (None, None), 1236: (None, None)}
+        expected_result = {
+            1234: (None, None, None),
+            1235: (None, None, None),
+            1236: (None, None, None),
+        }
         result = self.worker._getJobDetailsFromScontrol(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
