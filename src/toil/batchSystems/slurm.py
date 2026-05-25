@@ -144,6 +144,16 @@ def parse_slurm_time(slurm_time: str) -> int:
     return days * 86400 + result
 
 
+def slurm_job_number(batch_job_ref: int | str) -> int:
+    """
+    Normalize a Slurm batch job reference to its integer job ID.
+
+    ``submitJob`` stores an ``int`` in ``batchJobIDs``; other call paths may
+    pass ``"<job>"`` or ``"<job>.<task>"`` strings.
+    """
+    return int(str(batch_job_ref).split(".", 1)[0])
+
+
 # For parsing user-provided option overrides (or self-generated
 # options) for sbatch, we need a way to recognize long, long-with-equals, and
 # short forms.
@@ -474,7 +484,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 cpu, memory, jobID, jobName, job_environment, gpus, usePreferredPartition, comment
             ) + [f"--wrap=exec {command}"]
 
-        def submitJob(self, subLine: list[str]) -> int:
+        def submitJob(self, subLine: list[str]) -> str:
             try:
                 # Slurm is not quite clever enough to follow the XDG spec on
                 # its own. If the submission command sees e.g. XDG_RUNTIME_DIR
@@ -502,7 +512,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 # sbatch prints a line like 'Submitted batch job 2954103'
                 result = int(output.strip().split()[-1])
                 logger.info("sbatch submitted job %d", result)
-                return result
+                return str(result)
             except OSError as e:
                 logger.error(f"sbatch command failed with error: {e}")
                 raise e
@@ -534,7 +544,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             exit_codes: list[int | tuple[int, BatchJobExitReason | None] | None] = []
             with self.runningJobsLock:
                 slurm_to_toil = {
-                    int(self.batchJobIDs[x][0].split(".")[0]): x
+                    slurm_job_number(self.batchJobIDs[x][0]): x
                     for x in self.runningJobs
                     if x in self.batchJobIDs
                 }
@@ -560,7 +570,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             """
             logger.log(TRACE, "Getting exit code for slurm job: %s", batchJobID)
             # Convert batchJobID to an integer job ID.
-            job_id = int(batchJobID.split(".")[0])
+            job_id = slurm_job_number(batchJobID)
             status_dict = self._get_job_details([job_id])
             status = status_dict[job_id]
             toil_job_id = None
@@ -568,7 +578,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 for running_id in self.runningJobs:
                     if (
                         running_id in self.batchJobIDs
-                        and int(self.batchJobIDs[running_id][0].split(".")[0]) == job_id
+                        and slurm_job_number(self.batchJobIDs[running_id][0])
+                        == job_id
                     ):
                         toil_job_id = running_id
                         break
@@ -945,7 +956,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             job_id_raw = job_details.get("JobId")
             if job_id_raw is None:
                 return
-            slurm_job_id = int(str(job_id_raw).split(".")[0])
+            slurm_job_id = slurm_job_number(job_id_raw)
             self._maybe_invoke_partition_switch(
                 slurm_job_id, job_details, restart_threshold
             )
@@ -1634,6 +1645,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     def __init__(
         self, config: Config, maxCores: float, maxMemory: float, maxDisk: float
     ) -> None:
+        # Background thread starts in super().__init__ and may call checkOnJobs
+        # immediately; set partition-switch state before that.
+        self.partition_switch_watch: set[int] = set()
+        self._lost_job_first_seen: dict[int, float] = {}
+        self._partition_switch_last_poll = 0.0
         super().__init__(config, maxCores, maxMemory, maxDisk)
         self.partitions = SlurmBatchSystem.PartitionSet()
         # Record when the workflow started, so we know when to stop looking for
@@ -1651,9 +1667,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             self.failover_partitions = env_csv("TOIL_SLURM_PARTITION_FAILOVER")
         self.failover_partition_index = 0
         self.active_failover_partition: str | None = None
-        self.partition_switch_watch: set[int] = set()
-        self._lost_job_first_seen: dict[int, float] = {}
-        self._partition_switch_last_poll = 0.0
 
     def advance_failover_partition(self) -> str | None:
         """Rotate to the next configured failover partition for new sbatch submissions."""

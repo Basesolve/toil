@@ -1,4 +1,5 @@
 import errno
+import inspect
 import logging
 import sys
 import textwrap
@@ -526,9 +527,26 @@ class SlurmTest(ToilTest):
     ### Tests for coalesce_job_exit_codes
     ###
 
+    def test_slurm_job_number_accepts_int_and_string(self) -> None:
+        assert toil.batchSystems.slurm.slurm_job_number(785023) == 785023
+        assert toil.batchSystems.slurm.slurm_job_number("785023") == 785023
+        assert toil.batchSystems.slurm.slurm_job_number("785023.batch") == 785023
+
     def test_coalesce_job_exit_codes_one_exists(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_either)
         job_ids = ["785023"]  # FAILED
+        expected_result = [(127, BatchJobExitReason.FAILED)]
+        result = self.worker.coalesce_job_exit_codes(job_ids)
+        assert result == expected_result, f"{result} != {expected_result}"
+
+    def test_coalesce_job_exit_codes_int_batch_job_id_in_batchJobIDs(self) -> None:
+        """submitJob stores an int Slurm ID; coalesce must still map running jobs."""
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_either)
+        toil_job_id = 1
+        slurm_job_id = 785023
+        self.worker.batchJobIDs = {toil_job_id: (slurm_job_id, None)}
+        self.worker.runningJobs = {toil_job_id}
+        job_ids = ["785023"]
         expected_result = [(127, BatchJobExitReason.FAILED)]
         result = self.worker.coalesce_job_exit_codes(job_ids)
         assert result == expected_result, f"{result} != {expected_result}"
@@ -900,6 +918,26 @@ class SlurmTest(ToilTest):
 
         result = toil.batchSystems.slurm.parse_slurm_time("365-00:00:00")
         self.assertEqual(result, 365 * 86400)
+
+    def test_slurm_init_sets_partition_switch_watch_before_super(self) -> None:
+        """
+        GridEngineThread starts in super().__init__ and may call checkOnJobs
+        before SlurmBatchSystem.__init__ would otherwise finish.
+        """
+        src = inspect.getsource(toil.batchSystems.slurm.SlurmBatchSystem.__init__)
+        lines = src.splitlines()
+        super_line = next(
+            i
+            for i, line in enumerate(lines)
+            if "super().__init__(config" in line.replace(" ", "")
+            or "super().__init__(config" in line
+        )
+        watch_line = next(
+            i
+            for i, line in enumerate(lines)
+            if line.strip().startswith("self.partition_switch_watch")
+        )
+        assert watch_line < super_line
 
 
 class TestSlurmMountRecovery(ToilTest):
