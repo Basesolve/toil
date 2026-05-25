@@ -28,9 +28,9 @@ import sys
 import threading
 import time
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any
 
 from configargparse import ArgParser
 
@@ -49,22 +49,16 @@ from toil.job import (
     JobDescription,
 )
 from toil.jobStores.abstractJobStore import AbstractJobStore
-from toil.lib.expando import MagicExpando
-from toil.lib.io import make_public_dir
+from toil.lib.io import make_public_dir, path_union
 from toil.lib.resources import ResourceMonitor
-from toil.statsAndLogging import configure_root_logger, install_log_color, set_log_level
+from toil.statsAndLogging import StatsDict, configure_root_logger, install_log_color, set_log_level
 
 logger = logging.getLogger(__name__)
 
 
-class StatsDict(MagicExpando):
-    """Subclass of MagicExpando for type-checking purposes."""
-
-    jobs: list[MagicExpando]
-
 def nextChainable(
     predecessor: JobDescription, job_store: AbstractJobStore, config: Config
-) -> Optional[JobDescription]:
+) -> JobDescription | None:
     """
     Returns the next chainable job's JobDescription after the given predecessor
     JobDescription, if one exists, or None if the chain must terminate.
@@ -167,6 +161,7 @@ def nextChainable(
     # Made it through! This job is chainable.
     return successor
 
+
 def unstick_worker(interval: float = 120, timeout: float = 120) -> None:
     """
     Thread function that tries to prevent the process from getting stuck.
@@ -189,7 +184,7 @@ def unstick_worker(interval: float = 120, timeout: float = 120) -> None:
     # Figure out our process ID
     pid = os.getpid()
 
-    child: Optional[subprocess.Popen[bytes]] = None
+    child: subprocess.Popen[bytes] | None = None
 
     def clean_up_child() -> None:
         """
@@ -233,7 +228,9 @@ def unstick_worker(interval: float = 120, timeout: float = 120) -> None:
             )
         except FileNotFoundError:
             # If there isn't an lsof, don't try and use it.
-            logger.info("lsof is not available. We will not be able to use it to unstick a stuck Toil leader.")
+            logger.info(
+                "lsof is not available. We will not be able to use it to unstick a stuck Toil leader."
+            )
             return
         try:
             child.wait(timeout=timeout)
@@ -247,10 +244,14 @@ def unstick_worker(interval: float = 120, timeout: float = 120) -> None:
         if child.returncode != 0:
             # Something went wrong, which is suspicious. Either it failed or it
             # timed out and could not be killed promptly.
-            logger.warning("Could not list open files on ourselves. Return code: %s", child.returncode)
+            logger.warning(
+                "Could not list open files on ourselves. Return code: %s",
+                child.returncode,
+            )
 
         # Wait the interval.
         time.sleep(interval)
+
 
 def workerScript(
     job_store: AbstractJobStore,
@@ -258,8 +259,8 @@ def workerScript(
     job_name: str,
     job_store_id: str,
     redirect_output_to_log_file: bool = True,
-    local_worker_temp_dir: Optional[str] = None,
-    debug_flags: Optional[set[str]] = None,
+    local_worker_temp_dir: str | None = None,
+    debug_flags: set[str] | None = None,
 ) -> int:
     """
     Worker process script, runs a job.
@@ -357,18 +358,15 @@ def workerScript(
         "XDG_DATA_DIRS",
         "DBUS_SESSION_BUS_ADDRESS",
     }
-    for i in environment:
-        if i == "PATH":
+    for k, v in environment.items():
+        if k == "PATH":
             # Handle path specially. Sometimes e.g. leader may not include
             # /bin, but the Toil appliance needs it.
-            if i in os.environ and os.environ[i] != "":
-                # Use the provided PATH and then the local system's PATH
-                os.environ[i] = environment[i] + ":" + os.environ[i]
-            else:
-                # Use the provided PATH only
-                os.environ[i] = environment[i]
-        elif i not in env_reject:
-            os.environ[i] = environment[i]
+
+            # Use the provided PATH and then the local system's PATH if any
+            os.environ[k] = path_union(v, os.environ.get(k))
+        elif k not in env_reject:
+            os.environ[k] = v
     # sys.path is used by __import__ to find modules
     if "PYTHONPATH" in environment:
         for e in environment["PYTHONPATH"].split(":"):
@@ -450,7 +448,7 @@ def workerScript(
     jobAttemptFailed = False
     failure_exit_code = 1
     first_job_cores = None
-    statsDict = StatsDict()  # type: ignore[no-untyped-call]
+    statsDict = StatsDict()
     statsDict.jobs = []
     statsDict.workers.logs_to_leader = []
     statsDict.workers.logging_user_streams = []
@@ -515,7 +513,7 @@ def workerScript(
                 # Reduce the try count
                 if jobDesc.remainingTryCount < 0:
                     raise RuntimeError("The try count of the job cannot be negative.")
-                jobDesc.remainingTryCount = max(0, jobDesc.remainingTryCount - 1)
+                jobDesc.chargeRetry()
                 jobDesc.restartCheckpoint(job_store)
             # Otherwise, the job and successors are done, and we can cleanup stuff we couldn't clean
             # because of the job being a checkpoint
@@ -575,9 +573,7 @@ def workerScript(
                     caching=config.caching,
                 )
                 try:
-                    with job._executor(
-                        stats=statsDict, fileStore=fileStore
-                    ):
+                    with job._executor(stats=statsDict, fileStore=fileStore):
                         with deferredFunctionManager.open() as defer:
                             with fileStore.open(job):
                                 # Get the next block function to wait on committing this job
@@ -699,7 +695,8 @@ def workerScript(
         max_bytes = 0
         for job_stats in statsDict.jobs:
             if "disk" in job_stats:
-                max_bytes = max(max_bytes, int(job_stats.disk))
+                # TODO: MyPy doesn't know this type-narrows our Expando to something that has .disk
+                max_bytes = max(max_bytes, int(job_stats.disk)) # type:ignore[attr-defined]
         statsDict.workers.disk = str(max_bytes)
         # Count the jobs executed.
         # TODO: toil stats could compute this but its parser is too general to hook into simply.
@@ -978,7 +975,7 @@ def in_contexts(contexts: list[str]) -> Iterator[None]:
                 yield
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     if argv is None:
         argv = sys.argv
     # Parse our command line

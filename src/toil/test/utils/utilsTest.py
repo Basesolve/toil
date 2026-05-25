@@ -12,33 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import builtins
-from collections.abc import Callable, Generator
 import logging
 import os
-from pathlib import Path
 import re
 import subprocess
 import sys
 import time
 import uuid
-from typing import Optional, Any, cast
+from collections.abc import Callable, Generator
+from pathlib import Path
+from typing import Any, cast
+
 import pytest
 
 import toil
 from toil import resolveEntryPoint
 from toil.common import Config, Toil
+from toil.fileStores.abstractFileStore import AbstractFileStore
 from toil.job import Job
 from toil.lib.bioio import system
-from toil.fileStores.abstractFileStore import AbstractFileStore
-from toil.test import (
-    get_data,
-    pneeds_aws_ec2 as needs_aws_ec2,
-    pneeds_cwl as needs_cwl,
-    pneeds_docker as needs_docker,
-    pintegrative as integrative,
-    pneeds_rsync3 as needs_rsync3,
-    pslow as slow,
-)
+from toil.test import get_data
+from toil.test import pintegrative as integrative
+from toil.test import pneeds_aws_ec2 as needs_aws_ec2
+from toil.test import pneeds_cwl as needs_cwl
+from toil.test import pneeds_docker as needs_docker
+from toil.test import pneeds_rsync3 as needs_rsync3
+from toil.test import pslow as slow
+import toil.test.sort.sort
 from toil.test.sort.sort import makeFileToSort
 from toil.utils.toilStats import get_stats, process_data
 from toil.utils.toilStatus import ToilStatus
@@ -225,6 +225,7 @@ class TestUtils:
             str(self.N),
             "--stats",
             "--retryCount=2",
+            "--retryBackoffSeconds=0",
             "--badWorker=0.5",
             "--badWorkerFailInterval=0.05",
         ]
@@ -284,6 +285,7 @@ class TestUtils:
 
     @slow
     @pytest.mark.slow
+    @pytest.mark.timeout(600)
     def testUtilsStatsSort(
         self, tmp_path: Path, unsortedFile: Path, correctSort: list[str]
     ) -> None:
@@ -307,13 +309,18 @@ class TestUtils:
             str(self.N),
             "--stats",
             "--retryCount=99",
+            "--retryBackoffSeconds=0",
             "--badWorker=0.5",
             "--badWorkerFailInterval=0.01",
         ]
 
+        logger.info("Run command: %s", " ".join(toilCommand))
+
         # Run the script for the first time
         system(toilCommand)
         assert jobstore.exists()
+
+        logger.debug("Run stats")
 
         # Check we can run 'toil stats'
         system(self.statsCommand(jobstore))
@@ -353,7 +360,7 @@ class TestUtils:
         jobstore: Path,
         status: str,
         status_fn: Callable[[str], str],
-        process: Optional[subprocess.Popen[Any]] = None,
+        process: subprocess.Popen[Any] | None = None,
         seconds: int = 20,
     ) -> None:
         time_elapsed = 0.0
@@ -442,6 +449,7 @@ class TestUtils:
                 f"--fileToSort={unsortedFile}",
                 f"--outputFile={outputFile}",
                 "--clean=never",
+                "--retryBackoffSeconds=0",
                 "--badWorker=1",
             ]
         )
@@ -470,6 +478,7 @@ class TestUtils:
                     "--jobStore",
                     str(jobstore),
                     "--clean=never",
+                    "--retryBackoffSeconds=0",
                     "--badWorker=1",
                     str(cwl_file),
                     "--reverse",
@@ -542,6 +551,7 @@ class TestUtils:
 
         def fake_print(*args: Any, **kwargs: Any) -> None:
             print_args.extend(args)
+
         # Run a workflow that will always fail
         with get_data("test/cwl/alwaysfails.cwl") as cwl_file:
             cmd = [
@@ -581,6 +591,7 @@ class TestUtils:
             "-m",
             "toil.test.sort.restart_sort",
             jobstore.as_uri(),
+            "--retryBackoffSeconds=0",
             "--badWorker=1",
             "--logDebug",
         ]
@@ -591,6 +602,7 @@ class TestUtils:
             "-m",
             "toil.test.sort.restart_sort",
             jobstore.as_uri(),
+            "--retryBackoffSeconds=0",
             "--badWorker=0",
             "--logDebug",
             "--restart",

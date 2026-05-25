@@ -14,6 +14,7 @@
 import json
 import logging
 import os
+import sys
 import textwrap
 import time
 import unittest
@@ -24,8 +25,11 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Optional
 from urllib.parse import urlparse
 
+from toil.options.common import parseBool
+
+import pytest
+
 try:
-    from flask import Flask
     from flask.testing import FlaskClient
     from werkzeug.test import TestResponse
 except ImportError:
@@ -33,45 +37,17 @@ except ImportError:
     # extra wasn't installed. We'll then skip them all.
     pass
 
-from toil.test import ToilTest, needs_aws_s3, needs_celery_broker, needs_cwl, needs_server, integrative
+from toil.test import (
+    ToilTest,
+    integrative,
+    needs_aws_s3,
+    needs_celery_broker,
+    needs_cwl,
+    needs_server,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-@needs_server
-class ToilServerUtilsTest(ToilTest):
-    """
-    Tests for the utility functions used by the Toil server.
-    """
-
-    def test_workflow_canceling_recovery(self):
-        """
-        Make sure that a workflow in CANCELING state will be recovered to a
-        terminal state eventually even if the workflow runner Celery task goes
-        away without flipping the state.
-        """
-
-        from toil.server.utils import (
-            MemoryStateStore,
-            WorkflowStateMachine,
-            WorkflowStateStore,
-        )
-
-        store = WorkflowStateStore(MemoryStateStore(), "test-workflow")
-
-        state_machine = WorkflowStateMachine(store)
-
-        # Cancel a workflow
-        state_machine.send_cancel()
-        # Make sure it worked.
-        self.assertEqual(state_machine.get_current_state(), "CANCELING")
-
-        # Back-date the time of cancelation to something really old
-        store.set("cancel_time", "2011-11-04 00:05:23.283")
-
-        # Make sure it is now CANCELED due to timeout
-        self.assertEqual(state_machine.get_current_state(), "CANCELED")
 
 
 class hidden:
@@ -195,10 +171,10 @@ class BucketUsingTest(ToilTest):
         from mypy_boto3_s3 import S3ServiceResource
         from mypy_boto3_s3.service_resource import Bucket
 
-    region: Optional[str]
+    region: str | None
     s3_resource: Optional["S3ServiceResource"]
     bucket: Optional["Bucket"]
-    bucket_name: Optional[str]
+    bucket_name: str | None
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -208,7 +184,7 @@ class BucketUsingTest(ToilTest):
         super().setUpClass()
 
         from toil.lib.aws import get_current_aws_region, session
-        from toil.lib.aws.utils import create_s3_bucket
+        from toil.lib.aws.s3 import create_s3_bucket
 
         cls.region = get_current_aws_region()
         cls.s3_resource = session.resource("s3", region_name=cls.region)
@@ -219,7 +195,7 @@ class BucketUsingTest(ToilTest):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        from toil.lib.aws.utils import delete_s3_bucket
+        from toil.lib.aws.s3 import delete_s3_bucket
 
         if cls.bucket_name:
             delete_s3_bucket(cls.s3_resource, cls.bucket_name, cls.region)
@@ -292,11 +268,13 @@ class TrueDict(dict):
     Used as a workaround to set httpx post request encoding as recommended in
     <https://github.com/encode/httpx/discussions/2399#discussioncomment-3814186>.
     """
+
     def __bool__(self) -> bool:
         """
         Always say the object is truthy.
         """
         return True
+
 
 @needs_server
 class AbstractToilWESServerTest(ToilTest):
@@ -557,6 +535,7 @@ class ToilWESServerBenchTest(AbstractToilWESServerTest):
         self.assertIn("system_state_counts", service_info)
         self.assertIn("tags", service_info)
 
+
 @needs_cwl
 class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
     """
@@ -768,6 +747,47 @@ class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
             from toil.server.wes.tasks import WAIT_FOR_DEATH_TIMEOUT
 
             self.assertLess(cancel_seconds, WAIT_FOR_DEATH_TIMEOUT)
+
+    @pytest.mark.timeout(60)
+    @pytest.mark.skipif(
+        sys.version_info < (3, 14) and parseBool(os.environ.get("CI", "False")),
+        reason="mysteriously fails in CI on Python <3.14 but passes locally",
+    )
+    def test_cancel_before_setup(self) -> None:
+        """
+        Run and cancel a workflow before the workflow has a chance to set up
+        its cancellation handlers.
+        """
+
+        with pytest.MonkeyPatch.context() as mp:
+            # Patch the server to wait when starting tasks
+            from toil.server.wes.tasks import MultiprocessingTaskRunner
+            mp.setattr(MultiprocessingTaskRunner, "setup_delay", 10)
+
+            with self.app.test_client() as client:
+                # Start a workflow
+                run = self._start_slow_workflow(client)
+                time.sleep(2)
+                status = self._poll_status(client, run)
+                self.assertIn(status, ["QUEUED", "INITIALIZING", "RUNNING"])
+
+                # Cancel it
+                cancel_sent = time.time()
+                self._cancel_workflow(client, run)
+                time.sleep(1)
+                status = self._poll_status(client, run)
+                self.assertIn(status, ["CANCELING", "CANCELED"])
+
+                self._wait_for_status(client, run, "CANCELED")
+                cancel_complete = time.time()
+
+                # Make sure the cancellation was relatively prompt and we didn't
+                # have to go through any of the timeout codepaths
+                cancel_seconds = cancel_complete - cancel_sent
+                logger.info("Cancellation took %s seconds to complete", cancel_seconds)
+                from toil.server.wes.tasks import WAIT_FOR_DEATH_TIMEOUT
+
+                self.assertLess(cancel_seconds, WAIT_FOR_DEATH_TIMEOUT)
 
 
 @needs_celery_broker

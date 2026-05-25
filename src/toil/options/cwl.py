@@ -193,6 +193,24 @@ def add_cwl_options(parser: ArgumentParser, suppress: bool = True) -> None:
         help=suppress_help or "Path prefix for intermediate output directories",
         default=None,
     )
+    tmpdirgroup = (
+        parser.add_mutually_exclusive_group()
+        if not suppress_help
+        else parser.add_argument_group()
+    )
+    tmpdirgroup.add_argument(
+        "--rm-tmpdir",
+        action="store_true",
+        default=True,
+        help=suppress_help or "Delete intermediate temporary directories (default)",
+        dest="rm_tmpdir",
+    )
+    tmpdirgroup.add_argument(
+        "--leave-tmpdir",
+        action="store_false",
+        help=suppress_help or "Do not delete intermediate temporary directories",
+        dest="rm_tmpdir",
+    )
     parser.add_argument(
         "--force-docker-pull",
         action="store_true",
@@ -259,7 +277,6 @@ def add_cwl_options(parser: ArgumentParser, suppress: bool = True) -> None:
         default=False,
         help=suppress_help or SUPPRESS,
     )
-    # same workaround as dockergroup
     checkgroup = (
         parser.add_mutually_exclusive_group()
         if not suppress_help
@@ -424,7 +441,7 @@ def add_cwl_options(parser: ArgumentParser, suppress: bool = True) -> None:
         or "Specify a minimum memory allocation for all tasks ."
         "If --no-cwl-default-ram is passed, this does not apply to tools that do not "
         "specify a memory requirement; --defaultMemory is used for those tools"
-        "in that case."
+        "in that case.",
     )
     parser.add_argument(
         "--destBucket",
@@ -439,5 +456,5 @@ def add_cwl_options(parser: ArgumentParser, suppress: bool = True) -> None:
         "recomputing steps. Can be very helpful in the development and "
         "troubleshooting of CWL documents. This automatically bypasses the file store."
         " Not to be confused with --caching.",
-        dest="cachedir"
+        dest="cachedir",
     )

@@ -34,25 +34,13 @@ import stat
 import sys
 import textwrap
 import uuid
+
+# This is also in configargparse but MyPy doesn't know it
+from argparse import RawDescriptionHelpFormatter
+from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence
 from tempfile import NamedTemporaryFile, TemporaryFile, gettempdir
 from threading import Thread
-from typing import (
-    IO,
-    Any,
-    Callable,
-    Iterator,
-    Mapping,
-    MutableMapping,
-    MutableSequence,
-    Optional,
-    TextIO,
-    Tuple,
-    TypeVar,
-    Union,
-    cast,
-    Literal,
-    Protocol,
-)
+from typing import IO, Any, Literal, Optional, Protocol, TextIO, TypeVar, Union, cast
 from urllib.parse import quote, unquote, urlparse, urlsplit
 
 import cwl_utils.errors
@@ -66,9 +54,6 @@ import cwltool.load_tool
 import cwltool.main
 import cwltool.resolver
 import schema_salad.ref_resolver
-
-# This is also in configargparse but MyPy doesn't know it
-from argparse import RawDescriptionHelpFormatter
 from configargparse import ArgParser, Namespace
 from cwltool.loghandler import _logger as cwllogger
 from cwltool.loghandler import defaultStreamHandler
@@ -90,15 +75,21 @@ from cwltool.software_requirements import (
 )
 from cwltool.stdfsaccess import StdFsAccess, abspath
 from cwltool.utils import (
-    CWLObjectType,
-    CWLOutputType,
-    DirectoryType,
     adjustDirObjs,
     aslist,
     downloadHttpFile,
     get_listing,
     normalizeFilesDirs,
     visit_class,
+)
+from cwl_utils.types import (
+    CWLDirectoryType,
+    CWLFileType,
+    CWLObjectType,
+    CWLOutputType,
+    is_directory,
+    is_file,
+    is_file_or_directory,
 )
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from schema_salad.avro.schema import Names
@@ -110,13 +101,9 @@ from toil.batchSystems.abstractBatchSystem import InsufficientSystemResources
 from toil.batchSystems.registry import DEFAULT_BATCH_SYSTEM
 from toil.common import Config, Toil, addOptions
 from toil.cwl import check_cwltool_version
-from toil.lib.directory import (
-    DirectoryContents,
-    decode_directory,
-    encode_directory,
-)
-from toil.lib.trs import resolve_workflow
+from toil.lib.directory import DirectoryContents, decode_directory, encode_directory
 from toil.lib.misc import call_command
+from toil.lib.trs import resolve_workflow
 from toil.provisioners.clusterScaler import JobTooBigError
 
 check_cwltool_version()
@@ -125,36 +112,36 @@ from toil.cwl.utils import (
     CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE,
     download_structure,
     get_from_structure,
+    remove_redundant_mounts,
     visit_cwl_class_and_reduce,
-    remove_redundant_mounts
 )
 from toil.exceptions import FailedJobsException
 from toil.fileStores import FileID
 from toil.fileStores.abstractFileStore import AbstractFileStore
 from toil.job import (
     AcceleratorRequirement,
+    FileMetadata,
+    ImportsJob,
     Job,
     Promise,
     Promised,
-    unwrap,
-    ImportsJob,
-    get_file_sizes,
-    FileMetadata,
     WorkerImportJob,
+    get_file_sizes,
+    unwrap,
 )
 from toil.jobStores.abstractJobStore import (
     AbstractJobStore,
-    NoSuchFileException,
     InvalidImportExportUrlException,
     LocatorException,
+    NoSuchFileException,
 )
-from toil.lib.exceptions import UnimplementedURLException
 from toil.jobStores.fileJobStore import FileJobStore
 from toil.jobStores.utils import JobStoreUnavailableException, generate_locator
+from toil.lib.exceptions import UnimplementedURLException
 from toil.lib.io import mkdtemp
 from toil.lib.threading import ExceptionalThread, global_mutex
-from toil.statsAndLogging import DEFAULT_LOGLEVEL
 from toil.lib.url import URLAccess
+from toil.statsAndLogging import DEFAULT_LOGLEVEL
 
 logger = logging.getLogger(__name__)
 
@@ -229,18 +216,19 @@ def _filter_skip_null(value: Any, err_flag: list[bool]) -> Any:
                      allows us to flag, at any level of recursion, that we have
                      encountered a SkipNull.
     """
-    if isinstance(value, SkipNull):
-        err_flag[0] = True
-        value = None
-    elif isinstance(value, list):
-        return [_filter_skip_null(v, err_flag) for v in value]
-    elif isinstance(value, dict):
-        return {k: _filter_skip_null(v, err_flag) for k, v in value.items()}
+    match value:
+        case SkipNull():
+            err_flag[0] = True
+            value = None
+        case list(val_list):
+            return [_filter_skip_null(v, err_flag) for v in val_list]
+        case dict(val_dict):
+            return {k: _filter_skip_null(v, err_flag) for k, v in val_dict.items()}
     return value
 
 
 def ensure_no_collisions(
-    directory: DirectoryType, dir_description: Optional[str] = None
+    directory: CWLDirectoryType, dir_description: str | None = None
 ) -> None:
     """
     Make sure no items in the given CWL Directory have the same name.
@@ -259,7 +247,7 @@ def ensure_no_collisions(
     for child in directory.get("listing", []):
         if "basename" in child:
             # For each child that actually has a path to go at in its parent
-            wanted_name = cast(str, child["basename"])
+            wanted_name = child["basename"]
             if wanted_name in seen_names:
                 # We used this name already so bail out
                 raise cwl_utils.errors.WorkflowException(
@@ -310,9 +298,9 @@ class Conditional:
 
     def __init__(
         self,
-        expression: Optional[str] = None,
-        outputs: Union[dict[str, CWLOutputType], None] = None,
-        requirements: Optional[list[CWLObjectType]] = None,
+        expression: str | None = None,
+        outputs: dict[str, CWLOutputType] | None = None,
+        requirements: list[CWLObjectType] | None = None,
         container_engine: str = "docker",
     ):
         """
@@ -377,7 +365,7 @@ class Conditional:
 class ResolveSource:
     """Apply linkMerge and pickValue operators to values coming into a port."""
 
-    promise_tuples: Union[list[tuple[str, Promise]], tuple[str, Promise]]
+    promise_tuples: list[tuple[str, Promise]] | tuple[str, Promise]
 
     def __init__(
         self,
@@ -434,7 +422,7 @@ class ResolveSource:
     def resolve(self) -> Any:
         """First apply linkMerge then pickValue if either present."""
 
-        result: Optional[Any] = None
+        result: Any | None = None
         if isinstance(self.promise_tuples, list):
             result = self.link_merge(
                 cast(
@@ -449,9 +437,7 @@ class ResolveSource:
         result = filter_skip_null(self.name, result)
         return result
 
-    def link_merge(
-        self, values: CWLObjectType
-    ) -> Union[list[CWLOutputType], CWLOutputType]:
+    def link_merge(self, values: CWLObjectType) -> list[CWLOutputType] | CWLOutputType:
         """
         Apply linkMerge operator to `values` object.
 
@@ -477,7 +463,7 @@ class ResolveSource:
                 f"Unsupported linkMerge '{link_merge_type}' on {self.name}."
             )
 
-    def pick_value(self, values: Union[list[Union[str, SkipNull]], Any]) -> Any:
+    def pick_value(self, values: list[str | SkipNull] | Any) -> Any:
         """
         Apply pickValue operator to `values` object.
 
@@ -500,40 +486,39 @@ class ResolveSource:
 
         result = [v for v in values if not isinstance(v, SkipNull) and v is not None]
 
-        if pick_value_type == "first_non_null":
-            if len(result) < 1:
-                logger.error(
-                    "Could not find non-null entry for %s:\n%s",
-                    self.name,
-                    pprint.pformat(self.promise_tuples),
-                )
+        match pick_value_type:
+            case "first_non_null":
+                if len(result) < 1:
+                    logger.error(
+                        "Could not find non-null entry for %s:\n%s",
+                        self.name,
+                        pprint.pformat(self.promise_tuples),
+                    )
+                    raise cwl_utils.errors.WorkflowException(
+                        "%s: first_non_null operator found no non-null values"
+                        % self.name
+                    )
+                else:
+                    return result[0]
+            case "the_only_non_null":
+                if len(result) == 0:
+                    raise cwl_utils.errors.WorkflowException(
+                        "%s: the_only_non_null operator found no non-null values"
+                        % self.name
+                    )
+                elif len(result) > 1:
+                    raise cwl_utils.errors.WorkflowException(
+                        "%s: the_only_non_null operator found more than one non-null values"
+                        % self.name
+                    )
+                else:
+                    return result[0]
+            case "all_non_null":
+                return result
+            case _:
                 raise cwl_utils.errors.WorkflowException(
-                    "%s: first_non_null operator found no non-null values" % self.name
+                    f"Unsupported pickValue '{pick_value_type}' on {self.name}"
                 )
-            else:
-                return result[0]
-
-        elif pick_value_type == "the_only_non_null":
-            if len(result) == 0:
-                raise cwl_utils.errors.WorkflowException(
-                    "%s: the_only_non_null operator found no non-null values"
-                    % self.name
-                )
-            elif len(result) > 1:
-                raise cwl_utils.errors.WorkflowException(
-                    "%s: the_only_non_null operator found more than one non-null values"
-                    % self.name
-                )
-            else:
-                return result[0]
-
-        elif pick_value_type == "all_non_null":
-            return result
-
-        else:
-            raise cwl_utils.errors.WorkflowException(
-                f"Unsupported pickValue '{pick_value_type}' on {self.name}"
-            )
 
 
 class StepValueFrom:
@@ -676,10 +661,8 @@ class JustAValue:
 
 
 def resolve_dict_w_promises(
-    dict_w_promises: Union[
-        UnresolvedDict, CWLObjectType, dict[str, Union[str, StepValueFrom]]
-    ],
-    file_store: Optional[AbstractFileStore] = None,
+    dict_w_promises: UnresolvedDict | CWLObjectType | dict[str, str | StepValueFrom],
+    file_store: AbstractFileStore | None = None,
 ) -> CWLObjectType:
     """
     Resolve a dictionary of promises evaluate expressions to produce the actual values.
@@ -732,11 +715,11 @@ class ToilPathMapper(PathMapper):
 
     def __init__(
         self,
-        referenced_files: list[CWLObjectType],
+        referenced_files: MutableSequence[CWLFileType | CWLDirectoryType],
         basedir: str,
         stagedir: str,
         separateDirs: bool = True,
-        get_file: Union[Any, None] = None,
+        get_file: Any | None = None,
         stage_listing: bool = False,
         streaming_allowed: bool = True,
     ):
@@ -762,7 +745,7 @@ class ToilPathMapper(PathMapper):
 
     def visit(
         self,
-        obj: CWLObjectType,
+        obj: CWLFileType | CWLDirectoryType,
         stagedir: str,
         basedir: str,
         copy: bool = False,
@@ -851,7 +834,7 @@ class ToilPathMapper(PathMapper):
             # We only handle files and directories; only they have locations.
             return
 
-        location = cast(str, obj["location"])
+        location = obj["location"]
         if location in self:
             # If we've already mapped this, map it consistently.
             tgt = self._pathmap[location].target
@@ -864,7 +847,7 @@ class ToilPathMapper(PathMapper):
             # Decide where to put the file or directory, as an absolute path.
             tgt = os.path.join(
                 stagedir,
-                cast(str, obj["basename"]),
+                obj["basename"],
             )
             if self.reversemap(tgt) is not None:
                 # If the target already exists in the pathmap, but we haven't yet
@@ -881,7 +864,7 @@ class ToilPathMapper(PathMapper):
                 )
                 tgt = new_tgt
 
-        if obj["class"] == "Directory":
+        if is_directory(obj):
             # Whether or not we've already mapped this path, we need to map all
             # children recursively.
 
@@ -889,7 +872,7 @@ class ToilPathMapper(PathMapper):
 
             # We want to check the directory to make sure it is not
             # self-contradictory in its immediate children and their names.
-            ensure_no_collisions(cast(DirectoryType, obj))
+            ensure_no_collisions(obj)
 
             # We may need to copy this directory even if we don't copy things inside it.
             copy_here = False
@@ -923,7 +906,7 @@ class ToilPathMapper(PathMapper):
                     # And get a path for it
                     resolved = schema_salad.ref_resolver.uri_file_path(new_dir_uri)
 
-                    if "listing" in obj and obj["listing"] != []:
+                    if is_directory(obj) and obj["listing"] != []:
                         # If there's stuff inside here to stage, we need to copy
                         # this directory here, because we can't Docker mount things
                         # over top of immutable directories.
@@ -970,14 +953,14 @@ class ToilPathMapper(PathMapper):
 
             # Keep recursing
             self.visitlisting(
-                cast(list[CWLObjectType], obj.get("listing", [])),
+                obj.get("listing", []),
                 tgt,
                 basedir,
                 copy=copy,
                 staged=staged,
             )
 
-        elif obj["class"] == "File":
+        if is_file(obj):
             logger.debug("ToilPathMapper visiting file %s", location)
 
             if location in self._pathmap:
@@ -993,7 +976,7 @@ class ToilPathMapper(PathMapper):
             if "contents" in obj and location.startswith("_:"):
                 # We are supposed to create this file
                 self._pathmap[location] = MapperEnt(
-                    cast(str, obj["contents"]),
+                    obj["contents"],
                     tgt,
                     "CreateWritableFile" if copy else "CreateFile",
                     staged,
@@ -1048,7 +1031,7 @@ class ToilPathMapper(PathMapper):
 
             # Handle all secondary files that need to be next to this one.
             self.visitlisting(
-                cast(list[CWLObjectType], obj.get("secondaryFiles", [])),
+                obj.get("secondaryFiles", []),
                 stagedir,
                 basedir,
                 copy=copy,
@@ -1087,7 +1070,7 @@ class ToilSingleJobExecutor(cwltool.executors.SingleJobExecutor):
             )
 
             # If singularity is detected, prepull the image to ensure locking
-            (docker_req, docker_is_req) = process.get_requirement(
+            docker_req, docker_is_req = process.get_requirement(
                 feature="DockerRequirement"
             )
             with global_mutex(
@@ -1112,7 +1095,7 @@ class ToilTool:
         """
         super().__init__(*args, **kwargs)
         # Reserve a spot for the Toil job that ends up executing this tool.
-        self._toil_job: Optional[Job] = None
+        self._toil_job: Job | None = None
         # Remember path mappers we have used so we can interrogate them later to find out what the job mapped.
         self._path_mappers: list[cwltool.pathmapper.PathMapper] = []
 
@@ -1126,7 +1109,7 @@ class ToilTool:
 
     def make_path_mapper(
         self,
-        reffiles: list[Any],
+        reffiles: MutableSequence[CWLFileType | CWLDirectoryType],
         stagedir: str,
         runtimeContext: cwltool.context.RuntimeContext,
         separateDirs: bool,
@@ -1161,7 +1144,7 @@ class ToilCommandLineTool(ToilTool, cwltool.command_line_tool.CommandLineTool):
     """Subclass the cwltool command line tool to provide the custom ToilPathMapper."""
 
     def _initialworkdir(
-        self, j: Optional[cwltool.job.JobBase], builder: cwltool.builder.Builder
+        self, j: cwltool.job.JobBase | None, builder: cwltool.builder.Builder
     ) -> None:
         """
         Hook the InitialWorkDirRequirement setup to make sure that there are no
@@ -1227,6 +1210,7 @@ def toil_make_tool(
 # URI instead of raising an error right away, in case it is optional.
 MISSING_FILE = "missing://"
 
+
 class ToilFsAccess(StdFsAccess):
     """
     Custom filesystem access class which handles toil filestore references.
@@ -1240,7 +1224,7 @@ class ToilFsAccess(StdFsAccess):
     def __init__(
         self,
         basedir: str,
-        file_store: Optional[AbstractFileStore] = None,
+        file_store: AbstractFileStore | None = None,
     ) -> None:
         """Create a FsAccess object for the given Toil Filestore and basedir."""
         self.file_store = file_store
@@ -1271,103 +1255,104 @@ class ToilFsAccess(StdFsAccess):
         # See: https://github.com/common-workflow-language/cwltool/blob/beab66d649dd3ee82a013322a5e830875e8556ba/cwltool/stdfsaccess.py#L43  # noqa B950
 
         parse = urlparse(path)
-        if parse.scheme == "toilfile":
-            # Is a Toil file
+        match parse.scheme:
+            case "toilfile":  # Is a Toil file
+                if self.file_store is None:
+                    raise RuntimeError("URL requires a file store: " + path)
 
-            if self.file_store is None:
-                raise RuntimeError("URL requires a file store: " + path)
-
-            destination = self.file_store.readGlobalFile(
-                FileID.unpack(path[len("toilfile:") :]), symlink=True
-            )
-            logger.debug("Downloaded %s to %s", path, destination)
-            if not os.path.exists(destination):
-                raise RuntimeError(
-                    f"{destination} does not exist after filestore read."
+                destination = self.file_store.readGlobalFile(
+                    FileID.unpack(path[len("toilfile:") :]), symlink=True
                 )
-        elif parse.scheme == "toildir":
-            # Is a directory or relative to it
-
-            if self.file_store is None:
-                raise RuntimeError("URL requires a file store: " + path)
-
-            # We will download the whole directory and then look inside it
-
-            # Decode its contents, the path inside it to the file (if any), and
-            # the key to use for caching the directory.
-            contents, subpath, cache_key, _, _ = decode_directory(path)
-            logger.debug("Decoded directory contents: %s", contents)
-
-            if cache_key not in self.dir_to_download:
-                # Download to a temp directory.
-                temp_dir = self.file_store.getLocalTempDir()
-                temp_dir += "/toildownload"
-                os.makedirs(temp_dir)
-
-                logger.debug("ToilFsAccess downloading %s to %s", cache_key, temp_dir)
-
-                # Save it all into this new temp directory.
-                # Guaranteed to fill it with real files and not symlinks.
-                download_structure(self.file_store, {}, {}, contents, temp_dir)
-
-                # Make sure we use the same temp directory if we go traversing
-                # around this thing.
-                self.dir_to_download[cache_key] = temp_dir
-            else:
-                logger.debug("ToilFsAccess already has %s", cache_key)
-
-            if subpath is None:
-                # We didn't have any subdirectory, so just give back
-                # the path to the root
-                destination = self.dir_to_download[cache_key]
-            else:
-                # Navigate to the right subdirectory
-                destination = self.dir_to_download[cache_key] + "/" + subpath
-        elif parse.scheme == "file":
-            # This is a File URL. Decode it to an actual path.
-            destination = unquote(parse.path)
-        elif parse.scheme == "":
-            # This is just a local file and not a URL
-            destination = path
-        else:
-            # The destination is something else.
-            if URLAccess.get_is_directory(path):
-                # Treat this as a directory
-                if path not in self.dir_to_download:
-                    logger.debug(
-                        "ToilFsAccess fetching directory %s from a JobStore", path
+                logger.debug("Downloaded %s to %s", path, destination)
+                if not os.path.exists(destination):
+                    raise RuntimeError(
+                        f"{destination} does not exist after filestore read."
                     )
-                    dest_dir = mkdtemp()
+            case "toildir":  # Is a directory or relative to it
+                if self.file_store is None:
+                    raise RuntimeError("URL requires a file store: " + path)
 
-                    # Recursively fetch all the files in the directory.
-                    def download_to(url: str, dest: str) -> None:
-                        if URLAccess.get_is_directory(url):
-                            os.mkdir(dest)
-                            for part in URLAccess.list_url(url):
-                                download_to(
-                                    os.path.join(url, part), os.path.join(dest, part)
-                                )
-                        else:
-                            URLAccess.read_from_url(url, open(dest, "wb"))
+                # We will download the whole directory and then look inside it
 
-                    download_to(path, dest_dir)
-                    self.dir_to_download[path] = dest_dir
+                # Decode its contents, the path inside it to the file (if any), and
+                # the key to use for caching the directory.
+                contents, subpath, cache_key, _, _ = decode_directory(path)
+                logger.debug("Decoded directory contents: %s", contents)
 
-                destination = self.dir_to_download[path]
-            else:
-                # Treat this as a file.
-                if path not in self.dir_to_download:
-                    logger.debug("ToilFsAccess fetching file %s from a JobStore", path)
-                    # Try to grab it with a jobstore implementation, and save it
-                    # somewhere arbitrary.
-                    dest_file = NamedTemporaryFile(delete=False)
-                    URLAccess.read_from_url(path, dest_file)
-                    dest_file.close()
-                    self.dir_to_download[path] = dest_file.name
-                destination = self.dir_to_download[path]
-            logger.debug(
-                "ToilFsAccess has JobStore-supported URL %s at %s", path, destination
-            )
+                if cache_key not in self.dir_to_download:
+                    # Download to a temp directory.
+                    temp_dir = self.file_store.getLocalTempDir()
+                    temp_dir += "/toildownload"
+                    os.makedirs(temp_dir)
+
+                    logger.debug(
+                        "ToilFsAccess downloading %s to %s", cache_key, temp_dir
+                    )
+
+                    # Save it all into this new temp directory.
+                    # Guaranteed to fill it with real files and not symlinks.
+                    download_structure(self.file_store, {}, {}, contents, temp_dir)
+
+                    # Make sure we use the same temp directory if we go traversing
+                    # around this thing.
+                    self.dir_to_download[cache_key] = temp_dir
+                else:
+                    logger.debug("ToilFsAccess already has %s", cache_key)
+
+                if subpath is None:
+                    # We didn't have any subdirectory, so just give back
+                    # the path to the root
+                    destination = self.dir_to_download[cache_key]
+                else:
+                    # Navigate to the right subdirectory
+                    destination = self.dir_to_download[cache_key] + "/" + subpath
+            case "file":  # This is a File URL. Decode it to an actual path.
+                destination = unquote(parse.path)
+            case "":  # This is just a local file and not a URL
+                destination = path
+            case _:  # The destination is something else.
+                if URLAccess.get_is_directory(path):
+                    # Treat this as a directory
+                    if path not in self.dir_to_download:
+                        logger.debug(
+                            "ToilFsAccess fetching directory %s from a JobStore", path
+                        )
+                        dest_dir = mkdtemp()
+
+                        # Recursively fetch all the files in the directory.
+                        def download_to(url: str, dest: str) -> None:
+                            if URLAccess.get_is_directory(url):
+                                os.mkdir(dest)
+                                for part in URLAccess.list_url(url):
+                                    download_to(
+                                        os.path.join(url, part),
+                                        os.path.join(dest, part),
+                                    )
+                            else:
+                                URLAccess.read_from_url(url, open(dest, "wb"))
+
+                        download_to(path, dest_dir)
+                        self.dir_to_download[path] = dest_dir
+
+                    destination = self.dir_to_download[path]
+                else:
+                    # Treat this as a file.
+                    if path not in self.dir_to_download:
+                        logger.debug(
+                            "ToilFsAccess fetching file %s from a JobStore", path
+                        )
+                        # Try to grab it with a jobstore implementation, and save it
+                        # somewhere arbitrary.
+                        dest_file = NamedTemporaryFile(delete=False)
+                        URLAccess.read_from_url(path, dest_file)
+                        dest_file.close()
+                        self.dir_to_download[path] = dest_file.name
+                    destination = self.dir_to_download[path]
+                logger.debug(
+                    "ToilFsAccess has JobStore-supported URL %s at %s",
+                    path,
+                    destination,
+                )
 
         # Now destination is a local file, so make sure we really do have an
         # absolute path
@@ -1376,14 +1361,15 @@ class ToilFsAccess(StdFsAccess):
 
     def glob(self, pattern: str) -> list[str]:
         parse = urlparse(pattern)
-        if parse.scheme == "file":
-            pattern = os.path.abspath(unquote(parse.path))
-        elif parse.scheme == "":
-            pattern = os.path.abspath(pattern)
-        else:
-            raise RuntimeError(
-                f"Cannot efficiently support globbing on {parse.scheme} URIs"
-            )
+        match parse.scheme:
+            case "file":
+                pattern = os.path.abspath(unquote(parse.path))
+            case "":
+                pattern = os.path.abspath(pattern)
+            case _:
+                raise RuntimeError(
+                    f"Cannot efficiently support globbing on {parse.scheme} URIs"
+                )
 
         # Actually do the glob
         return [schema_salad.ref_resolver.file_uri(f) for f in glob.glob(pattern)]
@@ -1393,144 +1379,142 @@ class ToilFsAccess(StdFsAccess):
             raise RuntimeError(f"Mode {mode} for opening {fn} involves writing")
 
         parse = urlparse(fn)
-        if parse.scheme in ["", "file"]:
-            # Handle local files
-            return open(self._abs(fn), mode)
-        elif parse.scheme == "toildir":
-            contents, subpath, cache_key, _, _ = decode_directory(fn)
-            if cache_key in self.dir_to_download:
-                # This is already available locally, so fall back on the local copy
+        match parse.scheme:
+            case "" | "file":
+                # Handle local files
                 return open(self._abs(fn), mode)
-            else:
-                # We need to get the URI out of the virtual directory
-                if subpath is None:
-                    raise RuntimeError(f"{fn} is a toildir directory")
-                uri = get_from_structure(contents, subpath)
-                if not isinstance(uri, str):
-                    raise RuntimeError(f"{fn} does not point to a file")
-                # Recurse on that URI
-                return self.open(uri, mode)
-        elif parse.scheme == "toilfile":
-            if self.file_store is None:
-                raise RuntimeError("URL requires a file store: " + fn)
-            # Streaming access to Toil file store files requires being inside a
-            # context manager, which we can't require. So we need to download
-            # the file.
-            return open(self._abs(fn), mode)
+            case "toildir":
+                contents, subpath, cache_key, _, _ = decode_directory(fn)
+                if cache_key in self.dir_to_download:
+                    # This is already available locally, so fall back on the local copy
+                    return open(self._abs(fn), mode)
+                else:
+                    # We need to get the URI out of the virtual directory
+                    if subpath is None:
+                        raise RuntimeError(f"{fn} is a toildir directory")
+                    uri = get_from_structure(contents, subpath)
+                    if not isinstance(uri, str):
+                        raise RuntimeError(f"{fn} does not point to a file")
+                    # Recurse on that URI
+                    return self.open(uri, mode)
+            case "toilfile":
+                if self.file_store is None:
+                    raise RuntimeError("URL requires a file store: " + fn)
+                # Streaming access to Toil file store files requires being inside a
+                # context manager, which we can't require. So we need to download
+                # the file.
+                return open(self._abs(fn), mode)
+        # This should be supported by a job store.
+        byte_stream = URLAccess.open_url(fn)
+        if "b" in mode:
+            # Pass stream along in binary
+            return byte_stream
         else:
-            # This should be supported by a job store.
-            byte_stream = URLAccess.open_url(fn)
-            if "b" in mode:
-                # Pass stream along in binary
-                return byte_stream
-            else:
-                # Wrap it in a text decoder
-                return io.TextIOWrapper(byte_stream, encoding="utf-8")
+            # Wrap it in a text decoder
+            return io.TextIOWrapper(byte_stream, encoding="utf-8")
 
     def exists(self, path: str) -> bool:
         """Test for file existence."""
         parse = urlparse(path)
-        if parse.scheme in ["", "file"]:
-            # Handle local files
-            # toil's _abs() throws errors when files are not found and cwltool's _abs() does not
-            try:
-                return os.path.exists(self._abs(path))
-            except NoSuchFileException:
-                return False
-        elif parse.scheme == "toildir":
-            contents, subpath, cache_key, _, _ = decode_directory(path)
-            if subpath is None:
-                # The toildir directory itself exists
+        match parse.scheme:
+            case "" | "file":  # Handle local files
+                # toil's _abs() throws errors when files are not found and cwltool's _abs() does not
+                try:
+                    return os.path.exists(self._abs(path))
+                except NoSuchFileException:
+                    return False
+            case "toildir":
+                contents, subpath, cache_key, _, _ = decode_directory(path)
+                if subpath is None:
+                    # The toildir directory itself exists
+                    return True
+                uri = get_from_structure(contents, subpath)
+                if uri is None:
+                    # It's not in the virtual directory, so it doesn't exist
+                    return False
+                if isinstance(uri, dict):
+                    # Actually it's a subdirectory, so it exists.
+                    return True
+                # We recurse and poll the URI directly to make sure it really exists
+                return self.exists(uri)
+            case "toilfile":
+                # TODO: we assume CWL can't call deleteGlobalFile and so the file always exists
                 return True
-            uri = get_from_structure(contents, subpath)
-            if uri is None:
-                # It's not in the virtual directory, so it doesn't exist
-                return False
-            if isinstance(uri, dict):
-                # Actually it's a subdirectory, so it exists.
-                return True
-            # We recurse and poll the URI directly to make sure it really exists
-            return self.exists(uri)
-        elif parse.scheme == "toilfile":
-            # TODO: we assume CWL can't call deleteGlobalFile and so the file always exists
-            return True
-        else:
-            # This should be supported by a job store.
-            return URLAccess.url_exists(path)
+        return URLAccess.url_exists(path)  # This should be supported by a job store.
 
     def size(self, path: str) -> int:
         parse = urlparse(path)
-        if parse.scheme in ["", "file"]:
-            return os.stat(self._abs(path)).st_size
-        elif parse.scheme == "toildir":
-            # Decode its contents, the path inside it to the file (if any), and
-            # the key to use for caching the directory.
-            contents, subpath, cache_key, _, _ = decode_directory(path)
+        match parse.scheme:
+            case "" | "file":
+                return os.stat(self._abs(path)).st_size
+            case "toildir":
+                # Decode its contents, the path inside it to the file (if any), and
+                # the key to use for caching the directory.
+                contents, subpath, cache_key, _, _ = decode_directory(path)
 
-            # We can't get the size of just a directory.
-            if subpath is None:
-                raise RuntimeError(f"Attempted to check size of directory {path}")
+                # We can't get the size of just a directory.
+                if subpath is None:
+                    raise RuntimeError(f"Attempted to check size of directory {path}")
 
-            uri = get_from_structure(contents, subpath)
+                uri = get_from_structure(contents, subpath)
 
-            # We ought to end up with a URI.
-            if not isinstance(uri, str):
-                raise RuntimeError(f"Did not find a file at {path}")
-            return self.size(uri)
-        elif parse.scheme == "toilfile":
-            if self.file_store is None:
-                raise RuntimeError("URL requires a file store: " + path)
-            return self.file_store.getGlobalFileSize(
-                FileID.unpack(path[len("toilfile:") :])
-            )
-        else:
-            # This should be supported by a job store.
-            size = URLAccess.get_size(path)
-            if size is None:
-                # get_size can be unimplemented or unavailable
-                raise RuntimeError(f"Could not get size of {path}")
-            return size
+                # We ought to end up with a URI.
+                if not isinstance(uri, str):
+                    raise RuntimeError(f"Did not find a file at {path}")
+                return self.size(uri)
+            case "toilfile":
+                if self.file_store is None:
+                    raise RuntimeError("URL requires a file store: " + path)
+                return self.file_store.getGlobalFileSize(
+                    FileID.unpack(path[len("toilfile:") :])
+                )
+        # This should be supported by a job store.
+        size = URLAccess.get_size(path)
+        if size is None:
+            # get_size can be unimplemented or unavailable
+            raise RuntimeError(f"Could not get size of {path}")
+        return size
 
     def isfile(self, fn: str) -> bool:
         parse = urlparse(fn)
-        if parse.scheme in ["file", ""]:
-            return os.path.isfile(self._abs(fn))
-        elif parse.scheme == "toilfile":
-            # TODO: we assume CWL can't call deleteGlobalFile and so the file always exists
-            return True
-        elif parse.scheme == "toildir":
-            contents, subpath, cache_key, _, _ = decode_directory(fn)
-            if subpath is None:
-                # This is the toildir directory itself
-                return False
-            found = get_from_structure(contents, subpath)
-            # If we find a string, that's a file
-            # TODO: we assume CWL can't call deleteGlobalFile and so the file always exists
-            return isinstance(found, str)
-        else:
-            return self.exists(fn) and not URLAccess.get_is_directory(fn)
+        match parse.scheme:
+            case "file" | "":
+                return os.path.isfile(self._abs(fn))
+            case "toilfile":
+                # TODO: we assume CWL can't call deleteGlobalFile and so the file always exists
+                return True
+            case "toildir":
+                contents, subpath, cache_key, _, _ = decode_directory(fn)
+                if subpath is None:
+                    # This is the toildir directory itself
+                    return False
+                found = get_from_structure(contents, subpath)
+                # If we find a string, that's a file
+                # TODO: we assume CWL can't call deleteGlobalFile and so the file always exists
+                return isinstance(found, str)
+        return self.exists(fn) and not URLAccess.get_is_directory(fn)
 
     def isdir(self, fn: str) -> bool:
         logger.debug("ToilFsAccess checking type of %s", fn)
         parse = urlparse(fn)
-        if parse.scheme in ["file", ""]:
-            return os.path.isdir(self._abs(fn))
-        elif parse.scheme == "toilfile":
-            return False
-        elif parse.scheme == "toildir":
-            contents, subpath, cache_key, _, _ = decode_directory(fn)
-            if subpath is None:
-                # This is the toildir directory itself.
+        match parse.scheme:
+            case "file" | "":
+                return os.path.isdir(self._abs(fn))
+            case "toilfile":
+                return False
+            case "toildir":
+                contents, subpath, cache_key, _, _ = decode_directory(fn)
+                if subpath is None:
+                    # This is the toildir directory itself.
+                    # TODO: We assume directories can't be deleted.
+                    return True
+                found = get_from_structure(contents, subpath)
+                # If we find a dict, that's a directory.
                 # TODO: We assume directories can't be deleted.
-                return True
-            found = get_from_structure(contents, subpath)
-            # If we find a dict, that's a directory.
-            # TODO: We assume directories can't be deleted.
-            return isinstance(found, dict)
-        else:
-            status = URLAccess.get_is_directory(fn)
-            logger.debug("AbstractJobStore said: %s", status)
-            return status
+                return isinstance(found, dict)
+        status = URLAccess.get_is_directory(fn)
+        logger.debug("AbstractJobStore said: %s", status)
+        return status
 
     def listdir(self, fn: str) -> list[str]:
         # This needs to return full URLs for everything in the directory.
@@ -1538,32 +1522,29 @@ class ToilFsAccess(StdFsAccess):
         logger.debug("ToilFsAccess listing %s", fn)
 
         parse = urlparse(fn)
-        if parse.scheme in ["file", ""]:
-            # Find the local path
-            directory = self._abs(fn)
-            # Now list it (it is probably a directory)
-            return [abspath(quote(entry), fn) for entry in os.listdir(directory)]
-        elif parse.scheme == "toilfile":
-            raise RuntimeError(f"Cannot list a file: {fn}")
-        elif parse.scheme == "toildir":
-            contents, subpath, cache_key, _, _ = decode_directory(fn)
-            here = contents
-            if subpath is not None:
-                got = get_from_structure(contents, subpath)
-                if got is None:
-                    raise RuntimeError(f"Cannot list nonexistent directory: {fn}")
-                if isinstance(got, str):
-                    raise RuntimeError(
-                        f"Cannot list file or dubdirectory of a file: {fn}"
-                    )
-                here = got
-            # List all the things in here and make full URIs to them
-            return [os.path.join(fn, k) for k in here.keys()]
-        else:
-            return [
-                os.path.join(fn, entry.rstrip("/"))
-                for entry in URLAccess.list_url(fn)
-            ]
+        match parse.scheme:
+            case "file" | "":
+                # Find the local path
+                directory = self._abs(fn)
+                # Now list it (it is probably a directory)
+                return [abspath(quote(entry), fn) for entry in os.listdir(directory)]
+            case "toilfile":
+                raise RuntimeError(f"Cannot list a file: {fn}")
+            case "toildir":
+                contents, subpath, cache_key, _, _ = decode_directory(fn)
+                here = contents
+                if subpath is not None:
+                    got = get_from_structure(contents, subpath)
+                    if got is None:
+                        raise RuntimeError(f"Cannot list nonexistent directory: {fn}")
+                    if isinstance(got, str):
+                        raise RuntimeError(
+                            f"Cannot list file or dubdirectory of a file: {fn}"
+                        )
+                    here = got
+                # List all the things in here and make full URIs to them
+                return [os.path.join(fn, k) for k in here.keys()]
+        return [os.path.join(fn, entry.rstrip("/")) for entry in URLAccess.list_url(fn)]
 
     def join(self, path: str, *paths: str) -> str:
         # This falls back on os.path.join
@@ -1583,7 +1564,7 @@ def toil_get_file(
     uri: str,
     streamable: bool = False,
     streaming_allowed: bool = True,
-    pipe_threads: Optional[list[tuple[Thread, int]]] = None,
+    pipe_threads: list[tuple[Thread, int]] | None = None,
 ) -> str:
     """
     Set up the given file or directory from the Toil jobstore at a file URI
@@ -1725,21 +1706,31 @@ def toil_get_file(
         return schema_salad.ref_resolver.file_uri(src_path)
 
 
-def convert_file_uri_to_toil_uri(
-    applyFunc: Callable[[str], FileID],
+def import_file_through_cache(
+    import_func: Callable[[str], FileID],
     index: dict[str, str],
     existing: dict[str, str],
     file_uri: str,
 ) -> str:
     """
-    Given a file URI, convert it to a toil file URI. Uses applyFunc to handle the conversion.
+    Given a file URI, convert it to a toil file URI using the given caches.
 
-    Runs once on every unique file URI.
+    Uses import_func to do any required new imports. Runs import_func once on
+    every unique URI for a given set of caches.
 
-    'existing' is a set of files retrieved as inputs from toil_get_file. This
-    ensures they are mapped back as the same name if passed through.
+    :param index: Mapping from file URI to imported Toil URI.
 
-    Returns a toil uri path to the object.
+    :param existing: Reverse mapping from imported Toil URI or other remote URI
+        to file URI or local path. Allows integration with toil_get_file so
+        that a URI downloaded to a local file by get_toil_file will re-import
+        back to the same original URI.
+
+    :param file_uri: URI to the file to import. Not necessarily a file:// URI.
+
+    :raises FileNotFoundError: if the input RUI is a MISSING_FILE URI.
+
+    :returns: A toilfile: URI (or passed-through _: or toildir: URI) to the
+        imported file.
     """
     # Toil fileStore reference
     if file_uri.startswith("toilfile:") or file_uri.startswith("toildir:"):
@@ -1755,7 +1746,8 @@ def convert_file_uri_to_toil_uri(
         file_uri = existing.get(file_uri, file_uri)
         if file_uri not in index:
             try:
-                index[file_uri] = "toilfile:" + applyFunc(file_uri).pack()
+                index[file_uri] = "toilfile:" + import_func(file_uri).pack()
+                # TODO: Won't this put URIs in existing that toil_get_file() will expect to be local paths?
                 existing[index[file_uri]] = file_uri
             except Exception as e:
                 logger.error("Got exception '%s' while copying '%s'", e, file_uri)
@@ -1775,28 +1767,40 @@ def path_to_loc(obj: CWLObjectType) -> None:
 
 
 def extract_file_uri_once(
+    file_metadata: CWLFileType,
     fileindex: dict[str, str],
-    existing: dict[str, str],
-    file_metadata: CWLObjectType,
     mark_broken: bool = False,
     skip_remote: bool = False,
-) -> Optional[str]:
+) -> str | None:
     """
-    Extract the filename from a CWL file record.
+    Extract the filename that needs to be downloaded from a CWL file record.
 
-    This function matches the predefined function signature in visit_files, which ensures
-    that this function is called on all files inside a CWL object.
+    Updates the FileMetadata.
 
-    Ensures no duplicate files are returned according to fileindex. If a file has not been resolved already (and had file:// prepended)
-    then resolve symlinks.
-    :param fileindex: Forward mapping of filename
-    :param existing: Reverse mapping of filename. This function does not use this
-    :param file_metadata: CWL file record
-    :param mark_broken: Whether files should be marked as missing
-    :param skip_remote: Whether to skip remote files
-    :return:
+    This function matches the predefined function signature in visit_files,
+    which should be used to run it for all files inside a CWL object.
+
+    Ensures no duplicate files are returned according to fileindex. If a file
+    has not been resolved already (and had file:// prepended) then resolve
+    symlinks.
+
+    :param file_metadata: CWL file record to operate on.
+
+    :param fileindex: Forward mapping of filename to downloaded file path. If
+        the file's location already appears here, uses the cached value and
+        returns None.
+
+    :param mark_broken: If True, when files can't be imported because they e.g.
+        don't exist, set their locations to MISSING_FILE rather than failing
+        with an error.
+
+    :param skp_remote: If True, return None for remote URIs.
+
+    :return: The URI or local file path that needs to be dowlnoaded for this
+        file, given the ones already scheduled to be downloaded in existing and
+        the settings passed about what files need to be downloaded.
     """
-    location = cast(str, file_metadata["location"])
+    location = file_metadata["location"]
     if (
         location.startswith("toilfile:")
         or location.startswith("toildir:")
@@ -1808,18 +1812,30 @@ def extract_file_uri_once(
         return None
     if not location and file_metadata["path"]:
         file_metadata["location"] = location = schema_salad.ref_resolver.file_uri(
-            cast(str, file_metadata["path"])
+            file_metadata["path"]
         )
-    if location.startswith("file://") and not os.path.isfile(
-        schema_salad.ref_resolver.uri_file_path(location)
-    ):
-        if mark_broken:
-            logger.debug("File %s is missing", file_metadata)
-            file_metadata["location"] = location = MISSING_FILE + location
-        else:
+    if location.startswith("file://"):
+        file_path = schema_salad.ref_resolver.uri_file_path(location)
+        if not os.path.exists(file_path):
+            if mark_broken:
+                logger.debug("File %s is missing", file_metadata)
+                file_metadata["location"] = location = MISSING_FILE + location
+            else:
+                raise cwl_utils.errors.WorkflowException(
+                    "File is missing: %s" % file_metadata
+                )
+        elif os.path.isdir(file_path):
             raise cwl_utils.errors.WorkflowException(
-                "File is missing: %s" % file_metadata
+                f"Cannot import directory as a file: {file_path}"
             )
+        elif not os.path.isfile(file_path):
+            # It exists but is not a regular file or directory
+            # Allow /dev/null specifically as it's safe to read (returns EOF immediately)
+            if file_path != "/dev/null":
+                raise cwl_utils.errors.WorkflowException(
+                    f"Cannot import {file_path} as a file: not a regular file. "
+                    f"Only regular files and /dev/null are supported."
+                )
     if location.startswith("file://") or not skip_remote:
         # This is a local file or a remote file
         if location not in fileindex:
@@ -1840,25 +1856,29 @@ def extract_file_uri_once(
 V = TypeVar("V", covariant=True)
 
 
-class VisitFunc(Protocol[V]):
+class FileVisitFunc(Protocol[V]):
     def __call__(
         self,
-        fileindex: dict[str, str],
-        existing: dict[str, str],
-        file_metadata: CWLObjectType,
-        mark_broken: bool,
-        skip_remote: bool,
+        file_metadata: CWLFileType,
     ) -> V: ...
 
 
+class DirectoryVisitFunc(Protocol[V]):
+    def __call__(
+        self,
+        directory_metadata: CWLDirectoryType,
+        directory_contents: DirectoryContents,
+    ) -> V: ...
+
+
+V2 = TypeVar("V2", covariant=True)
+
+
 def visit_files(
-    func: VisitFunc[V],
+    file_func: FileVisitFunc[V],
+    directory_func: DirectoryVisitFunc[V2],
     fs_access: StdFsAccess,
-    fileindex: dict[str, str],
-    existing: dict[str, str],
-    cwl_object: Optional[CWLObjectType],
-    mark_broken: bool = False,
-    skip_remote: bool = False,
+    cwl_object: CWLObjectType | None,
     bypass_file_store: bool = False,
 ) -> list[V]:
     """
@@ -1880,37 +1900,38 @@ def visit_files(
 
     Also does some miscellaneous normalization.
 
-    :param import_function: The function used to upload a URI and get a
-        Toil FileID for it.
+    :param file_func: Function to run on each file's URI. This might
+        do something like uploading a URI and filling in the file's location
+        and/or returning an uploaded FileID. Any return values are aggregated
+        and returned.
+
+    :param directory_func: Function to run on each directory's contents. This
+        might fill in the directory's location based on its already-processed
+        contents. Any return values are ignored.
 
     :param fs_access: the CWL FS access object we use to access the filesystem
         to find files to import. Needs to support the URI schemes used.
 
-    :param fileindex: Forward map to fill in from file URI to Toil storage
-        location, used by write_file to deduplicate writes.
-
-    :param existing: Reverse map to fill in from Toil storage location to file
-        URI. Not read from.
-
     :param cwl_object: CWL tool (or workflow order) we are importing files for
 
-    :param mark_broken: If True, when files can't be imported because they e.g.
-        don't exist, set their locations to MISSING_FILE rather than failing
-        with an error.
-
-    :param skp_remote: If True, leave remote URIs in place instead of importing
-        files.
-
-    :param bypass_file_store: If True, leave file:// URIs in place instead of
+    :param bypass_file_store: If True, only do the normalization, and don't
+        actually visit. This will leave file:// URIs in place instead of
         importing files and directories.
 
     :param log_level: Log imported files at the given level.
+
+    :returns: A list of all return values from file_func calls.
     """
+    # TODO: This function used to be very specific to coordinating the actual
+    # upload of all the files, and has only been half-converted to a more
+    # generic scan. Some of the comments and structure only make sense in its
+    # original application.
+
     func_return: list[Any] = list()
     tool_id = cwl_object.get("id", str(cwl_object)) if cwl_object else ""
 
-    logger.debug("Importing files for %s", tool_id)
-    logger.debug("Importing files in %s", cwl_object)
+    logger.debug("Visiting files for %s", tool_id)
+    logger.debug("Visiting files in %s", cwl_object)
 
     # We need to upload all files to the Toil filestore, and encode structure
     # recursively into all Directories' locations. But we cannot safely alter
@@ -1934,8 +1955,8 @@ def visit_files(
     # Otherwise we actually want to put the things in the file store.
 
     def visit_file_or_directory_down(
-        rec: CWLObjectType,
-    ) -> Optional[list[CWLObjectType]]:
+        rec: CWLFileType | CWLDirectoryType,
+    ) -> MutableSequence[CWLFileType | CWLDirectoryType] | None:
         """
         Visit each CWL File or Directory on the way down.
 
@@ -1957,14 +1978,14 @@ def visit_files(
         if rec.get("class", None) == "File":
             # Nothing to do!
             return None
-        elif rec.get("class", None) == "Directory":
+        elif is_directory(rec):
             # Check the original listing for collisions
-            ensure_no_collisions(cast(DirectoryType, rec))
+            ensure_no_collisions(rec)
 
             # Pull out the old listing, if any
-            old_listing = cast(Optional[list[CWLObjectType]], rec.get("listing", None))
+            old_listing = rec.get("listing", None)
 
-            if not cast(str, rec["location"]).startswith("_:"):
+            if not rec["location"].startswith("_:"):
                 # This is a thing we can list and not just a literal, so we
                 # want to ensure that we have at least one level of listing.
                 if "listing" in rec and rec["listing"] == []:
@@ -1977,14 +1998,14 @@ def visit_files(
                 # its original File objects that we need to process)
 
                 # Check the new listing for collisions
-                ensure_no_collisions(cast(DirectoryType, rec))
+                ensure_no_collisions(rec)
 
             return old_listing
         return None
 
     def visit_file_or_directory_up(
-        rec: CWLObjectType,
-        down_result: Optional[list[CWLObjectType]],
+        rec: CWLFileType | CWLDirectoryType,
+        down_result: MutableSequence[CWLFileType | CWLDirectoryType] | None,
         child_results: list[DirectoryContents],
     ) -> DirectoryContents:
         """
@@ -2003,23 +2024,18 @@ def visit_files(
         contained similar dict for a subdirectory. We can reduce by joining
         everything into a single dict, when no filenames conflict.
         """
-        if rec.get("class", None) == "File":
+        if is_file(rec):
             # This is a CWL File
 
+            # We want to track it and any of its associated secondary files in
+            # this pseudo-Directory.
             result: DirectoryContents = {}
-            # Run a function on the file and store the return
-            func_return.append(
-                func(
-                    fileindex,
-                    existing,
-                    rec,
-                    mark_broken=mark_broken,
-                    skip_remote=skip_remote,
-                )
-            )
+
+            # Run the vsitor function on the file and store the return
+            func_return.append(file_func(rec))
 
             # Make a record for this file under its name
-            result[cast(str, rec["basename"])] = cast(str, rec["location"])
+            result[rec["basename"]] = rec["location"]
 
             for secondary_file_result in child_results:
                 # Glom in the secondary files, if any
@@ -2027,13 +2043,14 @@ def visit_files(
 
             return result
 
-        elif rec.get("class", None) == "Directory":
+        elif is_directory(rec):
             # This is a CWL Directory
 
-            # Restore the original listing, or its absence
-            rec["listing"] = cast(Optional[CWLOutputType], down_result)
-            if rec["listing"] is None:
+            # Restore the original listing, or its absenc
+            if down_result is None:
                 del rec["listing"]
+            else:
+                rec["listing"] = down_result
 
             # We know we have child results from a fully recursive listing.
             # Build them into a contents dict.
@@ -2043,11 +2060,11 @@ def visit_files(
                 # file under its name
                 contents.update(child_result)
 
-            # Upload the directory itself, which will adjust its location.
-            upload_directory(rec, contents, mark_broken=mark_broken)
+            # Visit the directory itself (which will probably adjust its location).
+            directory_func(rec, contents)
 
             # Show those contents as being under our name in our parent.
-            return {cast(str, rec["basename"]): contents}
+            return {rec["basename"]: contents}
 
         else:
             raise RuntimeError("Got unexpected class of object: " + str(rec))
@@ -2063,7 +2080,7 @@ def visit_files(
 
 
 def upload_directory(
-    directory_metadata: CWLObjectType,
+    directory_metadata: CWLDirectoryType,
     directory_contents: DirectoryContents,
     mark_broken: bool = False,
 ) -> None:
@@ -2085,7 +2102,7 @@ def upload_directory(
     tool, since some tools require it to be cleared or single-level but still
     expect to see its contents in the filesystem.
     """
-    location = cast(str, directory_metadata["location"])
+    location = directory_metadata["location"]
     if (
         location.startswith("toilfile:")
         or location.startswith("toildir:")
@@ -2095,7 +2112,7 @@ def upload_directory(
         return
     if not location and directory_metadata["path"]:
         location = directory_metadata["location"] = schema_salad.ref_resolver.file_uri(
-            cast(str, directory_metadata["path"])
+            directory_metadata["path"]
         )
     if location.startswith("file://") and not os.path.isdir(
         schema_salad.ref_resolver.uri_file_path(location)
@@ -2118,18 +2135,20 @@ def upload_directory(
     directory_metadata["location"] = encode_directory(directory_contents)
 
 
-def extract_and_convert_file_to_toil_uri(
-    convertfunc: Callable[[str], FileID],
+def ensure_file_imported(
+    import_func: Callable[[str], FileID],
+    file_metadata: CWLFileType,
     fileindex: dict[str, str],
     existing: dict[str, str],
-    file_metadata: CWLObjectType,
     mark_broken: bool = False,
     skip_remote: bool = False,
 ) -> None:
     """
     Extract the file URI out of a file object and convert it to a Toil URI.
 
-    Runs convertfunc on the file URI to handle conversion.
+    Stores the Toil URI in file_metadata.
+
+    Runs import_func to actually import new URIs.
 
     Is used to handle importing files into the jobstore.
 
@@ -2139,12 +2158,10 @@ def extract_and_convert_file_to_toil_uri(
     Unless skip_remote is set, also run on remote files and sets their locations
     to toil URIs as well.
     """
-    location = extract_file_uri_once(
-        fileindex, existing, file_metadata, mark_broken, skip_remote
-    )
+    location = extract_file_uri_once(file_metadata, fileindex, mark_broken, skip_remote)
     if location is not None:
-        file_metadata["location"] = convert_file_uri_to_toil_uri(
-            convertfunc, fileindex, existing, location
+        file_metadata["location"] = import_file_through_cache(
+            import_func, fileindex, existing, location
         )
 
     logger.debug("Sending file at: %s", file_metadata["location"])
@@ -2156,9 +2173,9 @@ def writeGlobalFileWrapper(file_store: AbstractFileStore, fileuri: str) -> FileI
     return file_store.writeGlobalFile(schema_salad.ref_resolver.uri_file_path(fileuri))
 
 
-def remove_empty_listings(rec: CWLObjectType) -> None:
+def remove_empty_listings(rec: CWLDirectoryType) -> None:
     if rec.get("class") != "Directory":
-        finddirs: list[CWLObjectType] = []
+        finddirs: list[CWLDirectoryType] = []
         visit_class(rec, ("Directory",), finddirs.append)
         for f in finddirs:
             remove_empty_listings(f)
@@ -2175,15 +2192,15 @@ class CWLNamedJob(Job):
 
     def __init__(
         self,
-        cores: Union[float, None] = 1,
-        memory: Union[int, str, None] = "1GiB",
-        disk: Union[int, str, None] = "1MiB",
-        accelerators: Optional[list[AcceleratorRequirement]] = None,
-        preemptible: Optional[bool] = None,
-        tool_id: Optional[str] = None,
-        parent_name: Optional[str] = None,
-        subjob_name: Optional[str] = None,
-        local: Optional[bool] = None,
+        cores: float | None = 1,
+        memory: int | str | None = "1GiB",
+        disk: int | str | None = "1MiB",
+        accelerators: list[AcceleratorRequirement] | None = None,
+        preemptible: bool | None = None,
+        tool_id: str | None = None,
+        parent_name: str | None = None,
+        subjob_name: str | None = None,
+        local: bool | None = None,
     ) -> None:
         """
         Make a new job and set up its requirements and naming.
@@ -2239,9 +2256,7 @@ class ResolveIndirect(CWLNamedJob):
     of actual values.
     """
 
-    def __init__(
-        self, cwljob: Promised[CWLObjectType], parent_name: Optional[str] = None
-    ):
+    def __init__(self, cwljob: Promised[CWLObjectType], parent_name: str | None = None):
         """Store the dictionary of promises for later resolution."""
         super().__init__(parent_name=parent_name, subjob_name="_resolve", local=True)
         self.cwljob = cwljob
@@ -2253,9 +2268,9 @@ class ResolveIndirect(CWLNamedJob):
 
 def toilStageFiles(
     toil: Toil,
-    cwljob: Union[CWLObjectType, list[CWLObjectType]],
+    cwljob: CWLObjectType | list[CWLObjectType],
     outdir: str,
-    destBucket: Union[str, None] = None,
+    destBucket: str | None = None,
     log_level: int = logging.DEBUG,
 ) -> None:
     """
@@ -2268,12 +2283,13 @@ def toilStageFiles(
     """
 
     def _collectDirEntries(
-        obj: Union[CWLObjectType, list[CWLObjectType]]
-    ) -> Iterator[CWLObjectType]:
+        obj: Any,
+    ) -> Iterator[CWLFileType | CWLDirectoryType]:
         if isinstance(obj, dict):
-            if obj.get("class") in ("File", "Directory"):
+            if is_file_or_directory(obj):
                 yield obj
-                yield from _collectDirEntries(obj.get("secondaryFiles", []))
+                if is_file(obj) and "secondaryFiles" in obj:
+                    yield from _collectDirEntries(obj["secondaryFiles"])
             else:
                 for sub_obj in obj.values():
                     yield from _collectDirEntries(sub_obj)
@@ -2414,9 +2430,11 @@ def toilStageFiles(
                     with open(p.target, "wb") as n:
                         n.write(p.resolved.encode("utf-8"))
 
-    def _check_adjust(f: CWLObjectType) -> CWLObjectType:
+    def _check_adjust(
+        f: CWLFileType | CWLDirectoryType,
+    ) -> CWLFileType | CWLDirectoryType:
         # Figure out where the path mapper put this
-        mapped_location: MapperEnt = pm.mapper(cast(str, f["location"]))
+        mapped_location: MapperEnt = pm.mapper(f["location"])
         if destBucket:
             # Make the location point to the destination bucket.
             # Reconstruct the path we exported to.
@@ -2430,7 +2448,7 @@ def toilStageFiles(
             f["location"] = schema_salad.ref_resolver.file_uri(mapped_location.target)
             f["path"] = mapped_location.target
 
-        if "contents" in f:
+        if is_file(f) and "contents" in f:
             del f["contents"]
         return f
 
@@ -2450,8 +2468,8 @@ class CWLJobWrapper(CWLNamedJob):
         tool: Process,
         cwljob: CWLObjectType,
         runtime_context: cwltool.context.RuntimeContext,
-        parent_name: Optional[str],
-        conditional: Union[Conditional, None] = None,
+        parent_name: str | None,
+        conditional: Conditional | None = None,
     ):
         """Store our context for later evaluation."""
         super().__init__(
@@ -2498,8 +2516,8 @@ class CWLJob(CWLNamedJob):
         tool: Process,
         cwljob: CWLObjectType,
         runtime_context: cwltool.context.RuntimeContext,
-        parent_name: Optional[str] = None,
-        conditional: Union[Conditional, None] = None,
+        parent_name: str | None = None,
+        conditional: Conditional | None = None,
     ):
         """Store the context for later execution."""
         self.cwltool = tool
@@ -2549,14 +2567,14 @@ class CWLJob(CWLNamedJob):
             else:
                 # We use a None requirement and the Toil default applies.
                 memory = None
-        
+
         # Imposing a minimum memory limit
         min_ram = getattr(runtime_context, "cwl_min_ram")
         if min_ram is not None and memory is not None:
             # Note: if the job is using the toil default memory, it won't be increased
             memory = max(memory, min_ram)
 
-        accelerators: Optional[list[AcceleratorRequirement]] = None
+        accelerators: list[AcceleratorRequirement] | None = None
         if req.get("cudaDeviceCount", 0) > 0:
             # There's a CUDARequirement, which cwltool processed for us
             # TODO: How is cwltool deciding what value to use between min and max?
@@ -2579,7 +2597,7 @@ class CWLJob(CWLNamedJob):
         # https://github.com/common-workflow-language/cwltool/blob/1573509eea2faa3cd1dc959224e52ff1d796d3eb/cwltool/extensions.yml#L221
         #
         # By default we have default preemptibility.
-        preemptible: Optional[bool] = None
+        preemptible: bool | None = None
         preemptible_req, _ = tool.get_requirement(
             "http://arvados.org/cwl#UsePreemptible"
         )
@@ -2780,6 +2798,12 @@ class CWLJob(CWLNamedJob):
                 get_file=getattr(runtime_context, "toil_get_file"),
                 streaming_allowed=runtime_context.streaming_allowed,
             )
+        else:
+            if runtime_context.outdir is not None:
+                # Multiple jobs may be racing to create the workflow outdir,
+                # and cwltool's creation code doesn't handle that, so create it
+                # now.
+                os.makedirs(runtime_context.outdir, exist_ok=True)
 
         # Collect standard output and standard error somewhere if they don't go to files.
         # We need to keep two FDs to these because cwltool will close what we give it.
@@ -2858,17 +2882,19 @@ class CWLJob(CWLNamedJob):
             logger.log(log_level, "Loading %s...", url)
             return writeGlobalFileWrapper(file_store, url)
 
-        file_upload_function = functools.partial(
-            extract_and_convert_file_to_toil_uri, file_import_function
+        file_visitor = functools.partial(
+            ensure_file_imported,
+            file_import_function,
+            fileindex=index,
+            existing=existing,
         )
 
         # Upload all the Files and set their and the Directories' locations, if
         # needed.
         visit_files(
-            file_upload_function,
+            file_visitor,
+            upload_directory,
             fs_access,
-            index,
-            existing,
             output,
             bypass_file_store=getattr(runtime_context, "bypass_file_store", False),
         )
@@ -2912,19 +2938,49 @@ def makeRootJob(
     :return:
     """
     if options.run_imports_on_workers:
-        filenames = extract_workflow_inputs(options, initialized_job_order, tool)
-        metadata = get_file_sizes(
-            filenames, toil._jobStore, include_remote_files=options.reference_inputs
+        input_filenames, tool_filenames = extract_workflow_inputs(
+            options, initialized_job_order, tool
+        )
+
+        # We need to import the tool files on the leader without symlinking,
+        # because they might not be available on shared storage.
+
+        # We need to make sure that if a workflow input and a tool input
+        # resolve to the same real file, it only gets imported once, without
+        # symlinking.
+
+        # Get metadata for non-tool input files
+        input_metadata = get_file_sizes(
+            input_filenames,
+            include_remote_files=options.reference_inputs,
+        )
+
+        # Also get metadata for tool input files, so we can resilve them to candidate URIs
+        tool_metadata = get_file_sizes(
+            input_filenames,
+            include_remote_files=options.reference_inputs,
+        )
+
+        # Import all the tool files right away, because a file that's both a
+        # tool file and an input needs to be imported without symlinking (since
+        # they might not be accessible from workers), and this builds the dict
+        # we can use to see if a resolved URI was a tool file.
+        logger.info("Importing tool-associated files...")
+        tool_path_to_fileid = WorkerImportJob.import_files(
+            tool_filenames, toil._jobStore, symlink=False
         )
 
         # Mapping of files to metadata for files that will be imported on the worker
-        # This will consist of files that we were able to get a file size for
+        # This will consist of input files that we were able to get a file size for
         worker_metadata: dict[str, FileMetadata] = dict()
-        # Mapping of files to metadata for files that will be imported on the leader
-        # This will consist of files that we were not able to get a file size for
-        leader_metadata = dict()
-        for filename, file_data in metadata.items():
-            if file_data[2] is None:  # size
+        # Mapping of files to metadata for input files that will be imported on the leader
+        # This will consist of input files that we were not able to get a file size for
+        leader_metadata: dict[str, FileMetadata] = dict()
+        for filename, file_data in input_metadata.items():
+            if file_data.source in tool_path_to_fileid:
+                # This input is also a tool file and is already imported.
+                continue
+            if file_data.size is None:
                 leader_metadata[filename] = file_data
             else:
                 worker_metadata[filename] = file_data
@@ -2935,20 +2991,32 @@ def makeRootJob(
                 len(worker_metadata),
             )
 
-        # import the files for the leader first
+        # Import other leader files (those without size info) with symlink=True
+        logger.info("Importing unknown-size files...")
         path_to_fileid = WorkerImportJob.import_files(
             list(leader_metadata.keys()), toil._jobStore
         )
+
+        # Combine leader imports
+        path_to_fileid.update(tool_path_to_fileid)
 
         # Because installing the imported files expects all files to have been
         # imported, we don't do that here; we combine the leader imports and
         # the worker imports and install them all at once.
 
         import_job = CWLImportWrapper(
-            initialized_job_order, tool, runtime_context, worker_metadata, path_to_fileid, options
+            initialized_job_order,
+            tool,
+            runtime_context,
+            worker_metadata,
+            path_to_fileid,
+            options,
         )
         return import_job
     else:
+        # Use a separate codepath to doa ll the imports on the leader.
+        # TODO: Can we combine the two codepaths and just do 0 worker imports
+        # in all-leader mode?
         import_workflow_inputs(
             toil._jobStore,
             options,
@@ -2966,13 +3034,13 @@ def makeJob(
     tool: Process,
     jobobj: CWLObjectType,
     runtime_context: cwltool.context.RuntimeContext,
-    parent_name: Optional[str],
-    conditional: Union[Conditional, None],
-) -> Union[
-    tuple["CWLWorkflow", ResolveIndirect],
-    tuple[CWLJob, CWLJob],
-    tuple[CWLJobWrapper, CWLJobWrapper],
-]:
+    parent_name: str | None,
+    conditional: Conditional | None,
+) -> (
+    tuple["CWLWorkflow", ResolveIndirect]
+    | tuple[CWLJob, CWLJob]
+    | tuple[CWLJobWrapper, CWLJobWrapper]
+):
     """
     Create the correct Toil Job object for the CWL tool.
 
@@ -3044,8 +3112,8 @@ class CWLScatter(Job):
         step: cwltool.workflow.WorkflowStep,
         cwljob: CWLObjectType,
         runtime_context: cwltool.context.RuntimeContext,
-        parent_name: Optional[str],
-        conditional: Union[Conditional, None],
+        parent_name: str | None,
+        conditional: Conditional | None,
     ):
         """Store our context for later execution."""
         super().__init__(cores=1, memory="1GiB", disk="1MiB", local=True)
@@ -3205,7 +3273,7 @@ class CWLGather(Job):
     def __init__(
         self,
         step: cwltool.workflow.WorkflowStep,
-        outputs: Promised[Union[CWLObjectType, list[CWLObjectType]]],
+        outputs: Promised[CWLObjectType | list[CWLObjectType]],
     ):
         """Collect our context for later gathering."""
         super().__init__(cores=1, memory="1GiB", disk="1MiB", local=True)
@@ -3214,8 +3282,8 @@ class CWLGather(Job):
 
     @staticmethod
     def extract(
-        obj: Union[CWLObjectType, list[CWLObjectType]], k: str
-    ) -> Union[CWLOutputType, list[CWLObjectType]]:
+        obj: CWLObjectType | list[CWLObjectType], k: str
+    ) -> CWLOutputType | list[CWLObjectType]:
         """
         Extract the given key from the obj.
 
@@ -3235,14 +3303,14 @@ class CWLGather(Job):
         """Gather all the outputs of the scatter."""
         outobj = {}
 
-        def sn(n: Union[Mapping[str, Any], str]) -> str:
+        def sn(n: Mapping[str, Any] | str) -> str:
             if isinstance(n, Mapping):
                 return shortname(n["id"])
             if isinstance(n, str):
                 return shortname(n)
 
         # TODO: MyPy can't understand that this is the type we should get by unwrapping the promise
-        outputs: Union[CWLObjectType, list[CWLObjectType]] = cast(
+        outputs: CWLObjectType | list[CWLObjectType] = cast(
             Union[CWLObjectType, list[CWLObjectType]], unwrap(self.outputs)
         )
         for k in [sn(i) for i in self.step.tool["out"]]:
@@ -3311,8 +3379,8 @@ class CWLWorkflow(CWLNamedJob):
         cwlwf: cwltool.workflow.Workflow,
         cwljob: CWLObjectType,
         runtime_context: cwltool.context.RuntimeContext,
-        parent_name: Optional[str] = None,
-        conditional: Union[Conditional, None] = None,
+        parent_name: str | None = None,
+        conditional: Conditional | None = None,
     ):
         """Gather our context for later execution."""
         super().__init__(
@@ -3325,7 +3393,7 @@ class CWLWorkflow(CWLNamedJob):
 
     def run(
         self, file_store: AbstractFileStore
-    ) -> Union[UnresolvedDict, dict[str, SkipNull]]:
+    ) -> UnresolvedDict | dict[str, SkipNull]:
         """
         Convert a CWL Workflow graph into a Toil job graph.
 
@@ -3376,7 +3444,7 @@ class CWLWorkflow(CWLNamedJob):
                     if stepinputs_fufilled:
                         logger.debug("Ready to make job for workflow step %s", step_id)
                         jobobj: dict[
-                            str, Union[ResolveSource, DefaultWithSource, StepValueFrom]
+                            str, ResolveSource | DefaultWithSource | StepValueFrom
                         ] = {}
 
                         for inp in step.tool["inputs"]:
@@ -3415,18 +3483,18 @@ class CWLWorkflow(CWLNamedJob):
                         )
 
                         if "scatter" in step.tool:
-                            wfjob: Union[
-                                CWLScatter, CWLWorkflow, CWLJob, CWLJobWrapper
-                            ] = CWLScatter(
-                                step,
-                                UnresolvedDict(jobobj),
-                                self.runtime_context,
-                                parent_name=parent_name,
-                                conditional=conditional,
+                            wfjob: CWLScatter | CWLWorkflow | CWLJob | CWLJobWrapper = (
+                                CWLScatter(
+                                    step,
+                                    UnresolvedDict(jobobj),
+                                    self.runtime_context,
+                                    parent_name=parent_name,
+                                    conditional=conditional,
+                                )
                             )
-                            followOn: Union[
-                                CWLGather, ResolveIndirect, CWLJob, CWLJobWrapper
-                            ] = CWLGather(step, wfjob.rv())
+                            followOn: (
+                                CWLGather | ResolveIndirect | CWLJob | CWLJobWrapper
+                            ) = CWLGather(step, wfjob.rv())
                             wfjob.addFollowOn(followOn)
                             logger.debug(
                                 "Is scatter with job %s and follow-on %s",
@@ -3517,7 +3585,10 @@ class CWLInstallImportsJob(Job):
         basedir: str,
         skip_remote: bool,
         bypass_file_store: bool,
-        import_data: list[Promised[dict[str, FileID]]],
+        leader_imports: dict[str, FileID],
+        worker_imports: None | (
+            Promised[tuple[dict[str, FileID], dict[str, FileMetadata]]]
+        ) = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -3526,7 +3597,9 @@ class CWLInstallImportsJob(Job):
 
         This class is only used when runImportsOnWorkers is enabled.
 
-        :param import_data: List of mappings from file URI to imported file ID.
+        :param leader_imports: Direct mapping from file URI to FileID for files imported on the leader.
+        :param worker_imports: Promise of (candidate_uri->FileID, filename->FileMetadata) tuple from worker imports.
+                              These two dicts must be used together for lookups.
         """
         super().__init__(local=True, **kwargs)
         self.initialized_job_order = initialized_job_order
@@ -3534,7 +3607,8 @@ class CWLInstallImportsJob(Job):
         self.basedir = basedir
         self.skip_remote = skip_remote
         self.bypass_file_store = bypass_file_store
-        self.import_data = import_data
+        self.leader_imports = leader_imports
+        self.worker_imports = worker_imports
 
     # TODO: Since we only call this from the class itself now it doesn't really
     # need to be static anymore.
@@ -3542,52 +3616,74 @@ class CWLInstallImportsJob(Job):
     def fill_in_files(
         initialized_job_order: CWLObjectType,
         tool: Process,
-        candidate_to_fileid: dict[str, FileID],
+        leader_imports: dict[str, FileID],
+        worker_candidate_to_fileid: dict[str, FileID] | None,
+        file_to_metadata: dict[str, FileMetadata] | None,
         basedir: str,
         skip_remote: bool,
         bypass_file_store: bool,
     ) -> tuple[Process, CWLObjectType]:
         """
-        Given a mapping of filenames to Toil file IDs, replace the filename with the file IDs throughout the CWL object.
+        Given mappings of filenames to Toil file IDs, replace the filename with
+            the file IDs throughout the CWL object.
+
+        :param leader_imports: Direct mapping from file URI to FileID for files
+            imported on the leader.
+        :param worker_candidate_to_fileid: Mapping from normalized candidate
+            URI to FileID for worker imports.
+        :param file_to_metadata: Mapping from original filename to FileMetadata (which contains
+             the normalized candidate URI in .source). Must be provided
+             together with worker_candidate_to_fileid.
         """
 
         def fill_in_file(filename: str) -> FileID:
             """
             Return the file name's associated Toil file ID
             """
-            try:
-                return candidate_to_fileid[filename]
-            except KeyError:
-                # Give something more useful than a KeyError if something went
-                # wrong with the importing.
-                raise RuntimeError(f"File at \"{filename}\" was never imported.")
+            # Try worker imports first
+            if (
+                worker_candidate_to_fileid is not None
+                and file_to_metadata is not None
+                and filename in file_to_metadata
+            ):
+                # Get the full candidate URI we used for this file
+                candidate_uri = file_to_metadata[filename].source
+                # Get the FIleID we got from that URI
+                return worker_candidate_to_fileid[candidate_uri]
 
-        file_convert_function = functools.partial(
-            extract_and_convert_file_to_toil_uri, fill_in_file
-        )
-        fs_access = ToilFsAccess(basedir)
+            # Fall back to direct lookup in leader imports
+            if filename in leader_imports:
+                return leader_imports[filename]
+
+            # If it wasn't imported on a worker or on the leader, it is missing.
+            raise RuntimeError(f'File at "{filename}" was never imported.')
+
         fileindex: dict[str, str] = {}
         existing: dict[str, str] = {}
-        visit_files(
-            file_convert_function,
-            fs_access,
-            fileindex,
-            existing,
-            initialized_job_order,
+        file_visitor = functools.partial(
+            ensure_file_imported,
+            fill_in_file,
+            fileindex=fileindex,
+            existing=existing,
             mark_broken=True,
             skip_remote=skip_remote,
+        )
+        directory_visitor = functools.partial(upload_directory, mark_broken=True)
+        fs_access = ToilFsAccess(basedir)
+        visit_files(
+            file_visitor,
+            directory_visitor,
+            fs_access,
+            initialized_job_order,
             bypass_file_store=bypass_file_store,
         )
         visitSteps(
             tool,
             functools.partial(
                 visit_files,
-                file_convert_function,
+                file_visitor,
+                directory_visitor,
                 fs_access,
-                fileindex,
-                existing,
-                mark_broken=True,
-                skip_remote=skip_remote,
                 bypass_file_store=bypass_file_store,
             ),
         )
@@ -3602,27 +3698,28 @@ class CWLInstallImportsJob(Job):
             rm_unprocessed_secondary_files(param_value)
         return tool, initialized_job_order
 
-    def run(self, file_store: AbstractFileStore) -> Tuple[Process, CWLObjectType]:
+    def run(self, file_store: AbstractFileStore) -> tuple[Process, CWLObjectType]:
         """
         Convert the filenames in the workflow inputs into the URIs
         :return: Promise of transformed workflow inputs. A tuple of the job order and process
         """
 
-        # Merge all the input dicts down to one to check.
-        candidate_to_fileid: dict[str, FileID] = {
-            k: v for mapping in unwrap(
-                self.import_data
-            ) for k, v in unwrap(mapping).items()
-        }
-
         initialized_job_order = unwrap(self.initialized_job_order)
         tool = unwrap(self.tool)
+
+        # Unpack worker imports if present
+        worker_candidate_to_fileid: dict[str, FileID] | None = None
+        file_to_metadata: dict[str, FileMetadata] | None = None
+        if self.worker_imports is not None:
+            worker_candidate_to_fileid, file_to_metadata = unwrap(self.worker_imports)
 
         # Install the imported files in the tool and job order
         return self.fill_in_files(
             initialized_job_order,
             tool,
-            candidate_to_fileid,
+            self.leader_imports,
+            worker_candidate_to_fileid,
+            file_to_metadata,
             self.basedir,
             self.skip_remote,
             self.bypass_file_store,
@@ -3677,7 +3774,8 @@ class CWLImportWrapper(CWLNamedJob):
             basedir=self.options.basedir,
             skip_remote=self.options.reference_inputs,
             bypass_file_store=self.options.bypass_file_store,
-            import_data=[self.imported_files, imports_job.rv(0)],
+            leader_imports=self.imported_files,
+            worker_imports=imports_job.rv(),
         )
         self.addChild(install_imports_job)
         imports_job.addFollowOn(install_imports_job)
@@ -3727,28 +3825,40 @@ class CWLStartJob(CWLNamedJob):
 
 def extract_workflow_inputs(
     options: Namespace, initialized_job_order: CWLObjectType, tool: Process
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     """
-    Collect all the workflow input files to import later.
+    Collect all the workflow input files and tool-associated files to import later.
+
+    Tool-associated files need to be imported without symlinks since they might be
+    coming from storage not accessible to all nodes.
+
     :param options: namespace
     :param initialized_job_order: cwl object
     :param tool: tool object
-    :return:
+    :return: tuple of (input_files, tool_files)
     """
     fileindex: dict[str, str] = {}
     existing: dict[str, str] = {}
 
+    # TODO: These visit passes do normalization, and when we install the
+    # imports we'll do the normakization again. We should refactor to just do
+    # the normalization once!
+
     # Extract out all the input files' filenames
     logger.info("Collecting input files...")
     fs_access = ToilFsAccess(options.basedir)
-    filenames = visit_files(
+    file_visitor = functools.partial(
         extract_file_uri_once,
-        fs_access,
-        fileindex,
-        existing,
-        initialized_job_order,
+        fileindex=fileindex,
         mark_broken=True,
         skip_remote=options.reference_inputs,
+    )
+    directory_visitor = functools.partial(upload_directory, mark_broken=True)
+    input_filenames = visit_files(
+        file_visitor,
+        directory_visitor,
+        fs_access,
+        initialized_job_order,
         bypass_file_store=options.bypass_file_store,
     )
     # Extract filenames of all the files associated with tools (binaries, etc.).
@@ -3757,17 +3867,16 @@ def extract_workflow_inputs(
         tool,
         functools.partial(
             visit_files,
-            extract_file_uri_once,
+            file_visitor,
+            directory_visitor,
             fs_access,
-            fileindex,
-            existing,
-            mark_broken=True,
-            skip_remote=options.reference_inputs,
             bypass_file_store=options.bypass_file_store,
         ),
     )
-    filenames.extend(tool_filenames)
-    return [file for file in filenames if file is not None]
+    return (
+        [file for file in input_filenames if file is not None],
+        [file for file in tool_filenames if file is not None],
+    )
 
 
 def import_workflow_inputs(
@@ -3788,6 +3897,11 @@ def import_workflow_inputs(
     :param log_level: log level
     :return:
     """
+
+    # Work out how to access files
+    fs_access = ToilFsAccess(options.basedir)
+
+    # Create a cache for importing files
     fileindex: dict[str, str] = {}
     existing: dict[str, str] = {}
 
@@ -3797,61 +3911,70 @@ def import_workflow_inputs(
         logger.log(log_level, "Loading %s...", url)
         return jobstore.import_file(url, symlink=True)
 
-    import_function = functools.partial(
-        extract_and_convert_file_to_toil_uri, file_import_function
-    )
-    # Import all the input files, some of which may be missing optional
-    # files.
-    logger.info("Importing input files...")
-    fs_access = ToilFsAccess(options.basedir)
-    visit_files(
-        import_function,
-        fs_access,
-        fileindex,
-        existing,
-        initialized_job_order,
+    # Make a visiting function for importing workflow input files, which may
+    # allow symlinking
+    file_visitor = functools.partial(
+        ensure_file_imported,
+        file_import_function,
+        fileindex=fileindex,
+        existing=existing,
         mark_broken=True,
         skip_remote=options.reference_inputs,
-        bypass_file_store=options.bypass_file_store,
     )
+    # And a function for packign up directories of imported files.
+    directory_visitor = functools.partial(upload_directory, mark_broken=True)
 
     # Make another function for importing tool files. This one doesn't allow
     # symlinking, since the tools might be coming from storage not accessible
     # to all nodes.
-    tool_import_function = functools.partial(
-        extract_and_convert_file_to_toil_uri,
+    tool_file_visitor = functools.partial(
+        ensure_file_imported,
         cast(
             Callable[[str], FileID],
             functools.partial(jobstore.import_file, symlink=False),
         ),
+        fileindex=fileindex,
+        existing=existing,
+        mark_broken=True,
+        skip_remote=options.reference_inputs,
     )
 
-    # Import all the files associated with tools (binaries, etc.).
-    # Not sure why you would have an optional secondary file here, but
-    # the spec probably needs us to support them.
+    # Import all the files associated with tools (binaries, etc.) FIRST, so
+    # that they can be imported without symlinking even if they are also
+    # workflow inputs.
     logger.info("Importing tool-associated files...")
     visitSteps(
         tool,
         functools.partial(
             visit_files,
-            tool_import_function,
+            tool_file_visitor,
+            directory_visitor,
             fs_access,
-            fileindex,
-            existing,
-            mark_broken=True,
-            skip_remote=options.reference_inputs,
             bypass_file_store=options.bypass_file_store,
         ),
     )
 
-    # We always expect to have processed all files that exist
-    for param_name, param_value in initialized_job_order.items():
-        # Loop through all the parameters for the workflow overall.
-        # Drop any files that aren't either imported (for when we use
-        # the file store) or available on disk (for when we don't).
-        # This will properly make them cause an error later if they
-        # were required.
-        rm_unprocessed_secondary_files(param_value)
+    # Not sure why you would have an optional secondary file here, but
+    # the spec probably needs us to support them.
+    visitSteps(tool, rm_unprocessed_secondary_files)
+
+    # Import all the input files, some of which may be missing optional
+    # files.
+    logger.info("Importing input files...")
+    visit_files(
+        file_visitor,
+        directory_visitor,
+        fs_access,
+        initialized_job_order,
+        bypass_file_store=options.bypass_file_store,
+    )
+
+    # We always expect to have processed all files that exist.
+    # Drop any files that aren't either imported (for when we use
+    # the file store) or available on disk (for when we don't).
+    # This will properly make them cause an error later if they
+    # were required.
+    rm_unprocessed_secondary_files(initialized_job_order)
 
 
 T = TypeVar("T")
@@ -3859,7 +3982,7 @@ T = TypeVar("T")
 
 def visitSteps(
     cmdline_tool: Process,
-    op: Callable[[CommentedMap], list[T]],
+    op: Callable[[CommentedMap], list[T] | None],
 ) -> list[T]:
     """
     Iterate over a CWL Process object, running the op on each tool description
@@ -3867,10 +3990,10 @@ def visitSteps(
     """
     if isinstance(cmdline_tool, cwltool.workflow.Workflow):
         # For workflows we need to dispatch on steps
-        ret = []
+        ret: list[T] = []
         for step in cmdline_tool.steps:
             # Handle the step's tool
-            ret.extend(op(step.tool))
+            ret.extend(op(step.tool) or [])
             # Recures on the embedded tool; maybe it's a workflow.
             recurse_ret = visitSteps(step.embedded_tool, op)
             ret.extend(recurse_ret)
@@ -3878,23 +4001,34 @@ def visitSteps(
     elif isinstance(cmdline_tool, cwltool.process.Process):
         # All CWL Process objects (including CommandLineTool) will have tools
         # if they bothered to run the Process __init__.
-        return op(cmdline_tool.tool)
+        return op(cmdline_tool.tool) or []
     raise RuntimeError(
         f"Unsupported type encountered in workflow " f"traversal: {type(cmdline_tool)}"
     )
 
 
 def rm_unprocessed_secondary_files(job_params: Any) -> None:
+    """
+    Scan a CWL object or collection and drop missing secondary files.
+    """
     if isinstance(job_params, list):
         for j in job_params:
+            # Recurse on list entries
             rm_unprocessed_secondary_files(j)
-    if isinstance(job_params, dict) and "secondaryFiles" in job_params:
+    if isinstance(job_params, dict):
+        for v in job_params.values():
+            # Recurse on dict values (maybe a secondary file has its own
+            # secondary files? Is that allowed?)
+            rm_unprocessed_secondary_files(v)
+
+    if is_file(job_params) and "secondaryFiles" in job_params:
+        # When we actually find a File, filter them.
         job_params["secondaryFiles"] = filtered_secondary_files(job_params)
 
 
 def filtered_secondary_files(
-    unfiltered_secondary_files: CWLObjectType,
-) -> list[CWLObjectType]:
+    unfiltered_secondary_files: CWLFileType,
+) -> MutableSequence[CWLFileType | CWLDirectoryType]:
     """
     Remove unprocessed secondary files.
 
@@ -3913,11 +4047,11 @@ def filtered_secondary_files(
     just a bit further down the track.
     """
     intermediate_secondary_files = []
-    final_secondary_files = []
+    final_secondary_files: MutableSequence[CWLFileType | CWLDirectoryType] = []
     # remove secondary files still containing interpolated strings
-    for sf in cast(list[CWLObjectType], unfiltered_secondary_files["secondaryFiles"]):
-        sf_bn = cast(str, sf.get("basename", ""))
-        sf_loc = cast(str, sf.get("location", ""))
+    for sf in unfiltered_secondary_files["secondaryFiles"]:
+        sf_bn = sf.get("basename", "")
+        sf_loc = sf.get("location", "")
         if ("$(" not in sf_bn) and ("${" not in sf_bn):
             if ("$(" not in sf_loc) and ("${" not in sf_loc):
                 intermediate_secondary_files.append(sf)
@@ -3934,8 +4068,8 @@ def filtered_secondary_files(
     # remove secondary files that are not present in the filestore or pointing
     # to existent things on disk
     for sf in intermediate_secondary_files:
-        sf_loc = cast(str, sf.get("location", ""))
-        if not sf_loc.startswith(MISSING_FILE) or sf.get("class", "") == "Directory":
+        sf_loc = sf.get("location", "")
+        if not sf_loc.startswith(MISSING_FILE) or is_directory(sf):
             # Pass imported files, and all Directories
             final_secondary_files.append(sf)
         else:
@@ -4048,8 +4182,8 @@ class NoAvailableJobStoreException(Exception):
 
 
 def generate_default_job_store(
-    batch_system_name: Optional[str],
-    provisioner_name: Optional[str],
+    batch_system_name: str | None,
+    provisioner_name: str | None,
     local_directory: str,
 ) -> str:
     """
@@ -4111,8 +4245,7 @@ def generate_default_job_store(
         )
 
 
-usage_message = "\n\n" + textwrap.dedent(
-    """
+usage_message = "\n\n" + textwrap.dedent("""
             NOTE: If you're trying to specify a jobstore, you must use --jobStore, not a positional argument.
 
             Usage: toil-cwl-runner [options] <workflow> [<input file>] [workflow options]
@@ -4124,10 +4257,7 @@ usage_message = "\n\n" + textwrap.dedent(
                      example.cwl \\
                      example-job.yaml \\
                      --wf_input="hello world"
-    """[
-        1:
-    ]
-)
+    """[1:])
 
 
 def get_options(args: list[str]) -> Namespace:
@@ -4141,8 +4271,7 @@ def get_options(args: list[str]) -> Namespace:
     parser = ArgParser(
         allow_abbrev=False,
         usage="%(prog)s [options] WORKFLOW [INFILE] [WF_OPTIONS...]",
-        description=textwrap.dedent(
-            """
+        description=textwrap.dedent("""
             positional arguments:
 
               WORKFLOW              CWL file to run.
@@ -4157,8 +4286,7 @@ def get_options(args: list[str]) -> Namespace:
 
                                     If an input has the same name as a Toil option, pass
                                     '--' before it.
-        """
-        ),
+        """),
         formatter_class=RawDescriptionHelpFormatter,
     )
 
@@ -4170,7 +4298,7 @@ def get_options(args: list[str]) -> Namespace:
     return options
 
 
-def main(args: Optional[list[str]] = None, stdout: TextIO = sys.stdout) -> int:
+def main(args: list[str] | None = None, stdout: TextIO = sys.stdout) -> int:
     """Run the main loop for toil-cwl-runner."""
     # Remove cwltool logger's stream handler so it uses Toil's
     cwllogger.removeHandler(defaultStreamHandler)
@@ -4240,7 +4368,7 @@ def main(args: Optional[list[str]] = None, stdout: TextIO = sys.stdout) -> int:
     setattr(runtime_context, "cwl_default_ram", options.cwl_default_ram)
     setattr(runtime_context, "cwl_min_ram", options.cwl_min_ram)
     runtime_context.move_outputs = "leave"
-    runtime_context.rm_tmpdir = False
+    runtime_context.rm_tmpdir = options.rm_tmpdir
     runtime_context.streaming_allowed = not options.disable_streaming
     if options.cachedir is not None:
         runtime_context.cachedir = os.path.abspath(options.cachedir)
@@ -4286,7 +4414,7 @@ def main(args: Optional[list[str]] = None, stdout: TextIO = sys.stdout) -> int:
     try:
 
         # We might have workflow metadata to pass to Toil
-        workflow_name=None
+        workflow_name = None
         trs_spec = None
 
         if not options.restart:
@@ -4435,6 +4563,13 @@ def main(args: Optional[list[str]] = None, stdout: TextIO = sys.stdout) -> int:
                 # If we're using the file store we need to start moving output
                 # files now.
                 runtime_context.move_outputs = "move"
+            elif options.rm_tmpdir:
+                # If bypassing the file store but wanting to clean up temp
+                # directories, we need to copy outputs out of tmpdir before
+                # deletion. Otherwise, downstream steps that reference files
+                # in the tmpdir will fail.
+                # TODO: "move" doesn't work here. Why?
+                runtime_context.move_outputs = "copy"
 
             # We instantiate an early builder object here to populate indirect
             # secondaryFile references using cwltool's library because we need
@@ -4555,6 +4690,7 @@ def main(args: Optional[list[str]] = None, stdout: TextIO = sys.stdout) -> int:
             stdout.write(json.dumps(outobj, indent=4, default=str))
             stdout.write("\n")
             logger.info("CWL run complete!")
+
     # Don't expose tracebacks to the user for exceptions that may be expected
     except FailedJobsException as err:
         if err.exit_code == CWL_UNSUPPORTED_REQUIREMENT_EXIT_CODE:
@@ -4573,7 +4709,7 @@ def main(args: Optional[list[str]] = None, stdout: TextIO = sys.stdout) -> int:
         InvalidImportExportUrlException,
         UnimplementedURLException,
         JobTooBigError,
-        FileNotFoundError
+        FileNotFoundError,
     ) as err:
         logging.error(err)
         return 1
@@ -4583,7 +4719,7 @@ def main(args: Optional[list[str]] = None, stdout: TextIO = sys.stdout) -> int:
 
 def find_default_container(
     args: Namespace, builder: cwltool.builder.Builder
-) -> Optional[str]:
+) -> str | None:
     """Find the default constructor by consulting a Toil.options object."""
     if args.default_container:
         return str(args.default_container)

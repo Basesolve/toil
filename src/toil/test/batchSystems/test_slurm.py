@@ -1,12 +1,12 @@
 import errno
-import textwrap
-from queue import Queue
-
 import logging
-import pytest
 import sys
-
+import textwrap
 from datetime import datetime, timedelta
+from queue import Queue
+from unittest import mock
+
+import pytest
 
 import toil.batchSystems.slurm
 from toil.batchSystems.abstractBatchSystem import (
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # we hope is not days and days away from the time the tests actually run.
 JOB_BASE_TIME = datetime.now().astimezone(None) - timedelta(days=5)
 
+
 def call_either(args, **_) -> str:
     """
     Pretend to call either sacct or scontrol as appropriate.
@@ -39,6 +40,7 @@ def call_either(args, **_) -> str:
         return call_scontrol(args)
     else:
         raise RuntimeError(f"Cannot fake command call: {args}")
+
 
 def call_sacct(args, **_) -> str:
     """
@@ -84,26 +86,24 @@ def call_sacct(args, **_) -> str:
 
     # See if they asked for a job list
     try:
-        j_index = args.index('-j')
+        j_index = args.index("-j")
         job_ids = [int(job_id) for job_id in args[j_index + 1].split(",")]
     except ValueError:
         # We're not restricting to a list of jobs.
         job_ids = list(sacct_info.keys())
     # See if they asked for start or end times
     try:
-        flag_index = args.index('-S')
+        flag_index = args.index("-S")
         begin_time = datetime.fromisoformat(args[flag_index + 1]).astimezone(None)
     except ValueError:
         # By default, Slurm uses today at midnight
-        begin_time = datetime.now().astimezone(None).replace(
-            hour=0,
-            minute=0,
-            second=0,
-            microsecond=0,
-            fold=0
+        begin_time = (
+            datetime.now()
+            .astimezone(None)
+            .replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
         )
     try:
-        flag_index = args.index('-E')
+        flag_index = args.index("-E")
         end_time = datetime.fromisoformat(args[flag_index + 1]).astimezone(None)
     except ValueError:
         end_time = None
@@ -251,6 +251,7 @@ def call_sacct_raises(*_):
         1, "sacct: error: Problem talking to the database: " "Connection timed out"
     )
 
+
 def call_sinfo(*_) -> str:
     """
     Simulate asking for partition info from Slurm
@@ -271,6 +272,7 @@ def call_sinfo(*_) -> str:
         """
     )
     return stdout
+
 
 class FakeBatchSystem(BatchSystemSupport):
     """
@@ -299,12 +301,16 @@ class FakeBatchSystem(BatchSystemSupport):
 
         config.workflowID = str(uuid4())
         config.cleanWorkDir = "always"
-        toil.batchSystems.slurm.SlurmBatchSystem.setOptions(lambda o: setattr(config, o, None))
+        toil.batchSystems.slurm.SlurmBatchSystem.setOptions(
+            lambda o: setattr(config, o, None)
+        )
         return config
+
 
 # Make the mock class not have abstract methods anymore, even though we don't
 # implement them. See <https://stackoverflow.com/a/17345619>.
 FakeBatchSystem.__abstractmethods__ = set()
+
 
 class SlurmTest(ToilTest):
     """
@@ -372,7 +378,6 @@ class SlurmTest(ToilTest):
         expected_result = {i: (None, None) for i in range(2000)}
         result = self.worker._getJobDetailsFromSacct(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
-
 
     ####
     #### tests for _getJobDetailsFromScontrol()
@@ -524,7 +529,7 @@ class SlurmTest(ToilTest):
             (130, BatchJobExitReason.FAILED),
             (0, BatchJobExitReason.FINISHED),
             (0, BatchJobExitReason.FINISHED),
-            None
+            None,
         ]
         result = self.worker.coalesce_job_exit_codes(job_ids)
         assert result == expected_result, f"{result} != {expected_result}"
@@ -625,13 +630,17 @@ class SlurmTest(ToilTest):
         assert "--partition=short" in command
 
         # With a partition override, we should not. But the override will be rewritten.
-        self.worker.boss.config.slurm_args = "--something --partition foo --somethingElse"
+        self.worker.boss.config.slurm_args = (
+            "--something --partition foo --somethingElse"
+        )
         command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
         assert "--partition=short" not in command
         assert "--partition=foo" in command
 
         # All ways of setting partition should work, including =
-        self.worker.boss.config.slurm_args = "--something --partition=foo --somethingElse"
+        self.worker.boss.config.slurm_args = (
+            "--something --partition=foo --somethingElse"
+        )
         command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
         assert "--partition=short" not in command
         assert "--partition=foo" in command
@@ -649,7 +658,9 @@ class SlurmTest(ToilTest):
         assert "--partition=foobar" in command
 
         # But they should be overridden by the argument overrides
-        self.worker.boss.config.slurm_args = "--something --partition=baz --somethingElse"
+        self.worker.boss.config.slurm_args = (
+            "--something --partition=baz --somethingElse"
+        )
         command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
         assert "--partition=baz" in command
 
@@ -669,14 +680,18 @@ class SlurmTest(ToilTest):
 
         # With a time override, we should use it, slightly translated, and it
         # should change the selected partition.
-        self.worker.boss.config.slurm_args = "--something --time 10:00:00 --somethingElse"
+        self.worker.boss.config.slurm_args = (
+            "--something --time 10:00:00 --somethingElse"
+        )
         command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
         logger.debug("Command: %s", command)
         assert "--partition=medium" in command
         assert "--time=0:36000" in command
 
         # All ways of setting time should work, including =
-        self.worker.boss.config.slurm_args = "--something --time=10:00:00 --somethingElse"
+        self.worker.boss.config.slurm_args = (
+            "--something --time=10:00:00 --somethingElse"
+        )
         command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
         logger.debug("Command: %s", command)
         assert "--partition=medium" in command
@@ -724,7 +739,9 @@ class SlurmTest(ToilTest):
         detector = toil.batchSystems.slurm.any_option_detector([])
         self.assertFalse(detector("--anything"))
 
-        detector = toil.batchSystems.slurm.any_option_detector([("foobar", "f"), "many-bothans", ("bazz-only", "B")])
+        detector = toil.batchSystems.slurm.any_option_detector(
+            [("foobar", "f"), "many-bothans", ("bazz-only", "B")]
+        )
 
         self.assertTrue(detector("--foobar"))
         self.assertTrue(detector("-f"))
@@ -734,4 +751,108 @@ class SlurmTest(ToilTest):
         self.assertFalse(detector("--no-bazz"))
         self.assertFalse(detector("--foo-bar=--bazz-only"))
 
+    def test_sinfo_not_permitted(self):
+        """Test when ``sinfo`` is not available.
 
+        Certain HPC platforms may prohibit Slurm commands that give access to
+        other users' jobs. E.g., BSC MN4, MN5. See issue #5461.
+        """
+        error_raised = CalledProcessErrorStderr(1, 'sinfo')
+        with (
+            mock.patch("toil.batchSystems.slurm.call_command", side_effect=error_raised),
+            mock.patch("toil.batchSystems.slurm.SlurmBatchSystem.PartitionSet._get_gpu_partitions") as mock_fn
+        ):
+            partition_set = toil.batchSystems.slurm.SlurmBatchSystem.PartitionSet()
+
+
+        assert partition_set.get_partition(120.0) is None
+
+        self.assertIsNone(partition_set.all_partitions)
+
+
+    ###
+    ### Tests for parse_slurm_time
+    ###
+
+    def test_parse_slurm_time_minutes(self):
+        """Test parsing 'minutes' format."""
+        result = toil.batchSystems.slurm.parse_slurm_time("5")
+        self.assertEqual(result, 5 * 60)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("30")
+        self.assertEqual(result, 30 * 60)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("120")
+        self.assertEqual(result, 120 * 60)
+
+    def test_parse_slurm_time_minutes_seconds(self):
+        """Test parsing 'minutes:seconds' format."""
+        result = toil.batchSystems.slurm.parse_slurm_time("5:30")
+        self.assertEqual(result, 5 * 60 + 30)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("10:00")
+        self.assertEqual(result, 10 * 60)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("0:45")
+        self.assertEqual(result, 45)
+
+    def test_parse_slurm_time_hours_minutes_seconds(self):
+        """Test parsing 'hours:minutes:seconds' format."""
+        result = toil.batchSystems.slurm.parse_slurm_time("1:30:00")
+        self.assertEqual(result, 1 * 3600 + 30 * 60)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("2:15:30")
+        self.assertEqual(result, 2 * 3600 + 15 * 60 + 30)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("10:00:00")
+        self.assertEqual(result, 10 * 3600)
+
+    def test_parse_slurm_time_days_hours(self):
+        """Test parsing 'days-hours' format."""
+        result = toil.batchSystems.slurm.parse_slurm_time("3-0")
+        self.assertEqual(result, 3 * 86400)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("1-12")
+        self.assertEqual(result, 1 * 86400 + 12 * 3600)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("7-00")
+        self.assertEqual(result, 7 * 86400)
+
+    def test_parse_slurm_time_days_hours_minutes(self):
+        """Test parsing 'days-hours:minutes' format."""
+        result = toil.batchSystems.slurm.parse_slurm_time("3-0:00")
+        self.assertEqual(result, 3 * 86400)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("3-00:00")
+        self.assertEqual(result, 3 * 86400)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("1-6:30")
+        self.assertEqual(result, 1 * 86400 + 6 * 3600 + 30 * 60)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("2-12:45")
+        self.assertEqual(result, 2 * 86400 + 12 * 3600 + 45 * 60)
+
+    def test_parse_slurm_time_days_hours_minutes_seconds(self):
+        """Test parsing 'days-hours:minutes:seconds' format."""
+        result = toil.batchSystems.slurm.parse_slurm_time("7-00:00:00")
+        self.assertEqual(result, 7 * 86400)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("1-02:30:45")
+        self.assertEqual(result, 1 * 86400 + 2 * 3600 + 30 * 60 + 45)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("5-12:00:00")
+        self.assertEqual(result, 5 * 86400 + 12 * 3600)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("0-01:30:00")
+        self.assertEqual(result, 1 * 3600 + 30 * 60)
+
+    def test_parse_slurm_time_edge_cases(self):
+        """Test edge cases and zero values."""
+        result = toil.batchSystems.slurm.parse_slurm_time("0-00:00:00")
+        self.assertEqual(result, 0)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("0")
+        self.assertEqual(result, 0)
+
+        result = toil.batchSystems.slurm.parse_slurm_time("365-00:00:00")
+        self.assertEqual(result, 365 * 86400)

@@ -18,12 +18,13 @@ import logging
 import os
 import time
 from argparse import ArgumentParser, Namespace
+from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 from threading import Event, Thread
-from typing import IO, TYPE_CHECKING, Any, Callable, Optional, Union
+from typing import IO, TYPE_CHECKING, Any, Union
 
 from toil.lib.conversions import strtobool
-from toil.lib.expando import Expando
+from toil.lib.expando import Expando, MagicExpando
 from toil.lib.history import HistoryManager
 from toil.lib.resources import ResourceMonitor
 
@@ -43,6 +44,10 @@ TRACE = logging.DEBUG - 5
 
 logging.addLevelName(TRACE, "TRACE")
 
+class StatsDict(MagicExpando):
+    """Subclass of MagicExpando for type-checking purposes."""
+
+    jobs: list[Expando]
 
 class StatsAndLogging:
     """A thread to aggregate statistics and logging."""
@@ -60,9 +65,7 @@ class StatsAndLogging:
         self._worker.start()
 
     @classmethod
-    def formatLogStream(
-        cls, stream: Union[IO[str], IO[bytes]], stream_name: str
-    ) -> str:
+    def formatLogStream(cls, stream: IO[str] | IO[bytes], stream_name: str) -> str:
         """
         Given a stream of text or bytes, and the job name, job itself, or some
         other optional stringifyable identity info for the job, return a big
@@ -90,9 +93,9 @@ class StatsAndLogging:
     def logWithFormatting(
         cls,
         stream_name: str,
-        jobLogs: Union[IO[str], IO[bytes]],
+        jobLogs: IO[str] | IO[bytes],
         method: Callable[[str], None] = logger.debug,
-        message: Optional[str] = None,
+        message: str | None = None,
     ) -> None:
         if message is not None:
             method(message)
@@ -174,7 +177,7 @@ class StatsAndLogging:
         startTime = time.time()
         startClock = ResourceMonitor.get_total_cpu_time()
 
-        def callback(fileHandle: Union[IO[bytes], IO[str]]) -> None:
+        def callback(fileHandle: IO[bytes] | IO[str]) -> None:
             statsStr = fileHandle.read()
             if not isinstance(statsStr, str):
                 statsStr = statsStr.decode()
@@ -259,7 +262,7 @@ class StatsAndLogging:
                             cores=float(job.requested_cores),
                             cpu_seconds=float(job.clock),
                             memory_bytes=int(job.memory) * 1024,
-                            disk_bytes=int(job.disk)
+                            disk_bytes=int(job.disk),
                         )
                     except:
                         logger.exception("Could not record job attempt in history!")
@@ -304,7 +307,7 @@ class StatsAndLogging:
         # in addition to cleaning on exceptions, onError should clean if there are any failed jobs
 
 
-def set_log_level(level: str, set_logger: Optional[logging.Logger] = None) -> None:
+def set_log_level(level: str, set_logger: logging.Logger | None = None) -> None:
     """Sets the root logger level to a given string level (like "INFO")."""
     level = "CRITICAL" if level.upper() == "OFF" else level.upper()
     set_logger = set_logger if set_logger else root_logger
@@ -314,7 +317,7 @@ def set_log_level(level: str, set_logger: Optional[logging.Logger] = None) -> No
     suppress_exotic_logging(__name__)
 
 
-def install_log_color(set_logger: Optional[logging.Logger] = None) -> None:
+def install_log_color(set_logger: logging.Logger | None = None) -> None:
     """Make logs colored."""
     # Most of this code is taken from miniwdl
     # delayed import
@@ -349,7 +352,7 @@ def install_log_color(set_logger: Optional[logging.Logger] = None) -> None:
 
 
 def add_logging_options(
-    parser: ArgumentParser, default_level: Optional[int] = None
+    parser: ArgumentParser, default_level: int | None = None
 ) -> None:
     """
     Add logging options to set the global log level.
@@ -424,11 +427,11 @@ def configure_root_logger() -> None:
     root_logger.setLevel(DEFAULT_LOGLEVEL)
 
 
-def log_to_file(log_file: Optional[str], log_rotation: bool) -> None:
+def log_to_file(log_file: str | None, log_rotation: bool) -> None:
     if log_file and log_file not in __loggingFiles:
         logger.debug(f"Logging to file '{log_file}'.")
         __loggingFiles.append(log_file)
-        handler: Union[RotatingFileHandler, logging.FileHandler]
+        handler: RotatingFileHandler | logging.FileHandler
         if log_rotation:
             handler = RotatingFileHandler(log_file, maxBytes=1000000, backupCount=1)
         else:

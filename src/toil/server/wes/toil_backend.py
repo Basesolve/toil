@@ -17,9 +17,9 @@ import os
 import shutil
 import uuid
 from collections import Counter
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
-from typing import Any, Callable, Optional, TextIO, Union, overload
+from typing import Any, TextIO, overload
 
 from flask import send_from_directory
 from werkzeug.utils import redirect
@@ -29,7 +29,11 @@ import toil.server.wes.amazon_wes_utils as amazon_wes_utils
 from toil.bus import JobStatus, replay_message_bus
 from toil.lib.io import AtomicFileCreate
 from toil.lib.threading import global_mutex
-from toil.server.utils import WorkflowStateMachine, connect_to_workflow_state_store
+from toil.server.utils import (
+    TERMINAL_STATES,
+    WorkflowStateMachine,
+    connect_to_workflow_state_store,
+)
 from toil.server.wes.abstract_backend import (
     OperationForbidden,
     TaskLog,
@@ -83,9 +87,9 @@ class ToilWorkflow:
     @overload
     def fetch_state(self, key: str, default: str) -> str: ...
     @overload
-    def fetch_state(self, key: str, default: None = None) -> Optional[str]: ...
+    def fetch_state(self, key: str, default: None = None) -> str | None: ...
 
-    def fetch_state(self, key: str, default: Optional[str] = None) -> Optional[str]:
+    def fetch_state(self, key: str, default: str | None = None) -> str | None:
         """
         Return the contents of the given key in the workflow's state
         store. If the key does not exist, the default value is returned.
@@ -96,7 +100,7 @@ class ToilWorkflow:
         return value
 
     @contextmanager
-    def fetch_scratch(self, filename: str) -> Generator[Optional[TextIO], None, None]:
+    def fetch_scratch(self, filename: str) -> Generator[TextIO | None, None, None]:
         """
         Get a context manager for either a stream for the given file from the
         workflow's scratch directory, or None if it isn't there.
@@ -109,27 +113,44 @@ class ToilWorkflow:
 
     def exists(self) -> bool:
         """Return True if the workflow run exists."""
-        return self.get_state() != "UNKNOWN"
+        return self.state_machine.get_current_state() != "UNKNOWN"
 
-    def get_state(self) -> str:
-        """Return the state of the current run."""
-        return self.state_machine.get_current_state()
+    def get_state(self, task_runner: type[TaskRunner]) -> str:
+        """
+        Return the state of the current run.
+        
+        Responsible for correcting the state when it is in conflict with what
+        the task runner knows about running processes.
+        """
+        
+        if not task_runner.is_live(self.run_id):
+            # The task is no longer running.
+            # We can read its state and it won't change it itself.
+            state = self.state_machine.get_current_state()
+            if not task_runner.is_ok(self.run_id):
+                # The task is known to have failed
+                if state not in TERMINAL_STATES:
+                    # The task did not record its own failure.
+                    logger.error(
+                        "Failing run %s because the task to run its leader crashed", self.run_id
+                    )
+                    self.state_machine.send_system_error()
+                    state = self.state_machine.get_current_state()
+            elif state == "CANCELING":
+                # The task stopped while we were trying to cancel it, without
+                # confirming. This can happen when we cancel a task before it
+                # gets the code set up to receive the signal. Clean it up here.
+                logger.info(
+                    "Marking run %s as canceled because its task can no longer mark it", self.run_id
+                )
+                self.state_machine.send_canceled()
+                state = self.state_machine.get_current_state()
+        else:
+            # The task is not known to have stopped; we don't need to do any
+            # postprocessing after reading the state.
+            state = self.state_machine.get_current_state()
 
-    def check_on_run(self, task_runner: type[TaskRunner]) -> None:
-        """
-        Check to make sure nothing has gone wrong in the task runner for this
-        workflow. If something has, log, and fail the workflow with an error.
-        """
-        if not task_runner.is_ok(self.run_id) and self.get_state() not in [
-            "SYSTEM_ERROR",
-            "EXECUTOR_ERROR",
-            "COMPLETE",
-            "CANCELED",
-        ]:
-            logger.error(
-                "Failing run %s because the task to run its leader crashed", self.run_id
-            )
-            self.state_machine.send_system_error()
+        return state
 
     def set_up_run(self) -> None:
         """Set up necessary directories for the run."""
@@ -181,7 +202,7 @@ class ToilWorkflow:
                 # Stream in the file
                 return json.load(f)
 
-    def _get_scratch_file_path(self, path: str) -> Optional[str]:
+    def _get_scratch_file_path(self, path: str) -> str | None:
         """
         Return the given relative path from self.scratch_dir, if it is a file,
         and None otherwise.
@@ -190,21 +211,21 @@ class ToilWorkflow:
             return None
         return path
 
-    def get_stdout_path(self) -> Optional[str]:
+    def get_stdout_path(self) -> str | None:
         """
         Return the path to the standard output log, relative to the run's
         scratch_dir, or None if it doesn't exist.
         """
         return self._get_scratch_file_path("stdout")
 
-    def get_stderr_path(self) -> Optional[str]:
+    def get_stderr_path(self) -> str | None:
         """
         Return the path to the standard output log, relative to the run's
         scratch_dir, or None if it doesn't exist.
         """
         return self._get_scratch_file_path("stderr")
 
-    def get_messages_path(self) -> Optional[str]:
+    def get_messages_path(self) -> str | None:
         """
         Return the path to the bus message log, relative to the run's
         scratch_dir, or None if it doesn't exist.
@@ -213,10 +234,8 @@ class ToilWorkflow:
 
     def get_task_logs(
         self,
-        filter_function: Optional[
-            Callable[[TaskLog, JobStatus], Optional[TaskLog]]
-        ] = None,
-    ) -> list[dict[str, Union[str, int, None]]]:
+        filter_function: None | (Callable[[TaskLog, JobStatus], TaskLog | None]) = None,
+    ) -> list[dict[str, str | int | None]]:
         """
         Return all the task log objects for the individual tasks in the workflow.
 
@@ -243,7 +262,7 @@ class ToilWorkflow:
             # Compose log objects from recovered job info.
             logs: list[TaskLog] = []
             for job_status in job_statuses.values():
-                task: Optional[TaskLog] = {
+                task: TaskLog | None = {
                     "name": job_status.name,
                     "exit_code": job_status.exit_code,
                 }
@@ -268,9 +287,9 @@ class ToilBackend(WESBackend):
     def __init__(
         self,
         work_dir: str,
-        state_store: Optional[str],
+        state_store: str | None,
         options: list[str],
-        dest_bucket_base: Optional[str],
+        dest_bucket_base: str | None,
         bypass_celery: bool = False,
         wes_dialect: str = "standard",
     ) -> None:
@@ -384,16 +403,16 @@ class ToilBackend(WESBackend):
         logger.info("Using server ID: %s", self.server_id)
 
         self.supported_versions = {
-            "py": ["3.7", "3.8", "3.9"],
+            "py": ["3.10", "3.11", "3.12", "3.13", "3.14"],
             "cwl": ["v1.0", "v1.1", "v1.2"],
             "wdl": ["draft-2", "1.0"],
         }
 
-    def _get_run(
-        self, run_id: str, should_exists: Optional[bool] = None
-    ) -> ToilWorkflow:
+    def _get_run(self, run_id: str, should_exists: bool | None = None) -> ToilWorkflow:
         """
         Helper method to instantiate a ToilWorkflow object.
+
+        Makes sure we see a sensible view of it.
 
         :param run_id: The run ID.
         :param should_exists: If set, ensures that the workflow run exists (or
@@ -411,7 +430,7 @@ class ToilBackend(WESBackend):
         # Sadly we can't just ask Celery if it has heard of them.
         # TODO: Implement multiple servers working together.
         owning_server = run.fetch_state("server_id")
-        apparent_state = run.get_state()
+        apparent_state = run.get_state(self.task_runner)
         if (
             apparent_state
             not in ("UNKNOWN", "COMPLETE", "EXECUTOR_ERROR", "SYSTEM_ERROR", "CANCELED")
@@ -432,8 +451,6 @@ class ToilBackend(WESBackend):
             )
             run.state_machine.send_system_error()
 
-        # Poll to make sure the run is not broken
-        run.check_on_run(self.task_runner)
         return run
 
     def get_runs(self) -> Generator[tuple[str, str], None, None]:
@@ -446,14 +463,14 @@ class ToilBackend(WESBackend):
                 continue
             run = self._get_run(run_id)
             if run.exists():
-                yield run_id, run.get_state()
+                yield run_id, run.get_state(self.task_runner)
 
     def get_state(self, run_id: str) -> str:
         """
         Return the state of the workflow run with the given run ID. May raise
         an error if the workflow does not exist.
         """
-        return self._get_run(run_id, should_exists=True).get_state()
+        return self._get_run(run_id, should_exists=True).get_state(self.task_runner)
 
     @handle_errors
     def get_service_info(self) -> dict[str, Any]:
@@ -490,7 +507,7 @@ class ToilBackend(WESBackend):
 
     @handle_errors
     def list_runs(
-        self, page_size: Optional[int] = None, page_token: Optional[str] = None
+        self, page_size: int | None = None, page_token: str | None = None
     ) -> dict[str, Any]:
         """List the workflow runs."""
         # TODO: implement pagination
@@ -566,7 +583,7 @@ class ToilBackend(WESBackend):
     def get_run_log(self, run_id: str) -> dict[str, Any]:
         """Get detailed info about a workflow run."""
         run = self._get_run(run_id, should_exists=True)
-        state = run.get_state()
+        state = run.get_state(self.task_runner)
 
         with run.fetch_scratch("request.json") as f:
             if f is None:
@@ -633,7 +650,7 @@ class ToilBackend(WESBackend):
 
         # Do some preflight checks on the current state.
         # We won't catch all cases where the cancel won't go through, but we can catch some.
-        state = run.get_state()
+        state = run.get_state(self.task_runner)
         if state in ("CANCELING", "CANCELED", "COMPLETE"):
             # We don't need to do anything.
             logger.warning(

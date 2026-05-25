@@ -24,7 +24,6 @@ import urllib.parse as urlparse
 import uuid
 from abc import ABCMeta, abstractmethod
 from io import BytesIO
-from itertools import chain, islice
 from queue import Queue
 from tempfile import mkstemp
 from threading import Thread
@@ -34,9 +33,9 @@ from urllib.request import Request, urlopen
 import pytest
 from stubserver import FTPStubServer
 
-from toil.common import Config, Toil
+from toil.common import Config
 from toil.fileStores import FileID
-from toil.job import Job, JobDescription, TemporaryID
+from toil.job import JobDescription, TemporaryID
 from toil.jobStores.abstractJobStore import NoSuchFileException, NoSuchJobException
 from toil.jobStores.fileJobStore import FileJobStore
 from toil.lib.io import mkdtemp
@@ -446,6 +445,31 @@ class AbstractJobStoreTest:
 
             with jobstore2.read_file_stream(fileID, encoding="utf-8") as f:
                 self.assertEqual(bar, f.read())
+
+        def testStreamUpdateAtomic(self):
+            """Checks if updating a stream and failing in the middle does nothing."""
+            jobstore = self.jobstore_initialized
+            foo = "foo"
+            bar = "bar"
+
+            with jobstore.write_file_stream(encoding="utf-8") as (
+                f,
+                fileID,
+            ):
+                f.write(foo)
+
+            class FakeError(RuntimeError):
+                pass
+
+            try:
+                with jobstore.update_file_stream(fileID, encoding="utf-8") as f:
+                    f.write(bar)
+                    raise FakeError("Oh dear")
+            except FakeError as e:
+                pass
+
+            with jobstore.read_file_stream(fileID, encoding="utf-8") as f:
+                self.assertEqual(foo, f.read())
 
         def testPerJobFiles(self):
             """Tests the behavior of files on jobs."""
@@ -1195,12 +1219,15 @@ class AbstractEncryptedJobStoreTest:
                 with self.jobstore_initialized.read_shared_file_stream(fileName) as f:
                     # If the read goes through, we should fail the assert because
                     # we read the cyphertext
-                    assert f.read() != phrase, (
-                        "Managed to read plaintext content with encryption off."
-                    )
+                    assert (
+                        f.read() != phrase
+                    ), "Managed to read plaintext content with encryption off."
             except AWSBadEncryptionKeyError as e:
                 # If the read doesn't go through, we get this.
-                assert "Your AWS encryption key is most likely configured incorrectly" in str(e)
+                assert (
+                    "Your AWS encryption key is most likely configured incorrectly"
+                    in str(e)
+                )
 
 
 class FileJobStoreTest(AbstractJobStoreTest.Test):
@@ -1452,13 +1479,15 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
             unitName="onJobStore",
         )
 
-        # Make the pickled size of the job larger than 256K
+        # Make the pickled size of the job larger than 256K by sticking a field on it
         with open("/dev/urandom", "rb") as random:
-            overlargeJob.jobName = str(random.read(512 * 1024))
+            random_data = str(random.read(512 * 1024))
+        setattr(overlargeJob, "giant_field", random_data)
         jobstore.assign_job_id(overlargeJob)
         jobstore.create_job(overlargeJob)
         self.assertTrue(jobstore.job_exists(overlargeJob.jobStoreID))
         overlargeJobDownloaded = jobstore.load_job(overlargeJob.jobStoreID)
+        assert getattr(overlargeJobDownloaded, "giant_field") == random_data
         # Because jobs lack equality comparison, we stringify for comparison.
         jobsInJobStore = [str(job) for job in jobstore.jobs()]
         self.assertEqual(jobsInJobStore, [str(overlargeJob)])
@@ -1539,7 +1568,8 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
     def _createExternalStore(self):
         """A S3.Bucket instance is returned"""
         from toil.jobStores.aws.jobStore import establish_boto3_session
-        from toil.lib.aws.utils import create_s3_bucket, retry_s3
+        from toil.lib.aws.utils import retry_s3
+        from toil.lib.aws.s3 import create_s3_bucket
 
         resource = establish_boto3_session().resource(
             "s3", region_name=self.awsRegion()
@@ -1555,7 +1585,7 @@ class AWSJobStoreTest(AbstractJobStoreTest.Test):
 
     def _cleanUpExternalStore(self, bucket):
         from toil.jobStores.aws.jobStore import establish_boto3_session
-        from toil.lib.aws.utils import delete_s3_bucket
+        from toil.lib.aws.s3 import delete_s3_bucket
 
         resource = establish_boto3_session().resource(
             "s3", region_name=self.awsRegion()

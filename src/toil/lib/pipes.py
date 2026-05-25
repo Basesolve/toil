@@ -1,17 +1,15 @@
 import errno
+import hashlib
 import logging
 import os
-import hashlib
-import threading
-
 from abc import ABC, abstractmethod
-from typing import Optional, TextIO, BinaryIO, IO, Any
+from typing import IO, Any
+from types import TracebackType
 
 from toil.lib.checksum import ChecksumError
 from toil.lib.threading import ExceptionalThread
 
 log = logging.getLogger(__name__)
-
 
 class WritablePipe(ABC):
     """
@@ -27,11 +25,9 @@ class WritablePipe(ABC):
     ...     _ = writable.write('Hello, world!\\n'.encode('utf-8'))
     Hello, world!
 
-    Each instance of this class creates a thread and invokes the readFrom method in that thread.
-    The thread will be join()ed upon normal exit from the context manager, i.e. the body of the
-    `with` statement. If an exception occurs, the thread will not be joined but a well-behaved
-    :meth:`.readFrom` implementation will terminate shortly thereafter due to the pipe having
-    been closed.
+    Each instance of this class creates a thread and invokes the readFrom
+    method in that thread. The thread will be join()ed upon exit from the
+    context manager, i.e. the body of the `with` statement.
 
     Now, exceptions in the reader thread will be reraised in the main thread:
 
@@ -73,9 +69,30 @@ class WritablePipe(ABC):
     RuntimeError: Hello, world!
     >>> y = os.dup(0); os.close(y); x == y
     True
+
+    Exceptions in the body of the with statement will cause an error that the
+    readFrom method can detect, visible by the time the empty-read EOF marker
+    is visible.
+
+    >>> seen_errors = []
+    >>> class MyPipe(WritablePipe):
+    ...     def readFrom(self, readable):
+    ...         while readable.read(100):
+    ...             pass
+    ...         if self.writer_error is not None:
+    ...             seen_errors.append(self.writer_error)
+    >>> with MyPipe() as writable:
+    ...     raise RuntimeError('Hello, world!')
+    Traceback (most recent call last):
+    ...
+    RuntimeError: Hello, world!
+    >>> len(seen_errors)
+    1
+    >>> type(seen_errors[0])
+    <class 'RuntimeError'>
     """
 
-    def __init__(self, encoding: Optional[str] = None, errors: Optional[str] = None) -> None:
+    def __init__(self, encoding: str | None = None, errors: str | None = None) -> None:
         """
         The specified encoding and errors apply to the writable end of the pipe.
 
@@ -86,12 +103,13 @@ class WritablePipe(ABC):
                 are the same as for open(). Defaults to 'strict' when an encoding is specified.
         """
         super().__init__()
-        self.encoding: Optional[str] = encoding
-        self.errors: Optional[str] = errors
-        self.readable_fh: Optional[int] = None
-        self.writable: Optional[IO[Any]] = None
-        self.thread: Optional[ExceptionalThread] = None
+        self.encoding: str | None = encoding
+        self.errors: str | None = errors
+        self.readable_fh: int | None = None
+        self.writable: IO[Any] | None = None
+        self.thread: ExceptionalThread | None = None
         self.reader_done: bool = False
+        self.writer_error: BaseException | None = None
 
     def __enter__(self) -> IO[Any]:
         self.readable_fh, writable_fh = os.pipe()
@@ -101,11 +119,19 @@ class WritablePipe(ABC):
             encoding=self.encoding,
             errors=self.errors,
         )
+        self.writer_error = None
         self.thread = ExceptionalThread(target=self._reader)
         self.thread.start()
         return self.writable
 
-    def __exit__(self, exc_type: Optional[str], exc_val: Optional[str], exc_tb: Optional[str]) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
+    ) -> None:
+        # If there was an exception, make sure it is visible to the reader
+        # before closing the write end of the pipe and generating an EOF.
+        if exc_val is not None:
+            self.writer_error = exc_val
+
         # Closing the writable end will send EOF to the readable and cause the reader thread
         # to finish.
         # TODO: Can close() fail? If so, would we try and clean up after the reader?
@@ -143,6 +169,10 @@ class WritablePipe(ABC):
         Implement this method to read data from the pipe. This method should support both
         binary and text mode output.
 
+        If this method needs to do any sort of cleanup on failure, it should
+        check self.writer_error after observing EOF, to distinguish normal
+        and abnormal termination of the writer.
+
         :param file readable: the file object representing the readable end of the pipe. Do not
             explicitly invoke the close() method of the object; that will be done automatically.
         """
@@ -158,8 +188,6 @@ class WritablePipe(ABC):
             self.readable_fh = None  # signal to parent thread that we've taken over
             self.readFrom(readable)
             self.reader_done = True
-
-
 
 class ReadablePipe(ABC):
     """
@@ -229,6 +257,10 @@ class ReadablePipe(ABC):
         Implement this method to write data from the pipe. This method should support both
         binary and text mode input.
 
+        Trying to write to the writable stream after the reader has
+        unexpectedly failed will produce an error, because the pipe will be
+        broken.
+
         :param file writable: the file object representing the writable end of the pipe. Do not
             explicitly invoke the close() method of the object, that will be done automatically.
         """
@@ -245,7 +277,7 @@ class ReadablePipe(ABC):
             if e.errno != errno.EPIPE:
                 raise
 
-    def __init__(self, encoding: Optional[str] = None, errors: Optional[str] = None) -> None:
+    def __init__(self, encoding: str | None = None, errors: str | None = None) -> None:
         """
         The specified encoding and errors apply to the readable end of the pipe.
 
@@ -256,11 +288,11 @@ class ReadablePipe(ABC):
                 are the same as for open(). Defaults to 'strict' when an encoding is specified.
         """
         super().__init__()
-        self.encoding: Optional[str] = encoding
-        self.errors: Optional[str] = errors
-        self.writable_fh: Optional[int] = None
-        self.readable: Optional[IO[Any]] = None
-        self.thread: Optional[ExceptionalThread] = None
+        self.encoding: str | None = encoding
+        self.errors: str | None = errors
+        self.writable_fh: int | None = None
+        self.readable: IO[Any] | None = None
+        self.thread: ExceptionalThread | None = None
 
     def __enter__(self) -> IO[Any]:
         readable_fh, self.writable_fh = os.pipe()
@@ -274,7 +306,9 @@ class ReadablePipe(ABC):
         self.thread.start()
         return self.readable
 
-    def __exit__(self, exc_type: Optional[str], exc_val: Optional[str], exc_tb: Optional[str]) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
+    ) -> None:
         # Close the read end of the pipe. The writing thread may
         # still be writing to the other end, but this will wake it up
         # if that's the case.
@@ -323,7 +357,12 @@ class ReadableTransformingPipe(ReadablePipe):
 
     """
 
-    def __init__(self, source: IO[Any], encoding: Optional[str] = None, errors: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        source: IO[Any],
+        encoding: str | None = None,
+        errors: str | None = None,
+    ) -> None:
         """
         :param str encoding: the name of the encoding used to encode the file. Encodings are the same
                 as for encode(). Defaults to None which represents binary mode.
@@ -357,7 +396,14 @@ class HashingPipe(ReadableTransformingPipe):
 
     Assumes info actually has a checksum.
     """
-    def __init__(self, source: IO[Any], encoding: Optional[str] = None, errors: Optional[str] = None, checksum_to_verify: Optional[str] = None) -> None:
+
+    def __init__(
+        self,
+        source: IO[Any],
+        encoding: str | None = None,
+        errors: str | None = None,
+        checksum_to_verify: str | None = None,
+    ) -> None:
         """
         :param str encoding: the name of the encoding used to encode the file. Encodings are the same
                 as for encode(). Defaults to None which represents binary mode.
@@ -365,13 +411,13 @@ class HashingPipe(ReadableTransformingPipe):
         :param str errors: an optional string that specifies how encoding errors are to be handled. Errors
                 are the same as for open(). Defaults to 'strict' when an encoding is specified.
         """
-        super(HashingPipe, self).__init__(source=source, encoding=encoding, errors=errors)
+        super().__init__(source=source, encoding=encoding, errors=errors)
         self.checksum_to_verify = checksum_to_verify
 
     def transform(self, readable: IO[Any], writable: IO[Any]) -> None:
         hash_object = hashlib.sha1()
         contents = readable.read(1024 * 1024)
-        while contents != b'':
+        while contents != b"":
             hash_object.update(contents)
             try:
                 writable.write(contents)
@@ -380,6 +426,8 @@ class HashingPipe(ReadableTransformingPipe):
                 # Can't check the checksum.
                 return
             contents = readable.read(1024 * 1024)
-        final_computed_checksum = f'sha1${hash_object.hexdigest()}'
+        final_computed_checksum = f"sha1${hash_object.hexdigest()}"
         if not self.checksum_to_verify == final_computed_checksum:
-            raise ChecksumError(f'Checksum mismatch. Expected: {self.checksum_to_verify} Actual: {final_computed_checksum}')
+            raise ChecksumError(
+                f"Checksum mismatch. Expected: {self.checksum_to_verify} Actual: {final_computed_checksum}"
+            )

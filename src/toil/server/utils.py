@@ -16,7 +16,6 @@ import logging
 import os
 from abc import abstractmethod
 from datetime import datetime
-from typing import Optional
 from urllib.parse import urlparse
 
 from toil.lib.io import AtomicFileCreate
@@ -57,7 +56,7 @@ def link_file(src: str, dest: str) -> None:
 
 
 def download_file_from_internet(
-    src: str, dest: str, content_type: Optional[str] = None
+    src: str, dest: str, content_type: str | None = None
 ) -> None:
     """
     Download a file from the Internet and write it to dest.
@@ -77,9 +76,7 @@ def download_file_from_internet(
         f.write(response.content)
 
 
-def download_file_from_s3(
-    src: str, dest: str, content_type: Optional[str] = None
-) -> None:
+def download_file_from_s3(src: str, dest: str, content_type: str | None = None) -> None:
     """
     Download a file from Amazon S3 and write it to dest.
     """
@@ -108,7 +105,7 @@ def get_file_class(path: str) -> str:
 
 
 @retry(errors=[OSError, BlockingIOError])
-def safe_read_file(file: str) -> Optional[str]:
+def safe_read_file(file: str) -> str | None:
     """
     Safely read a file by acquiring a shared lock to prevent other processes
     from writing to it while reading.
@@ -120,7 +117,7 @@ def safe_read_file(file: str) -> Optional[str]:
 
     try:
         # acquire a shared lock on the state file, which is blocking until we can lock it
-        fcntl.lockf(file_obj.fileno(), fcntl.LOCK_SH)
+        fcntl.flock(file_obj.fileno(), fcntl.LOCK_SH)
 
         try:
             return file_obj.read()
@@ -175,15 +172,15 @@ class MemoryStateCache:
         """
 
         super().__init__()
-        self._data: dict[tuple[str, str], Optional[str]] = {}
+        self._data: dict[tuple[str, str], str | None] = {}
 
-    def get(self, workflow_id: str, key: str) -> Optional[str]:
+    def get(self, workflow_id: str, key: str) -> str | None:
         """
         Get a key value from memory.
         """
         return self._data.get((workflow_id, key))
 
-    def set(self, workflow_id: str, key: str, value: Optional[str]) -> None:
+    def set(self, workflow_id: str, key: str, value: str | None) -> None:
         """
         Set or clear a key value in memory.
         """
@@ -234,7 +231,7 @@ class AbstractStateStore:
         self._cache = MemoryStateCache()
 
     @abstractmethod
-    def get(self, workflow_id: str, key: str) -> Optional[str]:
+    def get(self, workflow_id: str, key: str) -> str | None:
         """
         Get the value of the given key for the given workflow, or None if the
         key is not set for the workflow.
@@ -242,21 +239,21 @@ class AbstractStateStore:
         raise NotImplementedError
 
     @abstractmethod
-    def set(self, workflow_id: str, key: str, value: Optional[str]) -> None:
+    def set(self, workflow_id: str, key: str, value: str | None) -> None:
         """
         Set the value of the given key for the given workflow. If the value is
         None, clear the key.
         """
         raise NotImplementedError
 
-    def read_cache(self, workflow_id: str, key: str) -> Optional[str]:
+    def read_cache(self, workflow_id: str, key: str) -> str | None:
         """
         Read a value from a local cache, without checking the actual backend.
         """
 
         return self._cache.get(workflow_id, key)
 
-    def write_cache(self, workflow_id: str, key: str, value: Optional[str]) -> None:
+    def write_cache(self, workflow_id: str, key: str, value: str | None) -> None:
         """
         Write a value to a local cache, without modifying the actual backend.
         """
@@ -298,13 +295,13 @@ class FileStateStore(AbstractStateStore):
         logger.debug("Connected to FileStateStore at %s", url)
         self._base_dir = parse.path
 
-    def get(self, workflow_id: str, key: str) -> Optional[str]:
+    def get(self, workflow_id: str, key: str) -> str | None:
         """
         Get a key value from the filesystem.
         """
         return safe_read_file(os.path.join(self._base_dir, workflow_id, key))
 
-    def set(self, workflow_id: str, key: str, value: Optional[str]) -> None:
+    def set(self, workflow_id: str, key: str, value: str | None) -> None:
         """
         Set or clear a key value on the filesystem.
         """
@@ -365,7 +362,7 @@ if HAVE_S3:
             path = os.path.join(self._base_path, workflow_id, key)
             return self._bucket, path
 
-        def get(self, workflow_id: str, key: str) -> Optional[str]:
+        def get(self, workflow_id: str, key: str) -> str | None:
             """
             Get a key value from S3.
             """
@@ -378,7 +375,7 @@ if HAVE_S3:
                 except self._client.exceptions.NoSuchKey:
                     return None
 
-        def set(self, workflow_id: str, key: str, value: Optional[str]) -> None:
+        def set(self, workflow_id: str, key: str, value: str | None) -> None:
             """
             Set or clear a key value on S3.
             """
@@ -451,26 +448,26 @@ class WorkflowStateStore:
         self._state_store = state_store
         self._workflow_id = workflow_id
 
-    def get(self, key: str) -> Optional[str]:
+    def get(self, key: str) -> str | None:
         """
         Get the given item of workflow state.
         """
         return self._state_store.get(self._workflow_id, key)
 
-    def set(self, key: str, value: Optional[str]) -> None:
+    def set(self, key: str, value: str | None) -> None:
         """
         Set the given item of workflow state.
         """
         self._state_store.set(self._workflow_id, key, value)
 
-    def read_cache(self, key: str) -> Optional[str]:
+    def read_cache(self, key: str) -> str | None:
         """
         Read a value from a local cache, without checking the actual backend.
         """
 
         return self._state_store.read_cache(self._workflow_id, key)
 
-    def write_cache(self, key: str, value: Optional[str]) -> None:
+    def write_cache(self, key: str, value: str | None) -> None:
         """
         Write a value to a local cache, without modifying the actual backend.
         """
@@ -494,7 +491,7 @@ TERMINAL_STATES = {"COMPLETE", "EXECUTOR_ERROR", "SYSTEM_ERROR", "CANCELED"}
 
 # How long can a workflow be in CANCELING state before we conclude that the
 # workflow running task is gone and move it to CANCELED?
-MAX_CANCELING_SECONDS = 30
+MAX_CANCELING_SECONDS = 60
 
 
 class WorkflowStateMachine:
@@ -509,8 +506,6 @@ class WorkflowStateMachine:
     cache the first terminal state we see forever. If it becomes important that
     clients never see e.g. CANCELED -> COMPLETE or COMPLETE -> SYSTEM_ERROR, we
     can implement a real distributed state machine here.
-
-    We do handle making sure that tasks don't get stuck in CANCELING.
 
     State can be:
 
@@ -572,22 +567,11 @@ class WorkflowStateMachine:
         non-terminal state.
         """
 
-        state = self.get_current_state()
-        if state != "CANCELING" and state not in TERMINAL_STATES:
-            # If it's not obvious we shouldn't cancel, cancel.
-
-            # If we end up in CANCELING but the workflow runner task isn't around,
-            # or we signal it at the wrong time, we will stay there forever,
-            # because it's responsible for setting the state to anything else.
-            # So, we save a timestamp, and if we see a CANCELING status and an old
-            # timestamp, we move on.
-            self._store.set("cancel_time", get_iso_time())
-            # Set state after time, because having the state but no time is an error.
-            self._store.set("state", "CANCELING")
+        self._set_state("CANCELING")
 
     def send_canceled(self) -> None:
         """
-        Send a canceled message that would move to CANCELED from CANCELLING.
+        Send a canceled message that would move from CANCELING to CANCELED.
         """
         self._set_state("CANCELED")
 
@@ -623,28 +607,6 @@ class WorkflowStateMachine:
 
         # Otherwise do an actual read from backing storage.
         state = self._store.get("state")
-
-        if state == "CANCELING":
-            # Make sure it hasn't been CANCELING for too long.
-            # We can get stuck in CANCELING if the workflow-running task goes
-            # away or is stopped while reporting back, because it is
-            # repsonsible for posting back that it has been successfully
-            # canceled.
-            canceled_at = self._store.get("cancel_time")
-            if canceled_at is None:
-                # If there's no timestamp but it's supposedly canceling, put it
-                # into SYSTEM_ERROR, because we didn;t move to CANCELING properly.
-                state = "SYSTEM_ERROR"
-                self._store.set("state", state)
-            else:
-                # See if it has been stuck canceling for too long
-                canceled_at = datetime.fromisoformat(canceled_at)
-                canceling_seconds = (datetime.now() - canceled_at).total_seconds()
-                if canceling_seconds > MAX_CANCELING_SECONDS:
-                    # If it has, go to CANCELED instead, because the task is
-                    # nonresponsive and thus not running.
-                    state = "CANCELED"
-                    self._store.set("state", state)
 
         if state in TERMINAL_STATES:
             # We can cache this state forever

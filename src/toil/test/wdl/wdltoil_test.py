@@ -2,75 +2,105 @@ import json
 import logging
 import os
 import re
-import shutil
 import string
 import subprocess
 import unittest
 from collections.abc import Generator
 from pathlib import Path
-from typing import Any, Optional, Union, cast
+from typing import Any, cast
 from unittest.mock import patch
+from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
-from pytest_httpserver import HTTPServer
-
 import WDL.Error
 import WDL.Expr
+from pytest_httpserver import HTTPServer
 
 from toil.fileStores import FileID
 from toil.test import (
-    ToilTest,
     get_data,
     needs_docker,
     needs_docker_cuda,
     needs_google_storage,
     needs_online,
+    needs_singularity,
     needs_singularity_or_docker,
-    needs_wdl,
     slow,
 )
 from toil.version import exactPython
-from toil.wdl.wdltoil import (
-    WDLSectionJob,
-    WDLWorkflowGraph,
-    parse_disks,
-)
+from toil.wdl.wdltoil import WDLSectionJob, WDLWorkflowGraph, parse_disks
 
 logger = logging.getLogger(__name__)
 
 
 WDL_CONFORMANCE_TEST_REPO = "https://github.com/DataBiosphere/wdl-conformance-tests.git"
-WDL_CONFORMANCE_TEST_COMMIT = "46b5f85ee38ec60d0b8b9c35928b5104a2af83d5"
+WDL_CONFORMANCE_TEST_COMMIT = "12d6d8a54a11803fb529aeca18ee01cba01f1d3e"
 # These tests are known to require things not implemented by
 # Toil and will not be run in CI.
 WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL = [
-    16,  # Basic object test (deprecated and removed in 1.1); MiniWDL and toil-wdl-runner do not support Objects, so this will fail if ran by them
-    21,  # Parser: expression placeholders in strings in conditional expressions in 1.0, Cromwell style; Fails with MiniWDL and toil-wdl-runner
-    64,  # Legacy test for as_map_as_input; It looks like MiniWDL does not have the function as_map()
-    77,  # Test that array cannot coerce to a string. WDL 1.1 does not allow compound types to coerce into a string. This should return a TypeError.
+    "object",  # Basic object test (deprecated and removed in 1.1); MiniWDL and toil-wdl-runner do not support Objects, so this will fail if ran by them
+    "string_placeholders_conditionals_1_0",  # Parser: expression placeholders in strings in conditional expressions in 1.0, Cromwell style; Fails with MiniWDL and toil-wdl-runner
+    "as_map",  # Legacy test for as_map_as_input; It looks like MiniWDL does not have the function as_map()
+    "array_coerce",  # Test that array cannot coerce to a string. WDL 1.1 does not allow compound types to coerce into a string. This should return a TypeError.
+    "sibling_directories",  # TODO: This has started failing in CI despite passing locally on Mac and Linux. Come up with a more consistent test!
 ]
-WDL_UNIT_TESTS_UNSUPPORTED_BY_TOIL = [
-    14,  # test_object, Objects are not supported
-    19,  # map_to_struct, miniwdl cannot coerce map to struct, https://github.com/chanzuckerberg/miniwdl/issues/712
-    52,  # relative_and_absolute, needs root to run
-    58,  # test_gpu, needs gpu to run, else warning
-    59,  # will be fixed in #5001
-    66,  # This needs way too many resources (and actually doesn't work?), see https://github.com/DataBiosphere/wdl-conformance-tests/blob/2d617b703a33791f75f30a9db43c3740a499cd89/README_UNIT.md?plain=1#L8
-    67,  # same as above
-    68,  # Bug, see #https://github.com/DataBiosphere/toil/issues/4993
-    69,  # Same as 68
-    87,  # MiniWDL does not handle metacharacters properly when running regex, https://github.com/chanzuckerberg/miniwdl/issues/709
-    97,  # miniwdl bug, see https://github.com/chanzuckerberg/miniwdl/issues/701
-    105,  # miniwdl (and toil) bug, unserializable json is serialized, see https://github.com/chanzuckerberg/miniwdl/issues/702
-    107,  # object not supported
-    108,  # object not supported
-    109,  # object not supported
-    110,  # object not supported
-    120,  # miniwdl bug, see https://github.com/chanzuckerberg/miniwdl/issues/699
-    131,  # miniwdl bug, evalerror, see https://github.com/chanzuckerberg/miniwdl/issues/700
-    134,  # same as 131
-    144,  # miniwdl and toil bug
+
+# These tests (in the same order as in SPEC.md) are known to fail
+WDL_11_UNIT_TESTS_UNSUPPORTED_BY_TOIL = [
+    "test_object",  # Objects are not supported
+    "map_to_struct",  # miniwdl cannot coerce map to struct, https://github.com/chanzuckerberg/miniwdl/issues/712
+    "relative_and_absolute_task",  # needs root to run
+    "test_gpu_task",  # needs gpu to run, else warning
+    "hisat2_task",  # This needs way too many resources (and actually doesn't work?), see https://github.com/DataBiosphere/wdl-conformance-tests/blob/2d617b703a33791f75f30a9db43c3740a499cd89/README_UNIT.md?plain=1#L8
+    "gatk_haplotype_caller_task",  # same as above
+    "input_ref_call",  # Inputs refering into workflow body not yet implemented: see https://github.com/DataBiosphere/toil/issues/4993
+    "call_imported",  # Same as input_ref_call since it imports it
+    "call_imported_task",  # Same as input_ref_call since it imports it
+    "test_sub",  # MiniWDL does not handle metacharacters properly when running regex, https://github.com/chanzuckerberg/miniwdl/issues/709
+    "read_bool_task",  # miniwdl bug, see https://github.com/chanzuckerberg/miniwdl/issues/701
+    "write_json_fail",  # miniwdl (and toil) bug, unserializable json is serialized, see https://github.com/chanzuckerberg/miniwdl/issues/702
+    "read_object_task",  # object not supported
+    "read_objects_task",  # object not supported
+    "write_object_task",  # object not supported
+    "write_objects_task",  # object not supported
+    "test_transpose",  # miniwdl bug, see https://github.com/chanzuckerberg/miniwdl/issues/699
+    "test_as_map_fail",  # miniwdl bug, evalerror, see https://github.com/chanzuckerberg/miniwdl/issues/700
+    "test_collect_by_key",  # same as test_as_map_
+]
+
+WDL_12_UNIT_TESTS_UNSUPPORTED_BY_TOIL = WDL_11_UNIT_TESTS_UNSUPPORTED_BY_TOIL + [
+    "relative_paths_context",  # Toil can't yet resolve File coercion at task scope relative to task file.
+    "file_directory_equality",  # String to Directory coercion not yet implemented.
+    "single_return_code_task",  # MiniWDL 1.13.1 only knows returnCodes and not return_codes.
+    "all_return_codes_task",  # MiniWDL 1.13.1 only knows returnCodes and not return_codes.
+    "test_runtime_info_task",  # MiniWDL 1.13.1 can't yet expose the task global.
+    "placeholder_none",  # 'outputs' section expected 1 results (['placeholder_none.s']), got 0 instead ([]) with exit code 1
+    "person_struct_task",  # Doesn't work as written in the spec; see https://github.com/openwdl/wdl/issues/739
+    "import_structs",  # Feature not yet implemented?
+    "environment_variable_should_echo",  # Ln 14 Col 45: Unexpected token STRING1_FRAGMENT
+    "outputs_task",  # 'outputs' section expected 2 results (['outputs.threshold', 'outputs.two_csvs']), got 3 instead (['outputs.two_csvs', 'outputs.csvs', 'outputs.threshold']) with exit code 0
+    "glob_task",  # 'outputs' section expected 1 results (['glob.last_file_contents']), got 2 instead (['glob.last_file_contents', 'glob.outfiles']) with exit code 0
+    "test_hints_task",  # Test is written as if the file has 3 lines, but it really has 2. See https://github.com/openwdl/wdl/issues/741
+    "input_hint_task",  # Missing outputs in test definition: https://github.com/openwdl/wdl/issues/740
+    "test_allow_nested_inputs",  # Ln 27 Col 3: Unexpected token HINTS
+    "multi_nested_inputs",  # Ln 8 Col 9: Unexpected token STRING1_FRAGMENT
+    "allow_nested",  # Ln 32 Col 9: Unexpected token STRING1_FRAGMENT
+    "test_find_task",  # Ln 9 Col 22: No such function: find
+    "test_matches_task",  # Ln 7 Col 29: No such function: matches
+    "change_extension_task",  # 'outputs' section expected 2 results (['change_extension.data', 'change_extension.index']), got 3 instead (['change_extension.index', 'change_extension.data', 'change_extension.data_file']) with exit code 0
+    "join_paths_task",  # Ln 14 Col 15: No such function: join_paths
+    "gen_files_task",  # 'outputs' section expected 1 results (['gen_files.glob_len']), got 2 instead (['gen_files.glob_len', 'gen_files.files']) with exit code 0
+    "file_sizes_task",  # WDL.Error.StaticTypeMismatch: Expected File? instead of Map[String,Pair[Int,File?]] 
+    "read_tsv_task",  # Ln 21 Col 5: Unknown type Object
+    "write_tsv_task",  # Ln 28 Col 16: write_tsv expects 1 argument(s)
+    "test_contains",  # Ln 25 Col 22: No such function: contains
+    "chunk_array",  # Ln 8 Col 17: No such function: chunk
+    "test_select_first",  # Ln 14 Col 17: select_first expects 1 argument(s)
+    "test_keys",  # Ln 32 Col 36: Expected Map[Any,Any] instead of Name
+    "test_contains_key",  # Ln 18 Col 20: No such function: contains_key
+    "test_values",  # Ln 28 Col 20: No such function: values
+    "test_length",  # length() isn't implemented for maps and strings yet
 ]
 
 
@@ -152,8 +182,87 @@ class TestWDLConformance:
             "-v",
             "1.1",
             "--progress",
-            "--exclude-numbers",
-            ",".join([str(t) for t in WDL_UNIT_TESTS_UNSUPPORTED_BY_TOIL]),
+            "--exclude-ids",
+            ",".join(WDL_11_UNIT_TESTS_UNSUPPORTED_BY_TOIL),
+        ]
+        p2 = subprocess.run(commands2, capture_output=True)
+        self.check(p2)
+
+    @slow
+    def test_unit_tests_v12(self, wdl_conformance_test_repo: Path) -> None:
+        # TODO: Using a branch lets Toil commits that formerly passed start to
+        # fail CI when the branch moves.
+        os.chdir(wdl_conformance_test_repo)
+        repo_url = "https://github.com/adamnovak/wdl.git"
+        repo_branch = "wdl-1.2-fix-json"
+        commands1 = [
+            exactPython,
+            "setup_unit_tests.py",
+            "-v",
+            "1.2",
+            "--extra-patch-data",
+            "unit_tests_patch_data.yaml",
+            "--repo",
+            repo_url,
+            "--branch",
+            repo_branch,
+            "--force-pull",
+        ]
+        p1 = subprocess.run(commands1, capture_output=True)
+        self.check(p1)
+        commands2 = [
+            exactPython,
+            "run_unit.py",
+            "-r",
+            "toil-wdl-runner",
+            "-v",
+            "1.2",
+            "--progress",
+            "--exclude-ids",
+            ",".join(WDL_12_UNIT_TESTS_UNSUPPORTED_BY_TOIL),
+        ]
+        p2 = subprocess.run(commands2, capture_output=True)
+        self.check(p2)
+
+    @slow
+    def test_single_unit_test(self, wdl_conformance_test_repo: Path) -> None:
+        """
+        Run a single WDL spec unit test.  Defaults to ``glob_task`` on WDL
+        1.1, but both can be overridden via environment variables:
+
+        - ``WDL_UNIT_TEST_ID``: id of the test to run (e.g. ``serde_pair``)
+        - ``WDL_UNIT_TEST_VERSION``: WDL version to use (e.g. ``1.2``)
+        """
+        test_id = os.environ.get("WDL_UNIT_TEST_ID", "glob_task")
+        wdl_version = os.environ.get("WDL_UNIT_TEST_VERSION", "1.1")
+        os.chdir(wdl_conformance_test_repo)
+        repo_url = "https://github.com/openwdl/wdl.git"
+        repo_branch = f"wdl-{wdl_version}"
+        commands1 = [
+            exactPython,
+            "setup_unit_tests.py",
+            "-v",
+            wdl_version,
+            "--extra-patch-data",
+            "unit_tests_patch_data.yaml",
+            "--repo",
+            repo_url,
+            "--branch",
+            repo_branch,
+            "--force-pull",
+        ]
+        p1 = subprocess.run(commands1, capture_output=True)
+        self.check(p1)
+        commands2 = [
+            exactPython,
+            "run_unit.py",
+            "-r",
+            "toil-wdl-runner",
+            "-v",
+            wdl_version,
+            "--progress",
+            "--id",
+            test_id,
         ]
         p2 = subprocess.run(commands2, capture_output=True)
         self.check(p2)
@@ -173,10 +282,8 @@ class TestWDLConformance:
             "1.0",
         ]
         if WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL:
-            commands.append("--exclude-numbers")
-            commands.append(
-                ",".join([str(t) for t in WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL])
-            )
+            commands.append("--exclude-ids")
+            commands.append(",".join(WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL))
         p = subprocess.run(commands, capture_output=True)
 
         self.check(p)
@@ -196,10 +303,8 @@ class TestWDLConformance:
             "1.1",
         ]
         if WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL:
-            commands.append("--exclude-numbers")
-            commands.append(
-                ",".join([str(t) for t in WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL])
-            )
+            commands.append("--exclude-ids")
+            commands.append(",".join(WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL))
         p = subprocess.run(commands, capture_output=True)
 
         self.check(p)
@@ -207,7 +312,9 @@ class TestWDLConformance:
     # estimated running time: 10 minutes (once all the appropriate tests get
     # marked as "development")
     @slow
-    def test_conformance_tests_development(self, wdl_conformance_test_repo: Path) -> None:
+    def test_conformance_tests_development(
+        self, wdl_conformance_test_repo: Path
+    ) -> None:
         os.chdir(wdl_conformance_test_repo)
         commands = [
             exactPython,
@@ -220,10 +327,8 @@ class TestWDLConformance:
             "development",
         ]
         if WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL:
-            commands.append("--exclude-numbers")
-            commands.append(
-                ",".join([str(t) for t in WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL])
-            )
+            commands.append("--exclude-ids")
+            commands.append(",".join(WDL_CONFORMANCE_TESTS_UNSUPPORTED_BY_TOIL))
         p = subprocess.run(commands, capture_output=True)
 
         self.check(p)
@@ -284,6 +389,92 @@ class TestWDL:
                 assert os.path.exists(result["ga4ghMd5.value"])
                 assert os.path.basename(result["ga4ghMd5.value"]) == "md5sum.txt"
 
+    @needs_singularity
+    def test_sif_image(self, tmp_path: Path) -> None:
+        """Test if Toil can run a SIF image as a container"""
+
+        # We need to grab a SIF somewhere.
+        sif_file = tmp_path / "image.sif"
+        # The SIF needs to have Bash for WDL to use it. So we grab an Ubuntu
+        # image off a friendly server. This is probably too big to check in.
+        subprocess.check_call([
+            "singularity",
+            "pull",
+            str(sif_file),
+            "docker://mirror.gcr.io/library/ubuntu:25.10"
+        ])
+
+        with get_data("test/wdl/singularity/singularity.wdl") as wdl:
+            inputs =  {
+                "singularity_wf.leader_sif_path": str(os.path.abspath(sif_file))
+            }
+
+            result_json = subprocess.check_output(
+                self.base_command
+                + [
+                    str(wdl),
+                    json.dumps(inputs),
+                    "-o",
+                    str(tmp_path),
+                    "--logDebug",
+                    "--retryCount=0",
+                    "--container=singularity",
+                ]
+            )
+            result = json.loads(result_json)
+
+            assert "singularity_wf.value" in result
+            assert isinstance(result["singularity_wf.value"], str)
+            assert result["singularity_wf.value"] == "questing"
+
+        # TODO: This only tests absolute path, but we ought to also support
+        # relative path.
+
+    @needs_singularity_or_docker
+    def test_file_uri_no_hostname(self, tmp_path: Path, subtests: pytest.Subtests) -> None:
+        """Test if Toil handles file URIs without even empty hostnames"""
+
+        # We need to test file:/absolute/path/to/the/file in conjunction with
+        # worker imports, which didn't work in
+        # https://github.com/DataBiosphere/toil/issues/5392
+        with get_data("test/wdl/md5sum/md5sum.1.0.wdl") as wdl:
+            with get_data("test/wdl/md5sum/md5sum.input") as input_file:
+                # We need to wrap the absolute path to the input file in a JSON as a URI.
+                file_uri = f"file:{quote(os.path.abspath(input_file))}"
+
+                # Then put that in inline input JSON
+                input_json = json.dumps({"ga4ghMd5.inputFile": file_uri})
+
+                for worker_import in (False, True):
+                    with subtests.test(msg=f"Worker import: {worker_import}"):
+
+                        result_json = subprocess.check_output(
+                            self.base_command
+                            + [
+                                str(wdl),
+                                input_json,
+                                "-o",
+                                str(tmp_path),
+                                "--logDebug",
+                                "--retryCount=0",
+                            ]
+                            + (
+                                [
+                                    "--runImportsOnWorkers",
+                                ]
+                                if worker_import
+                                else []
+                            )
+                        )
+                        result = json.loads(result_json)
+
+                        assert "ga4ghMd5.value" in result
+                        assert isinstance(result["ga4ghMd5.value"], str)
+                        assert os.path.exists(result["ga4ghMd5.value"])
+                        assert (
+                            os.path.basename(result["ga4ghMd5.value"]) == "md5sum.txt"
+                        )
+
     @needs_online
     def test_url_to_file(self, tmp_path: Path) -> None:
         """
@@ -314,12 +505,55 @@ class TestWDL:
                         "-o",
                         str(tmp_path),
                         "--logInfo",
-                        "--retryCount=0"
+                        "--retryCount=0",
                     ]
                 )
                 result = json.loads(result_json)
 
                 assert "StringFileCoercion.output_file" in result
+
+    def test_cromwell_pair_input(self, tmp_path: Path) -> None:
+        """
+        Test that Cromwell-style Pair inputs using capitalised Left/Right keys
+        are accepted. Cromwell allows ``{"Left": x, "Right": y}`` in input JSON.
+        """
+        with get_data("test/wdl/testfiles/cromwell_pair.wdl") as wdl:
+            inputs = json.dumps(
+                {
+                    "cromwell_pair.p": {"Left": 1, "Right": 2},
+                    "cromwell_pair.nested": {
+                        "Left": "hello",
+                        "Right": {"Left": 3, "Right": 4},
+                    },
+                }
+            )
+            result_json = subprocess.check_output(
+                self.base_command
+                + [str(wdl), inputs, "-o", str(tmp_path), "--retryCount=0"]
+            )
+            result = json.loads(result_json)
+
+            assert result["cromwell_pair.left_out"] == 1
+            assert result["cromwell_pair.right_out"] == 2
+            assert result["cromwell_pair.nested_left_out"] == "hello"
+            assert result["cromwell_pair.nested_inner_left_out"] == 3
+            assert result["cromwell_pair.nested_inner_right_out"] == 4
+
+    @needs_docker
+    def test_gather(self, tmp_path: Path) -> None:
+        """
+        Test files with the same name from different scatter tasks.
+        """
+        with get_data("test/wdl/testfiles/gather.wdl") as wdl:
+            result_json = subprocess.check_output(
+                self.base_command
+                + [str(wdl), "-o", str(tmp_path), "--logInfo", "--retryCount=0"]
+            )
+            result = json.loads(result_json)
+
+            assert "gather.outfile" in result
+            assert isinstance(result["gather.outfile"], str)
+            assert open(result["gather.outfile"]).read() == "1\n2\n3\n"
 
     @needs_docker
     def test_gather(self, tmp_path: Path) -> None:
@@ -374,42 +608,35 @@ class TestWDL:
             out_dir = tmp_path / "out"
             file_path = tmp_path / "file"
             jobstore_path = tmp_path / "tree"
-            command = (
-                self.base_command
-                + [
-                    str(wdl),
-                    "-o",
-                    str(out_dir),
-                    "-i",
-                    json.dumps({"read_file.input_string": str(file_path)}),
-                    "--jobStore",
-                    str(jobstore_path),
-                    "--retryCount=0"
-                ]
-            )
+            command = self.base_command + [
+                str(wdl),
+                "-o",
+                str(out_dir),
+                "-i",
+                json.dumps({"read_file.input_string": str(file_path)}),
+                "--jobStore",
+                str(jobstore_path),
+                "--retryCount=0",
+            ]
             with pytest.raises(subprocess.CalledProcessError):
                 # The first time we run it, it should fail because it's trying
                 # to work on a nonexistent file from a string path.
-                result_json = subprocess.check_output(
-                    command + ["--logCritical"]
-                )
+                result_json = subprocess.check_output(command + ["--logCritical"])
 
             # Then create the file
             with open(file_path, "w") as f:
                 f.write("This is a line\n")
                 f.write("This is a different line")
-            
+
             # Now it should work
-            result_json = subprocess.check_output(
-                    command + ["--restart"]
-                )
+            result_json = subprocess.check_output(command + ["--restart"])
             result = json.loads(result_json)
 
             assert "read_file.lines" in result
             assert isinstance(result["read_file.lines"], list)
             assert result["read_file.lines"] == [
                 "This is a line",
-                "This is a different line"
+                "This is a different line",
             ]
 
             # Since we were catching
@@ -721,15 +948,14 @@ class TestWDL:
                 Return the parsed output.
                 """
                 logger.info("Test optional file with HTTP code %s", code)
-                httpserver.expect_request(
-                    "/" + str(code)
-                ).respond_with_data(
-                    "Some data",
-                    status=code,
-                    content_type="text/plain"
+                httpserver.expect_request("/" + str(code)).respond_with_data(
+                    "Some data", status=code, content_type="text/plain"
                 )
                 base_url = httpserver.url_for("/")
-                json_value = '{"url_to_optional_file.http_code": %d, "url_to_optional_file.base_url": "%s"}' % (code, base_url)
+                json_value = (
+                    '{"url_to_optional_file.http_code": %d, "url_to_optional_file.base_url": "%s"}'
+                    % (code, base_url)
+                )
                 result_json = subprocess.check_output(
                     self.base_command
                     + [
@@ -761,6 +987,7 @@ class TestWDL:
                 with pytest.raises(subprocess.CalledProcessError):
                     run_for_code(code)
 
+    @needs_singularity_or_docker
     def test_missing_output_directory(self, tmp_path: Path) -> None:
         """
         Test if Toil can run a WDL workflow into a new directory.
@@ -781,7 +1008,7 @@ class TestWDL:
 
     @needs_singularity_or_docker
     def test_miniwdl_self_test(
-        self, tmp_path: Path, extra_args: Optional[list[str]] = None
+        self, tmp_path: Path, extra_args: list[str] | None = None
     ) -> None:
         """Test if the MiniWDL self test runs and produces the expected output."""
         with get_data("test/wdl/miniwdl_self_test/self_test.wdl") as wdl_file:
@@ -860,7 +1087,7 @@ class TestWDL:
     @pytest.mark.integrative
     @needs_singularity_or_docker
     def test_dockstore_trs(
-        self, tmp_path: Path, extra_args: Optional[list[str]] = None
+        self, tmp_path: Path, extra_args: list[str] | None = None
     ) -> None:
         wdl_file = "#workflow/github.com/dockstore/bcc2020-training/HelloWorld:master"
         # Needs an input but doesn't provide a good one.
@@ -894,7 +1121,7 @@ class TestWDL:
     @pytest.mark.integrative
     @needs_singularity_or_docker
     def test_dockstore_metrics_publication(
-        self, tmp_path: Path, extra_args: Optional[list[str]] = None
+        self, tmp_path: Path, extra_args: list[str] | None = None
     ) -> None:
         wdl_file = "#workflow/github.com/dockstore/bcc2020-training/HelloWorld:master"
         # Needs an input but doesn't provide a good one.
@@ -908,10 +1135,12 @@ class TestWDL:
         # Set credentials we got permission to publish from the Dockstore team,
         # and work on the staging Dockstore.
         env["TOIL_TRS_ROOT"] = "https://staging.dockstore.org"
-        env["TOIL_DOCKSTORE_TOKEN"] = "99cf5578ebe94b194d7864630a86258fa3d6cedcc17d757b5dd49e64ee3b68c3"
+        env["TOIL_DOCKSTORE_TOKEN"] = (
+            "99cf5578ebe94b194d7864630a86258fa3d6cedcc17d757b5dd49e64ee3b68c3"
+        )
         # Enable history for when <https://github.com/DataBiosphere/toil/pull/5258> merges
         env["TOIL_HISTORY"] = "True"
-        
+
         try:
             output_log = subprocess.check_output(
                 self.base_command
@@ -930,10 +1159,15 @@ class TestWDL:
                 env=env,
             ).decode("utf-8", errors="replace")
         except subprocess.CalledProcessError as e:
-            logger.error("Test run of Toil failed: %s", e.stdout.decode("utf-8", errors="replace"))
+            logger.error(
+                "Test run of Toil failed: %s",
+                e.stdout.decode("utf-8", errors="replace"),
+            )
             raise
 
-        assert "Workflow metrics were accepted by Dockstore." in output_log, f"No acceptance message in log: {output_log}"
+        assert (
+            "Workflow metrics were accepted by Dockstore." in output_log
+        ), f"No acceptance message in log: {output_log}"
 
     @slow
     @needs_docker_cuda
@@ -943,27 +1177,10 @@ class TestWDL:
 
         json_dir = tmp_path / "json"
         json_dir.mkdir()
-        base_uri = "https://raw.githubusercontent.com/vgteam/vg_wdl/65dd739aae765f5c4dedd14f2e42d5a263f9267a"
+        base_uri = "https://raw.githubusercontent.com/vgteam/vg_wdl/fc6654db25e3e2c2bb85cc6dc5e3bb81dfe7a236"
 
         wdl_file = f"{base_uri}/workflows/giraffe_and_deepvariant.wdl"
-        json_file = json_dir / "inputs.json"
-        with json_file.open("w") as fp:
-            # Write some inputs. We need to override the example inputs to use a GPU container, but that means we need absolute input URLs.
-            json.dump(
-                {
-                    "GiraffeDeepVariant.INPUT_READ_FILE_1": f"{base_uri}/tests/small_sim_graph/reads_1.fastq.gz",
-                    "GiraffeDeepVariant.INPUT_READ_FILE_2": f"{base_uri}/tests/small_sim_graph/reads_2.fastq.gz",
-                    "GiraffeDeepVariant.XG_FILE": f"{base_uri}/tests/small_sim_graph/graph.xg",
-                    "GiraffeDeepVariant.SAMPLE_NAME": "s0",
-                    "GiraffeDeepVariant.GBWT_FILE": f"{base_uri}/tests/small_sim_graph/graph.gbwt",
-                    "GiraffeDeepVariant.GGBWT_FILE": f"{base_uri}/tests/small_sim_graph/graph.gg",
-                    "GiraffeDeepVariant.MIN_FILE": f"{base_uri}/tests/small_sim_graph/graph.min",
-                    "GiraffeDeepVariant.DIST_FILE": f"{base_uri}/tests/small_sim_graph/graph.dist",
-                    "GiraffeDeepVariant.OUTPUT_GAF": True,
-                    "GiraffeDeepVariant.runDeepVariantCallVariants.in_dv_gpu_container": "google/deepvariant:1.3.0-gpu",
-                },
-                fp,
-            )
+        json_file = f"{base_uri}/params/giraffe_and_deepvariant.json"
 
         result_json = subprocess.check_output(
             self.base_command
@@ -1000,7 +1217,7 @@ class TestWDL:
         # TODO: Reduce memory requests with custom/smaller inputs.
         # TODO: Skip if node lacks enough memory.
 
-        base_uri = "https://raw.githubusercontent.com/vgteam/vg_wdl/65dd739aae765f5c4dedd14f2e42d5a263f9267a"
+        base_uri = "https://raw.githubusercontent.com/vgteam/vg_wdl/fc6654db25e3e2c2bb85cc6dc5e3bb81dfe7a236"
         wdl_file = f"{base_uri}/workflows/giraffe.wdl"
         json_file = f"{base_uri}/params/giraffe.json"
 
@@ -1055,19 +1272,24 @@ class TestWDL:
         """Test that Toil's lint check works"""
         with get_data("test/wdl/lint_error.wdl") as wdl:
             out = subprocess.check_output(
-                self.base_command + [str(wdl), "-o", str(tmp_path), "--logInfo"], stderr=subprocess.STDOUT)
+                self.base_command + [str(wdl), "-o", str(tmp_path), "--logInfo"],
+                stderr=subprocess.STDOUT,
+            )
 
-            assert b'UnnecessaryQuantifier' in out
+            assert b"UnnecessaryQuantifier" in out
 
             p = subprocess.Popen(
-                self.base_command + [wdl, "--strict=True", "--logCritical"], stderr=subprocess.PIPE)
+                self.base_command + [wdl, "--strict=True", "--logCritical"],
+                stderr=subprocess.PIPE,
+            )
             # Not actually a test assert; we need this to teach MyPy that we
             # get an stderr when we pass stderr=subprocess.PIPE.
             assert p.stderr is not None
             stderr = p.stderr.read()
             p.wait()
             assert p.returncode == 2
-            assert b'Workflow did not pass linting in strict mode' in stderr
+            assert b"Workflow did not pass linting in strict mode" in stderr
+
 
 class TestWDLToilBench(unittest.TestCase):
     """Tests for Toil's MiniWDL-based implementation that don't run workflows."""
@@ -1178,14 +1400,16 @@ class TestWDLToilBench(unittest.TestCase):
                     assert "decl2" in result[0]
                     assert "successor" in result[1]
 
-    def make_string_expr(self, to_parse: str, expr_type: type[WDL.Expr.String] = WDL.Expr.String) -> WDL.Expr.String:
+    def make_string_expr(
+        self, to_parse: str, expr_type: type[WDL.Expr.String] = WDL.Expr.String
+    ) -> WDL.Expr.String:
         """
         Parse pseudo-WDL for testing whitespace removal.
         """
 
         pos = WDL.Error.SourcePosition("nowhere", "nowhere", 0, 0, 0, 0)
 
-        parts: list[Union[str, WDL.Expr.Placeholder]] = re.split("(~{[^}]*})", to_parse)
+        parts: list[str | WDL.Expr.Placeholder] = re.split("(~{[^}]*})", to_parse)
         for i in range(1, len(parts), 2):
             parts[i] = WDL.Expr.Placeholder(pos, {}, WDL.Expr.Null(pos))
 
@@ -1196,9 +1420,7 @@ class TestWDLToilBench(unittest.TestCase):
         Test to make sure that we pick sensible but non-colliding directories to put files in.
         """
 
-        from toil.wdl.wdltoil import (
-            choose_human_readable_directory,
-        )
+        from toil.wdl.wdltoil import choose_human_readable_directory
 
         # The first time we should get a path with the task name
         first_chosen = choose_human_readable_directory(

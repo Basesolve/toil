@@ -13,10 +13,9 @@
 # limitations under the License.
 import logging
 import time
-from typing import Optional
 
 from toil.bus import JobUpdatedMessage, MessageBus
-from toil.job import CheckpointJobDescription, JobDescription
+from toil.job import CheckpointJobDescription, JobDescription, TemporaryID
 from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchJobException
 
 logger = logging.getLogger(__name__)
@@ -102,7 +101,7 @@ class ToilState:
     def load_workflow(
         self,
         rootJob: JobDescription,
-        jobCache: Optional[dict[str, JobDescription]] = None,
+        jobCache: dict[str, JobDescription] | None = None,
     ) -> None:
         """
         Load the workflow rooted at the given job.
@@ -207,7 +206,7 @@ class ToilState:
         start_time = time.time()
         wait_time = 0.1
         initially_known = job_id in self.__job_database
-        new_truth: Optional[JobDescription] = None
+        new_truth: JobDescription | None = None
         while True:
             try:
                 new_truth = self.__job_store.load_job(job_id)
@@ -353,6 +352,9 @@ class ToilState:
             def processSuccessorWithMultiplePredecessors(
                 successor: JobDescription,
             ) -> None:
+                # TODO: Can we hide the fact that TemporaryID exists better
+                # from the type system???
+                assert not isinstance(jobDesc.jobStoreID, TemporaryID) 
                 # If jobDesc is not reported as complete by the successor
                 if jobDesc.jobStoreID not in successor.predecessorsFinished:
 

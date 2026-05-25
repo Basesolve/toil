@@ -17,10 +17,11 @@ import dill as pickle
 import stat
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import wraps
 from io import BytesIO
-from typing import Any, IO, Iterator, Optional
+from typing import IO, Any
 from urllib.parse import ParseResult, urlunparse
 
 from google.api_core.exceptions import (
@@ -39,10 +40,10 @@ from toil.jobStores.abstractJobStore import (
     NoSuchJobException,
     NoSuchJobStoreException,
 )
-from toil.lib.pipes import ReadablePipe, WritablePipe
 from toil.lib.compatibility import compat_bytes
 from toil.lib.io import AtomicFileCreate
 from toil.lib.misc import truncExpBackoff
+from toil.lib.pipes import ReadablePipe, WritablePipe
 from toil.lib.retry import old_retry
 from toil.lib.url import URLAccess
 
@@ -92,6 +93,7 @@ def google_retry(f):
 
     return wrapper
 
+
 @contextmanager
 def permission_error_reporter(url: ParseResult, notes: str) -> Iterator[None]:
     """
@@ -102,7 +104,7 @@ def permission_error_reporter(url: ParseResult, notes: str) -> Iterator[None]:
     behind the scenes. Then it will complain::
 
         <class 'google.auth.exceptions.InvalidOperation'>: Anonymous credentials cannot be refreshed.
-    
+
     We need to detect this and report that the real problem is that the user
     has not set up any credentials. When you try to make the client
     non-anonymously and don't have credentials set up, you get a nice error
@@ -136,7 +138,6 @@ def permission_error_reporter(url: ParseResult, notes: str) -> Iterator[None]:
             ) from e
         else:
             raise
-
 
 
 class GoogleJobStore(AbstractJobStore, URLAccess):
@@ -182,6 +183,7 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
         """
 
         notes: list[str] = []
+
         def add_note(message: str, *args: Any, warn: bool = False) -> None:
             """
             Add and possibly warn with a note about the client permissions.
@@ -190,6 +192,7 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
             if warn:
                 log.warning(note)
             notes.append(note)
+
         def compile_notes() -> str:
             """
             Make one string explainign why we might not have expected permissions.
@@ -202,9 +205,7 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
         # Determine if we have an override environment variable for our credentials.
         # We get the path to check existence, but Google Storage works out what
         # to use later by looking at the environment again.
-        credentials_path: Optional[str] = os.getenv(
-            "GOOGLE_APPLICATION_CREDENTIALS", None
-        )
+        credentials_path: str | None = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", None)
         if credentials_path is not None and not os.path.exists(credentials_path):
             # If the file is missing, complain.
             # This variable holds a file name and not any sensitive data itself.
@@ -212,22 +213,25 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
                 "File '%s' from GOOGLE_APPLICATION_CREDENTIALS is unavailable! "
                 "We may not be able to authenticate!",
                 credentials_path,
-                warn=True
+                warn=True,
             )
 
         if credentials_path is None and os.path.exists(cls.nodeServiceAccountJson):
             try:
                 # load credentials from a particular file on GCE nodes if an
                 # override path is not set
-                return storage.Client.from_service_account_json(
-                    cls.nodeServiceAccountJson
-                ), compile_notes()
+                return (
+                    storage.Client.from_service_account_json(
+                        cls.nodeServiceAccountJson
+                    ),
+                    compile_notes(),
+                )
             except OSError:
                 # Probably we don't have permission to use the file.
                 add_note(
                     "File '%s' exists but didn't work to authenticate!",
                     cls.nodeServiceAccountJson,
-                    warn=True
+                    warn=True,
                 )
 
         # Either a filename is specified, or our fallback file isn't there.
@@ -366,9 +370,7 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
 
         env = {}
 
-        credentials_path: Optional[str] = os.getenv(
-            "GOOGLE_APPLICATION_CREDENTIALS", None
-        )
+        credentials_path: str | None = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", None)
         if credentials_path is not None:
             # Send along the environment variable that points to the credentials file.
             # It must be available in the same place on all nodes.
@@ -486,7 +488,9 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
 
     @classmethod
     @google_retry
-    def _get_blob_from_url(cls, client: storage.Client, url: ParseResult, exists: bool = False) -> storage.blob.Blob:
+    def _get_blob_from_url(
+        cls, client: storage.Client, url: ParseResult, exists: bool = False
+    ) -> storage.blob.Blob:
         """
         Gets the blob specified by the url.
 
@@ -521,7 +525,7 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
     @classmethod
     def _url_exists(cls, url: ParseResult) -> bool:
         client, auth_notes = cls.create_client()
-        with permission_error_reporter(url, auth_notes): 
+        with permission_error_reporter(url, auth_notes):
             try:
                 cls._get_blob_from_url(client, url, exists=True)
                 return True
@@ -718,10 +722,27 @@ class GoogleJobStore(AbstractJobStore, URLAccess):
             def readFrom(self, readable):
                 if not update:
                     assert not blob.exists()
-                if readable.seekable():
-                    blob.upload_from_file(readable)
-                else:
-                    blob.upload_from_string(readable.read())
+                # TODO: our pipe stream is not seekable, and
+                # blob.upload_from_file() apparently wants a seekable stream
+                # (TODO: check this! The docs at
+                # <https://docs.cloud.google.com/python/docs/reference/storage/latest/google.cloud.storage.blob.Blob#google_cloud_storage_blob_Blob_upload_from_file>
+                # don't say but they do say it acts differently based on file
+                # size.)
+
+                # So we just always dump the whole stream to memory and then
+                # upload it.
+                all_data = readable.read()
+
+                # This in turn means we can use WritabelPipe's built-in writer
+                # exception detection to cancel the upload on writer failure,
+                # and we don't need to work out a way to get an error to come
+                # from a read call inside Google's code.
+                if self.writer_error is not None:
+                    # Don't actually commit an upload where the writer failed.
+                    log.error("Aborting upload due to error in writer")
+                    return
+
+                blob.upload_from_string(all_data)
 
         with UploadPipe(encoding=encoding, errors=errors) as writable:
             yield writable

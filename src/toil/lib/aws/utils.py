@@ -15,20 +15,11 @@ import errno
 import logging
 import os
 import socket
-from collections.abc import Iterable, Iterator
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    ContextManager,
-    Literal,
-    Optional,
-    Union,
-    cast,
-)
-from urllib.parse import ParseResult, urlparse
+from collections.abc import Callable, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, ContextManager, Literal, cast
+from urllib.parse import ParseResult
 
-# To import toil.lib.aws.session, the AWS libraries must be installed 
+# To import toil.lib.aws.session, the AWS libraries must be installed
 from toil.lib.aws import AWSRegionName, AWSServerErrors, session
 from toil.lib.conversions import strtobool
 from toil.lib.memoize import memoize
@@ -73,7 +64,7 @@ THROTTLED_ERROR_CODES = [
 
 @retry(errors=[AWSServerErrors])
 def delete_sdb_domain(
-    sdb_domain_name: str, region: Optional[str] = None, quiet: bool = True
+    sdb_domain_name: str, region: str | None = None, quiet: bool = True
 ) -> None:
     sdb_client = session.client("sdb", region_name=region)
     sdb_client.delete_domain(DomainName=sdb_domain_name)
@@ -132,71 +123,6 @@ def retry_s3(
     """
     return old_retry(delays=delays, timeout=timeout, predicate=predicate)
 
-
-@retry(errors=[AWSServerErrors])
-def delete_s3_bucket(
-    s3_resource: "S3ServiceResource", bucket: str, quiet: bool = True
-) -> None:
-    """
-    Delete the given S3 bucket.
-
-    Note that S3 bucket deletion is only eventually-consistent, and anyone can
-    register any S3 bucket name. For both of these reasons, a bucket name might
-    not be immediately (or ever) available for re-use after this function
-    returns.
-    """
-    printq(f"Deleting s3 bucket: {bucket}", quiet)
-
-    paginator = s3_resource.meta.client.get_paginator("list_object_versions")
-    try:
-        for response in paginator.paginate(Bucket=bucket):
-            # Versions and delete markers can both go in here to be deleted.
-            # They both have Key and VersionId, but there's no shared base type
-            # defined for them in the stubs to express that. See
-            # <https://github.com/vemel/mypy_boto3_builder/issues/123>. So we
-            # have to do gymnastics to get them into the same list.
-            to_delete: list[dict[str, Any]] = cast(
-                list[dict[str, Any]], response.get("Versions", [])
-            ) + cast(list[dict[str, Any]], response.get("DeleteMarkers", []))
-            for entry in to_delete:
-                printq(
-                    f"    Deleting {entry['Key']} version {entry['VersionId']}", quiet
-                )
-                s3_resource.meta.client.delete_object(
-                    Bucket=bucket, Key=entry["Key"], VersionId=entry["VersionId"]
-                )
-        s3_resource.Bucket(bucket).delete()
-        # S3 bucket deletion is only eventually-consistent. See
-        # <https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-bucket.html>
-        printq(f"\n * S3 bucket successfully scheduled for deletion: {bucket}\n\n", quiet)
-    except s3_resource.meta.client.exceptions.NoSuchBucket:
-        printq(f"\n * S3 bucket no longer exists: {bucket}\n\n", quiet)
-
-
-def create_s3_bucket(
-    s3_resource: "S3ServiceResource",
-    bucket_name: str,
-    region: AWSRegionName,
-) -> "Bucket":
-    """
-    Create an AWS S3 bucket, using the given Boto3 S3 session, with the
-    given name, in the given region.
-
-    Supports the us-east-1 region, where bucket creation is special.
-
-    *ALL* S3 bucket creation should use this function.
-    """
-    logger.info("Creating bucket '%s' in region %s.", bucket_name, region)
-    if region == "us-east-1":  # see https://github.com/boto/boto3/issues/125
-        bucket = s3_resource.create_bucket(Bucket=bucket_name)
-    else:
-        bucket = s3_resource.create_bucket(
-            Bucket=bucket_name,
-            CreateBucketConfiguration={"LocationConstraint": region},
-        )
-    return bucket
-
-
 @retry(errors=[ClientError])
 def enable_public_objects(bucket_name: str) -> None:
     """
@@ -233,6 +159,32 @@ def enable_public_objects(bucket_name: str) -> None:
     # Stop using an ownership controls setting that prohibits ACLs.
     s3_client.delete_bucket_ownership_controls(Bucket=bucket_name)
 
+@retry(errors=[ClientError])
+def enable_encryption(bucket_name: str) -> None:
+    """
+    Enable server-side encryption with customer keys (SSE-C) on a bucket.
+
+    Amazon blocks this by default now because they don't think people holding
+    their own keys is "flexible". See
+    <https://docs.aws.amazon.com/AmazonS3/latest/userguide/default-s3-c-encryption-setting-faq.html>
+    """
+    s3_client = session.client("s3")
+
+    # It is not documented whether touching some rules destroys others, but the
+    # examples at
+    # <https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketEncryption.html#API_PutBucketEncryption_Examples>
+    # suggest not. Note that to *un*block SSE-C, we say something that sounds
+    # like we're trying to *block* an encryption type of "NONE", but that's
+    # what the example in the docs for that particular task does. The list is
+    # constrained to be non-empty.
+    s3_client.put_bucket_encryption(
+        Bucket=bucket_name,
+        ServerSideEncryptionConfiguration={
+            "Rules": [
+                {"BlockedEncryptionTypes": {"EncryptionType": ["NONE"]}},
+            ],
+        },
+    )
 
 class NoBucketLocationError(Exception):
     """
@@ -242,9 +194,9 @@ class NoBucketLocationError(Exception):
 
 def get_bucket_region(
     bucket_name: str,
-    endpoint_url: Optional[str] = None,
-    only_strategies: Optional[set[int]] = None,
-    anonymous: Optional[bool] = None
+    endpoint_url: str | None = None,
+    only_strategies: set[int] | None = None,
+    anonymous: bool | None = None,
 ) -> str:
     """
     Get the AWS region name associated with the given S3 bucket, or raise NoBucketLocationError.
@@ -262,7 +214,7 @@ def get_bucket_region(
     config = session.ANONYMOUS_CONFIG if anonymous else None
     s3_client = session.client("s3", endpoint_url=endpoint_url, config=config)
 
-    def attempt_get_bucket_location() -> Optional[str]:
+    def attempt_get_bucket_location() -> str | None:
         """
         Try and get the bucket location from the normal API call.
         """
@@ -270,7 +222,7 @@ def get_bucket_region(
             "LocationConstraint", None
         )
 
-    def attempt_get_bucket_location_from_us_east_1() -> Optional[str]:
+    def attempt_get_bucket_location_from_us_east_1() -> str | None:
         """
         Try and get the bucket location from the normal API call, but against us-east-1
         """
@@ -289,7 +241,7 @@ def get_bucket_region(
             "LocationConstraint", None
         )
 
-    def attempt_head_bucket() -> Optional[str]:
+    def attempt_head_bucket() -> str | None:
         """
         Try and get the bucket location from calling HeadBucket and inspecting
         the headers.
@@ -303,7 +255,7 @@ def get_bucket_region(
 
     # Compose a list of strategies we want to try in order, which may work.
     # None is an acceptable return type that actually means something.
-    strategies: list[Callable[[], Optional[str]]] = []
+    strategies: list[Callable[[], str | None]] = []
     strategies.append(attempt_get_bucket_location)
     if not endpoint_url:
         # We should only try to talk to us-east-1 if we don't have a custom
@@ -338,25 +290,30 @@ def get_bucket_region(
                         raise
                 except KeyError as e:
                     # If we get a weird head response we will have a KeyError
-                    logger.debug("Strategy %d to get bucket location did not work: %s", i + 1, e)
+                    logger.debug(
+                        "Strategy %d to get bucket location did not work: %s", i + 1, e
+                    )
                     error_logs.append((i + 1, str(e)))
                     last_error = e
 
     error_messages = []
     for rank, message in error_logs:
-        error_messages.append(f"Strategy {rank} failed to get bucket location because: {message}")
+        error_messages.append(
+            f"Strategy {rank} failed to get bucket location because: {message}"
+        )
     # If we get here we ran out of attempts.
     raise NoBucketLocationError(
         "Could not get bucket location: " + "\n".join(error_messages)
     ) from last_error
 
+
 @memoize
 def get_bucket_region_if_available(
     bucket_name: str,
-    endpoint_url: Optional[str] = None,
-    only_strategies: Optional[set[int]] = None,
-    anonymous: Optional[bool] = None
-) -> Optional[str]:
+    endpoint_url: str | None = None,
+    only_strategies: set[int] | None = None,
+    anonymous: bool | None = None,
+) -> str | None:
     """
     Get the AWS region name associated with the given S3 bucket, or return None.
 
@@ -369,21 +326,26 @@ def get_bucket_region_if_available(
     try:
         return get_bucket_region(bucket_name, endpoint_url, only_strategies, anonymous)
     except Exception as e:
-        if isinstance(e, NoBucketLocationError) or (isinstance(e, ClientError) and get_error_status(e) == 403):
+        if isinstance(e, NoBucketLocationError) or (
+            isinstance(e, ClientError) and get_error_status(e) == 403
+        ):
             # We can't know
             return None
         else:
             raise
 
+
 def region_to_bucket_location(region: str) -> str:
     return "" if region == "us-east-1" else region
 
 
-def bucket_location_to_region(location: Optional[str]) -> str:
+def bucket_location_to_region(location: str | None) -> str:
     return "us-east-1" if location == "" or location is None else location
 
 
-def get_object_for_url(url: ParseResult, existing: Optional[bool] = None, anonymous: Optional[bool] = None) -> "S3Object":
+def get_object_for_url(
+    url: ParseResult, existing: bool | None = None, anonymous: bool | None = None
+) -> "S3Object":
     """
     Extracts a key (object) from a given parsed s3:// URL.
 
@@ -400,11 +362,11 @@ def get_object_for_url(url: ParseResult, existing: Optional[bool] = None, anonym
     bucket_name = url.netloc
 
     # Decide if we need to override Boto's built-in URL here.
-    endpoint_url: Optional[str] = None
+    endpoint_url: str | None = None
     host = os.environ.get("TOIL_S3_HOST", None)
     port = os.environ.get("TOIL_S3_PORT", None)
     protocol = "https"
-    if strtobool(os.environ.get("TOIL_S3_USE_SSL", 'True')) is False:
+    if strtobool(os.environ.get("TOIL_S3_USE_SSL", "True")) is False:
         protocol = "http"
     if host:
         endpoint_url = f"{protocol}://{host}" + f":{port}" if port else ""
@@ -412,13 +374,17 @@ def get_object_for_url(url: ParseResult, existing: Optional[bool] = None, anonym
     # TODO: OrdinaryCallingFormat equivalent in boto3?
     # if botoargs:
     #     botoargs['calling_format'] = boto.s3.connection.OrdinaryCallingFormat()
-    
+
     config = session.ANONYMOUS_CONFIG if anonymous else None
     # Get the bucket's region to avoid a redirect per request.
     # Cache the result
-    region = get_bucket_region_if_available(bucket_name, endpoint_url=endpoint_url, anonymous=anonymous)
+    region = get_bucket_region_if_available(
+        bucket_name, endpoint_url=endpoint_url, anonymous=anonymous
+    )
     if region is not None:
-        s3 = session.resource("s3", region_name=region, endpoint_url=endpoint_url, config=config)
+        s3 = session.resource(
+            "s3", region_name=region, endpoint_url=endpoint_url, config=config
+        )
     else:
         # We can't get the bucket location, perhaps because we don't have
         # permission to do that.
@@ -461,7 +427,7 @@ def get_object_for_url(url: ParseResult, existing: Optional[bool] = None, anonym
 
 
 @retry(errors=[AWSServerErrors])
-def list_objects_for_url(url: ParseResult, anonymous: Optional[bool] = None) -> list[str]:
+def list_objects_for_url(url: ParseResult, anonymous: bool | None = None) -> list[str]:
     """
     Extracts a key (object) from a given parsed s3:// URL. The URL will be
     supplemented with a trailing slash if it is missing.
@@ -478,20 +444,20 @@ def list_objects_for_url(url: ParseResult, anonymous: Optional[bool] = None) -> 
 
     # Decide if we need to override Boto's built-in URL here.
     # TODO: Deduplicate with get_object_for_url, or push down into session module
-    endpoint_url: Optional[str] = None
+    endpoint_url: str | None = None
     host = os.environ.get("TOIL_S3_HOST", None)
     port = os.environ.get("TOIL_S3_PORT", None)
     protocol = "https"
-    if strtobool(os.environ.get("TOIL_S3_USE_SSL", 'True')) is False:
+    if strtobool(os.environ.get("TOIL_S3_USE_SSL", "True")) is False:
         protocol = "http"
     if host:
         endpoint_url = f"{protocol}://{host}" + f":{port}" if port else ""
-    
+
     config = session.ANONYMOUS_CONFIG if anonymous else None
     client = session.client("s3", endpoint_url=endpoint_url, config=config)
 
     listing = []
-    
+
     try:
         paginator = client.get_paginator("list_objects_v2")
         result = paginator.paginate(Bucket=bucket_name, Prefix=key_name, Delimiter="/")
@@ -513,12 +479,13 @@ def list_objects_for_url(url: ParseResult, anonymous: Optional[bool] = None) -> 
         else:
             raise
 
-
     logger.debug("Found in %s items: %s", url, listing)
     return listing
 
 
-def flatten_tags(tags: dict[str, str]) -> list[dict[Union[Literal["Key"], Literal["Value"]], str]]:
+def flatten_tags(
+    tags: dict[str, str],
+) -> list[dict[Literal["Key"] | Literal["Value"], str]]:
     """
     Convert tags from a key to value dict into a list of 'Key': xxx, 'Value': xxx dicts.
     """

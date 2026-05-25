@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Generator
 import json
 import logging
 import os
@@ -23,15 +22,16 @@ import subprocess
 import sys
 import uuid
 import zipfile
+from collections.abc import Callable, Generator
 from functools import partial
 from io import StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional, cast
+from typing import TYPE_CHECKING, cast
 from unittest.mock import Mock, call
 from urllib.request import urlretrieve
 
 if TYPE_CHECKING:
-    from cwltool.utils import CWLObjectType
+    from cwl_utils.types import CWLObjectType
 
 import pytest
 
@@ -43,33 +43,29 @@ from schema_salad.exceptions import ValidationException
 from toil.cwl.utils import (
     DirectoryStructure,
     download_structure,
+    remove_redundant_mounts,
     visit_cwl_class_and_reduce,
     visit_top_cwl_class,
-    remove_redundant_mounts
 )
 from toil.fileStores import FileID
 from toil.fileStores.abstractFileStore import AbstractFileStore
 from toil.job import WorkerImportJob
 from toil.lib.threading import cpu_count
-from toil.test import (
-    get_data,
-)
-from toil.test import (
-    pslow as slow,
-    pneeds_docker as needs_docker,
-    pneeds_cwl as needs_cwl,
-    pneeds_aws_s3 as needs_aws_s3,
-    pneeds_docker_cuda as needs_docker_cuda,
-    pneeds_gridengine as needs_gridengine,
-    pneeds_kubernetes as needs_kubernetes,
-    pneeds_local_cuda as needs_local_cuda,
-    pneeds_lsf as needs_lsf,
-    pneeds_mesos as needs_mesos,
-    pneeds_online as needs_online,
-    pneeds_slurm as needs_slurm,
-    pneeds_torque as needs_torque,
-    pneeds_wes_server as needs_wes_server,
-)
+from toil.test import get_data
+from toil.test import pneeds_aws_s3 as needs_aws_s3
+from toil.test import pneeds_cwl as needs_cwl
+from toil.test import pneeds_docker as needs_docker
+from toil.test import pneeds_docker_cuda as needs_docker_cuda
+from toil.test import pneeds_gridengine as needs_gridengine
+from toil.test import pneeds_kubernetes as needs_kubernetes
+from toil.test import pneeds_local_cuda as needs_local_cuda
+from toil.test import pneeds_lsf as needs_lsf
+from toil.test import pneeds_mesos as needs_mesos
+from toil.test import pneeds_online as needs_online
+from toil.test import pneeds_slurm as needs_slurm
+from toil.test import pneeds_torque as needs_torque
+from toil.test import pneeds_wes_server as needs_wes_server
+from toil.test import pslow as slow
 
 log = logging.getLogger(__name__)
 CONFORMANCE_TEST_TIMEOUT = 10000
@@ -78,15 +74,15 @@ CONFORMANCE_TEST_TIMEOUT = 10000
 def run_conformance_tests(
     workDir: str,
     yml: str,
-    runner: Optional[str] = None,
+    runner: str | None = None,
     caching: bool = False,
-    batchSystem: Optional[str] = None,
-    selected_tests: Optional[str] = None,
-    selected_tags: Optional[str] = None,
-    skipped_tests: Optional[str] = None,
-    extra_args: Optional[list[str]] = None,
+    batchSystem: str | None = None,
+    selected_tests: str | None = None,
+    selected_tags: str | None = None,
+    skipped_tests: str | None = None,
+    extra_args: list[str] | None = None,
     must_support_all_features: bool = False,
-    junit_file: Optional[str] = None,
+    junit_file: str | None = None,
 ) -> None:
     """
     Run the CWL conformance tests.
@@ -225,6 +221,9 @@ def run_conformance_tests(
         log.info("Unsuccessful return code is OK")
 
 
+# This is a type for a function that runs toil-cwl-runner and checks the
+# result. See TestCWLWorkflow._tester and TestCWLWorkflow._debug_worker_tester
+# for implementations.
 TesterFuncType = Callable[[Path, Path, "CWLObjectType", Path], None]
 
 
@@ -256,8 +255,29 @@ class TestCWLWorkflow:
         expect: "CWLObjectType",
         outdir: Path,
         out_name: str = "output",
-        main_args: Optional[list[str]] = None,
+        main_args: list[str] | None = None,
     ) -> None:
+        """
+        Helper function that runs a CWL workflow and checks the result.
+
+        Implements TesterFuncType, plus a few additional parameters.
+
+        :param cwlfile: CWL workflow file path to run.
+        :param jobfile: Path to the input definition for the workflow run.
+        :param expect: Expected result of the workflow as a deserialized CWL
+            object. Should have one key per workflow output field. If output
+            files are expected from the workflow, they need to have their
+            absolute paths on disk under outdir already filled in.
+        :param outdir: Path to a directory to put the workflow's output files
+            in.
+        :param out_name: Name of the JSON key where the workflow's outputs can
+            be found in the output JSON from Toil.
+        :param main_args: Additional arguments to pass to toil-cwl-runner. This
+            is not part of TesterFuncType; you can use partial() to fill this
+            in and stamp out a TesterFuncType that runs toil-cwl-runner with
+            various closed-over arguments.
+        """
+
         from toil.cwl import cwltoil
 
         st = StringIO()
@@ -293,6 +313,21 @@ class TestCWLWorkflow:
     def _debug_worker_tester(
         self, cwlfile: Path, jobfile: Path, expect: "CWLObjectType", outdir: Path
     ) -> None:
+        """
+        Helper function that runs a CWL workflow with --debugWorker and checks
+        the result.
+
+        Implements TesterFuncType directly.
+
+        :param cwlfile: CWL workflow file path to run.
+        :param jobfile: Path to the input definition for the workflow run.
+        :param expect: Expected result of the workflow as a deserialized CWL
+            object. Should have one key per workflow output field. If output
+            files are expected from the workflow, they need to have their
+            absolute paths on disk under outdir already filled in.
+        :param outdir: Path to a directory to put the workflow's output files
+            in.
+        """
         from toil.cwl import cwltoil
 
         st = StringIO()
@@ -334,6 +369,21 @@ class TestCWLWorkflow:
                 )
 
     def download(self, inputs: str, tester_fn: TesterFuncType, out_dir: Path) -> None:
+        """
+        Run a generic download test with a tester function and check the result.
+
+        Ther test is the download.cwl workflow.
+
+        The result has to match _expected_download_output on the output
+        directory, so it must contain an empty "output.txt" file.
+
+        :param inputs: Relative path to the inputs file within the Toil source
+            tree's src/toil/test/cwl directory.
+        :param tester_fn: The tester function to use to run the workflow and
+            check the result.
+        :param out_dir: Path to the output directory to save the workflow
+            output in.
+        """
         with get_data(f"test/cwl/{inputs}") as input_location:
             with get_data("test/cwl/download.cwl") as cwl_file:
                 tester_fn(
@@ -490,8 +540,8 @@ class TestCWLWorkflow:
         main_args = [
             "--outdir",
             str(tmp_path),
-            "#workflow/github.com/dockstore-testing/md5sum-checker:master",
-            "https://raw.githubusercontent.com/dockstore-testing/md5sum-checker/refs/heads/master/md5sum/md5sum-input-cwl.json",
+            "github.com/mr-c/dockstore-tool-md5sum:master",
+            "https://github.com/mr-c/dockstore-tool-md5sum/raw/refs/heads/master/test.json"
         ]
         cwltoil.main(main_args, stdout=stdout)
         out = json.loads(stdout.getvalue())
@@ -595,6 +645,41 @@ class TestCWLWorkflow:
 
     def test_download_file(self, tmp_path: Path) -> None:
         self.download("download_file.json", self._tester, tmp_path)
+
+    def test_download_file_worker_import(self, tmp_path: Path) -> None:
+        self.download(
+            "download_file.json",
+            partial(self._tester, main_args=["--run-imports-on-workers"]),
+            tmp_path,
+        )
+
+    def test_download_file_uri(self, tmp_path: Path) -> None:
+        self.download("download_file_uri.json", self._tester, tmp_path)
+
+    def test_download_file_uri_worker_import(self, tmp_path: Path) -> None:
+        self.download(
+            "download_file_uri.json",
+            partial(self._tester, main_args=["--run-imports-on-workers"]),
+            tmp_path,
+        )
+
+    def test_download_file_uri_no_hostname(self, tmp_path: Path) -> None:
+        """
+        Test if CWL handles file: URIs without even empty hostnames.
+        """
+        # We can in fact ship an absolute file URI to an empty file if we
+        # assume /dev/null is available. So we can still use the helpers.
+        self.download("download_file_uri_no_hostname.json", self._tester, tmp_path)
+
+    def test_download_file_uri_no_hostname_worker_import(self, tmp_path: Path) -> None:
+        """
+        Test if CWL handles file: URIs without even empty hostnames, with worker import.
+        """
+        self.download(
+            "download_file_uri_no_hostname.json",
+            partial(self._tester, main_args=["--run-imports-on-workers"]),
+            tmp_path,
+        )
 
     @needs_aws_s3
     @pytest.mark.aws_s3
@@ -827,7 +912,7 @@ class TestCWLWorkflow:
     @pytest.mark.aws_s3
     @pytest.mark.online
     def test_streamable(
-        self, tmp_path: Path, extra_args: Optional[list[str]] = None
+        self, tmp_path: Path, extra_args: list[str] | None = None
     ) -> None:
         """
         Test that a file with 'streamable'=True is a named pipe.
@@ -1114,6 +1199,7 @@ def cwl_v1_0_spec(tmp_path: Path) -> Generator[Path]:
     finally:
         pass  # no cleanup
 
+
 @pytest.mark.integrative
 @pytest.mark.conformance
 @needs_cwl
@@ -1143,11 +1229,11 @@ class TestCWLv10Conformance:
     def test_run_conformance(
         self,
         cwl_v1_0_spec: Path,
-        batchSystem: Optional[str] = None,
+        batchSystem: str | None = None,
         caching: bool = False,
-        selected_tests: Optional[str] = None,
-        skipped_tests: Optional[str] = None,
-        extra_args: Optional[list[str]] = None,
+        selected_tests: str | None = None,
+        skipped_tests: str | None = None,
+        extra_args: list[str] | None = None,
     ) -> None:
         run_conformance_tests(
             workDir=str(cwl_v1_0_spec / "v1.0"),
@@ -1319,9 +1405,9 @@ class TestCWLv11Conformance:
         self,
         cwl_v1_1_spec: Path,
         caching: bool = False,
-        batchSystem: Optional[str] = None,
-        skipped_tests: Optional[str] = None,
-        extra_args: Optional[list[str]] = None,
+        batchSystem: str | None = None,
+        skipped_tests: str | None = None,
+        extra_args: list[str] | None = None,
     ) -> None:
         run_conformance_tests(
             workDir=str(cwl_v1_1_spec),
@@ -1408,14 +1494,14 @@ class TestCWLv12Conformance:
     def test_run_conformance(
         self,
         cwl_v1_2_spec: Path,
-        runner: Optional[str] = None,
+        runner: str | None = None,
         caching: bool = False,
-        batchSystem: Optional[str] = None,
-        selected_tests: Optional[str] = None,
-        skipped_tests: Optional[str] = None,
-        extra_args: Optional[list[str]] = None,
+        batchSystem: str | None = None,
+        selected_tests: str | None = None,
+        skipped_tests: str | None = None,
+        extra_args: list[str] | None = None,
         must_support_all_features: bool = False,
-        junit_file: Optional[str] = None,
+        junit_file: str | None = None,
     ) -> None:
         if junit_file is None:
             junit_file = os.path.abspath("conformance-1.2.junit.xml")
@@ -1486,7 +1572,7 @@ class TestCWLv12Conformance:
         self,
         cwl_v1_2_spec: Path,
         caching: bool = False,
-        junit_file: Optional[str] = None,
+        junit_file: str | None = None,
     ) -> None:
         if junit_file is None:
             junit_file = os.path.abspath("kubernetes-conformance-1.2.junit.xml")
@@ -1920,12 +2006,17 @@ def test_trim_mounts_op_nonredundant() -> None:
     """
     Make sure we don't remove all non-duplicate listings
     """
-    s: CWLObjectType = {"class": "Directory", "basename": "directory", "listing": [{"class": "File", "basename": "file", "contents": "hello world"}]}
+    s: CWLObjectType = {
+        "class": "Directory",
+        "basename": "directory",
+        "listing": [{"class": "File", "basename": "file", "contents": "hello world"}],
+    }
     remove_redundant_mounts(s)
 
     # nothing should have been removed
-    assert isinstance(s['listing'], list)
-    assert len(s['listing']) == 1
+    assert isinstance(s["listing"], list)
+    assert len(s["listing"]) == 1
+
 
 @needs_cwl
 @pytest.mark.cwl
@@ -1944,7 +2035,7 @@ def test_trim_mounts_op_redundant() -> None:
                 "location": "file:///home/heaucques/Documents/toil/test_dir/nested_dir",
                 "basename": "nested_dir",
                 "listing": [],
-                "path": "/home/heaucques/Documents/toil/test_dir/nested_dir"
+                "path": "/home/heaucques/Documents/toil/test_dir/nested_dir",
             },
             {
                 "class": "File",
@@ -1954,16 +2045,17 @@ def test_trim_mounts_op_redundant() -> None:
                 "nameroot": "test_file",
                 "nameext": "",
                 "path": "/home/heaucques/Documents/toil/test_dir/test_file",
-                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709"
-            }
+                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            },
         ],
-        "path": "/home/heaucques/Documents/toil/test_dir"
+        "path": "/home/heaucques/Documents/toil/test_dir",
     }
     remove_redundant_mounts(s)
 
     # everything should have been removed
-    assert isinstance(s['listing'], list)
-    assert len(s['listing']) == 0
+    assert isinstance(s["listing"], list)
+    assert len(s["listing"]) == 0
+
 
 @needs_cwl
 @pytest.mark.cwl
@@ -1982,7 +2074,7 @@ def test_trim_mounts_op_partially_redundant() -> None:
                 "location": "file:///home/heaucques/Documents/thing",
                 "basename": "thing2",
                 "listing": [],
-                "path": "/home/heaucques/Documents/toil/thing2"
+                "path": "/home/heaucques/Documents/toil/thing2",
             },
             {
                 "class": "File",
@@ -1992,16 +2084,17 @@ def test_trim_mounts_op_partially_redundant() -> None:
                 "nameroot": "test_file",
                 "nameext": "",
                 "path": "/home/heaucques/Documents/toil/test_dir/test_file",
-                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709"
-            }
+                "checksum": "sha1$da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            },
         ],
-        "path": "/home/heaucques/Documents/toil/test_dir"
+        "path": "/home/heaucques/Documents/toil/test_dir",
     }
     remove_redundant_mounts(s)
 
     # everything except the nested directory should be removed
-    assert isinstance(s['listing'], list)
-    assert len(s['listing']) == 1
+    assert isinstance(s["listing"], list)
+    assert len(s["listing"]) == 1
+
 
 @needs_cwl
 @pytest.mark.cwl
@@ -2012,10 +2105,16 @@ def test_trim_mounts_op_mixed_urls_and_paths() -> None:
     """
     # Edge cases around encoding:
     # Ensure URL decoded file URIs match the bare path equivalent. Both of these paths should have the same shared directory
-    s: CWLObjectType = {"class": "Directory", "basename": "123", "location": "file:///tmp/%25/123", "listing": [{"class": "File", "path": "/tmp/%/123/456", "basename": "456"}]}
+    s: CWLObjectType = {
+        "class": "Directory",
+        "basename": "123",
+        "location": "file:///tmp/%25/123",
+        "listing": [{"class": "File", "path": "/tmp/%/123/456", "basename": "456"}],
+    }
     remove_redundant_mounts(s)
-    assert isinstance(s['listing'], list)
-    assert len(s['listing']) == 0
+    assert isinstance(s["listing"], list)
+    assert len(s["listing"]) == 0
+
 
 @needs_cwl
 @pytest.mark.cwl
@@ -2023,22 +2122,39 @@ def test_trim_mounts_op_mixed_urls_and_paths() -> None:
 def test_trim_mounts_op_decodable_paths() -> None:
     """"""
     # Ensure path names don't get unnecessarily decoded
-    s: CWLObjectType = {"class": "Directory", "basename": "dir", "path": "/tmp/cat%2Ftag/dir", "listing": [{"class": "File", "path": "/tmp/cat/tag/dir/file", "basename": "file"}]}
+    s: CWLObjectType = {
+        "class": "Directory",
+        "basename": "dir",
+        "path": "/tmp/cat%2Ftag/dir",
+        "listing": [
+            {"class": "File", "path": "/tmp/cat/tag/dir/file", "basename": "file"}
+        ],
+    }
     remove_redundant_mounts(s)
-    assert isinstance(s['listing'], list)
-    assert len(s['listing']) == 1
+    assert isinstance(s["listing"], list)
+    assert len(s["listing"]) == 1
+
 
 @needs_cwl
 @pytest.mark.cwl
 @pytest.mark.cwl_small
 def test_trim_mounts_op_multiple_encodings() -> None:
     # Ensure differently encoded URLs are properly decoded
-    s: CWLObjectType = {"class": "Directory", "basename": "dir", "location": "file:///tmp/cat%2Ftag/dir", "listing": [{"class": "File", "location": "file:///tmp/cat%2ftag/dir/file", "basename": "file"}]}
+    s: CWLObjectType = {
+        "class": "Directory",
+        "basename": "dir",
+        "location": "file:///tmp/cat%2Ftag/dir",
+        "listing": [
+            {
+                "class": "File",
+                "location": "file:///tmp/cat%2ftag/dir/file",
+                "basename": "file",
+            }
+        ],
+    }
     remove_redundant_mounts(s)
-    assert isinstance(s['listing'], list)
-    assert len(s['listing']) == 0
-
-
+    assert isinstance(s["listing"], list)
+    assert len(s["listing"]) == 0
 
 
 @needs_cwl
@@ -2163,6 +2279,7 @@ def test_import_on_workers() -> None:
 
         assert detector.detected is True
 
+
 @needs_cwl
 @pytest.mark.cwl
 @pytest.mark.cwl_small
@@ -2180,12 +2297,103 @@ def test_missing_tmpdir_and_tmp_outdir(tmp_path: Path) -> None:
             "toil-cwl-runner",
             f"--jobStore=file:{tmp_path / 'jobstore'}",
             "--strict-memory-limit",
-            f'--tmpdir-prefix={tmpdir_prefix}',
-            f'--tmp-outdir-prefix={tmp_outdir_prefix}',
+            f"--tmpdir-prefix={tmpdir_prefix}",
+            f"--tmp-outdir-prefix={tmp_outdir_prefix}",
             str(cwl_file),
         ]
         p = subprocess.run(cmd)
         assert p.returncode == 0
+
+
+@needs_cwl
+@pytest.mark.cwl
+@pytest.mark.cwl_small
+def test_leave_tmpdir(tmp_path: Path) -> None:
+    """
+    Test that --leave-tmpdir leaves intermediate temporary directories behind.
+    """
+    tmpdir_prefix = os.path.join(tmp_path, "tmpdir", "prefix_")
+
+    # Create the parent directory for tmpdir_prefix
+    os.makedirs(os.path.dirname(tmpdir_prefix), exist_ok=True)
+
+    with get_data("test/cwl/echo_string.cwl") as cwl_file:
+        # We need to bypass the file store or else we use --workDir and not
+        # --tmpdir-prefix, and then the workers always clean up at the Toil
+        # level.
+        cmd = [
+            "toil-cwl-runner",
+            f"--jobStore=file:{tmp_path / 'jobstore'}",
+            "--bypass-file-store",
+            "--leave-tmpdir",
+            f"--tmpdir-prefix={tmpdir_prefix}",
+            f"--outdir={tmp_path / 'outdir'}",
+            "--retryCount=0",
+            str(cwl_file),
+        ]
+        p = subprocess.run(cmd)
+        assert p.returncode == 0
+
+    # Check that temp directories were left behind
+    tmpdir_parent = os.path.dirname(tmpdir_prefix)
+    leftover_dirs = os.listdir(tmpdir_parent)
+    assert len(leftover_dirs) > 0, "Expected temp directories to be left behind with --leave-tmpdir"
+
+
+@needs_cwl
+@pytest.mark.cwl
+@pytest.mark.cwl_small
+def test_rm_tmpdir(tmp_path: Path, subtests: pytest.Subtests) -> None:
+    """
+    Test that --rm-tmpdir removes intermediate temporary directories.
+    """
+
+    subtest_num = 0
+    for bypass_filestore in (False, True):
+        for successful_workflow in (True, False):
+            with subtests.test(msg=f"Bypass filestore: {bypass_filestore} Successful workflow: {successful_workflow}"):
+                
+                # Each run needs a separate root
+                base_dir = tmp_path / str(subtest_num)
+                subtest_num += 1
+
+                # Use the same tree for all sorts of temp file so we can check for
+                # any leftovers
+                to_clean = base_dir / "tmpdir"
+                os.makedirs(to_clean, exist_ok=True)
+
+                workflow_path = "test/cwl/echo_string.cwl" if successful_workflow else "test/cwl/echo_string_and_fail.cwl"
+
+                
+                with get_data(workflow_path) as cwl_file:
+                    # We set both tmpdir-prefix and workDir to be extra special sure
+                    # the files go in there. When not bypassing the filestore,
+                    # we ignore the tmpdir-prefix and work in workDir.
+                    cmd = [
+                        "toil-cwl-runner",
+                        f"--jobStore=file:{base_dir / 'jobstore'}",
+                        "--rm-tmpdir",
+                        f"--tmpdir-prefix={to_clean / 'prefix'}",
+                        f"--workDir={to_clean}",
+                        f"--tmp-outdir-prefix={to_clean / 'out_prefix'}",
+                        f"--outdir={base_dir / 'outdir'}",
+                        "--retryCount=0",
+                    ]
+                    if bypass_filestore:
+                        cmd.append("--bypass-file-store")
+                    cmd.append(str(cwl_file))
+                    p = subprocess.run(cmd)
+                    if successful_workflow:
+                        assert p.returncode == 0
+                    else:
+                        # The workflow should fail but we should still do the
+                        # cleanup, because the cleanup should be per task.
+                        assert p.returncode != 0
+
+                # Check that temp directories were cleaned up
+                leftover_dirs = os.listdir(to_clean)
+                assert len(leftover_dirs) == 0, f"Expected temp directories to be removed with --rm-tmpdir, but found: {leftover_dirs}"
+
 
 # StreamHandler is generic, _typeshed doesn't exist at runtime, do a bit of typing trickery, see https://github.com/python/typeshed/issues/5680
 if TYPE_CHECKING:
@@ -2218,7 +2426,5 @@ class ImportWorkersMessageHandler(_stream_handler):
                 f"Log message {record.msg} has wrong number of "
                 f"fields in {record.args}"
             ) from e
-        if formatted.startswith(
-            f"Issued job '{WorkerImportJob.__name__}'"
-        ):
+        if formatted.startswith(f"Issued job '{WorkerImportJob.__name__}'"):
             self.detected = True

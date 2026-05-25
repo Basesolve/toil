@@ -25,11 +25,12 @@ python = f'python{sys.version_info[0]}.{sys.version_info[1]}'
 pip = f'{python} -m pip'
 
 # Debian and Ubuntu don't package ensurepip by default so the python-venv package must be installed
-python_packages = {'python3.9': ['python3.9-distutils', 'python3.9-venv'],
-                   'python3.10': ['python3.10-distutils', 'python3.10-venv'],
+python_packages = {'python3.10': ['python3.10-distutils', 'python3.10-venv'],
                    'python3.11': ['python3.11-distutils', 'python3.11-venv'],
                    'python3.12': ['python3.12-venv'],
-                   'python3.13': ['python3.13-venv']}  # python3.13 removed distutils
+                   'python3.13': ['python3.13-venv'],
+                   'python3.14': ['python3.14-venv'],
+                   }  # python3.13 removed distutils
 
 dependencies = ' '.join(python_packages[python] +
                         ['libffi-dev',  # For client side encryption for extras with PyNACL
@@ -70,7 +71,10 @@ dependencies = ' '.join(python_packages[python] +
                          'uidmap',
                          'squashfs-tools-ng',
                          # Dependencies for singularity on kubernetes
-                         'tzdata'])
+                         'tzdata',
+                         # Dependencies for building pysam when we need it for Cactus testing and there's no wheel
+                         'libbz2-dev',
+                         'liblzma-dev'])
 
 # pymesos's http-parser dependency can't build on Python later than 3.10, as
 # released in 0.9.0. The upstream pymesos can, but we write it out of Toil's
@@ -78,11 +82,11 @@ dependencies = ' '.join(python_packages[python] +
 # available in PyPI. So we need to manually inject a working http-parser, and
 # pymesos, into the Docker images.
 extra_mesos_python_modules = {
-    'python3.9': [],
     'python3.10': [],
     'python3.11': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15'],
     'python3.12': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15'],
-    'python3.13': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15']
+    'python3.13': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15'],
+    'python3.14': ['http-parser@git+https://github.com/adamnovak/http-parser.git@5a63516597bb4c93a7ba178b1e4bab939da5afb3', 'pymesos==0.3.15']
 }
 
 extra_python_modules = " ".join(extra_mesos_python_modules[python])
@@ -128,9 +132,9 @@ print(heredoc('''
     # wget --recursive --restrict-file-names=windows -k --convert-links --no-parent --page-requisites -m https://rpm.aventer.biz/Ubuntu/ https://www.aventer.biz/assets/support_aventer.asc https://rpm.aventer.biz/README.txt
     # ipfs add -r .
     # It contains a GPG key that will expire 2026-09-28
-    RUN echo "deb https://public.gi.ucsc.edu/~anovak/outbox/toil/ipfs/QmRXnGNiWk523zgNkuamENVkghMJ2zJtinVfgjHbc4Dcpr/rpm.aventer.biz/Ubuntu/focal focal main" \
+    RUN echo "deb https://public.gi.ucsc.edu/cgl/ci/toil/dependencies/ipfs/QmRXnGNiWk523zgNkuamENVkghMJ2zJtinVfgjHbc4Dcpr/rpm.aventer.biz/Ubuntu/focal focal main" \
         > /etc/apt/sources.list.d/mesos.list \
-        && curl https://public.gi.ucsc.edu/~anovak/outbox/toil/ipfs/QmRXnGNiWk523zgNkuamENVkghMJ2zJtinVfgjHbc4Dcpr/www.aventer.biz/assets/support_aventer.asc | apt-key add -
+        && curl https://public.gi.ucsc.edu/cgl/ci/toil/dependencies/ipfs/QmRXnGNiWk523zgNkuamENVkghMJ2zJtinVfgjHbc4Dcpr/www.aventer.biz/assets/support_aventer.asc | apt-key add -
 
     RUN apt-get -y update --fix-missing && \
         DEBIAN_FRONTEND=noninteractive apt-get -y upgrade && \

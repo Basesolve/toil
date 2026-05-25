@@ -18,14 +18,16 @@ import errno
 import logging
 import math
 import os
-import pandas
-from queue import Empty
-import sys
 import shlex
-
+import sys
 from argparse import SUPPRESS, ArgumentParser, _ArgumentGroup
-from datetime import datetime, timedelta, timezone
-from typing import Callable, NamedTuple, Optional, TypeVar
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from queue import Empty
+import time
+from typing import NamedTuple, TypeVar
+
+import pandas
 
 from toil.batchSystems.abstractBatchSystem import (
     EXIT_STATUS_UNAVAILABLE_VALUE,
@@ -90,22 +92,38 @@ NONTERMINAL_STATES: set[str] = {
 
 def parse_slurm_time(slurm_time: str) -> int:
     """
-    Parse a Slurm-style time duration like 7-00:00:00 to a number of seconds.
+    Parse a Slurm-style time duration to a number of seconds.
+
+    Slurm supports the following time formats:
+    - "minutes"
+    - "minutes:seconds"
+    - "hours:minutes:seconds"
+    - "days-hours"
+    - "days-hours:minutes"
+    - "days-hours:minutes:seconds"
 
     Raises ValueError if not parseable.
     """
-    # slurm returns time in days-hours:minutes:seconds format
-    # Sometimes it will only return minutes:seconds, so days may be omitted
-    # For ease of calculating, we'll make sure all the delimeters are ':'
-    # Then reverse the list so that we're always counting up from seconds -> minutes -> hours -> days
-    total_seconds = 0
-    elapsed_split: list[str] = slurm_time.replace("-", ":").split(":")
-    elapsed_split.reverse()
-    seconds_per_unit = [1, 60, 3600, 86400]
-    for index, multiplier in enumerate(seconds_per_unit):
-        if index < len(elapsed_split):
-            total_seconds += multiplier * int(elapsed_split[index])
-    return total_seconds
+    # Split on dash to check for days
+    if "-" in slurm_time:
+        days_str, _, slurm_time = slurm_time.partition("-")
+        days = int(days_str)
+    else:
+        days = 0
+
+    # Split remaining time into components and convert to integers
+    time_components = [int(x) for x in slurm_time.split(":")]
+
+    # Pad right to 3 if we have days, 2 otherwise
+    time_components += [0] * ((3 if days else 2) - len(time_components))
+
+    # Parse as base 60 from the left
+    result = 0
+    for component in time_components:
+        result = result * 60 + component
+
+    return days * 86400 + result
+
 
 # For parsing user-provided option overrides (or self-generated
 # options) for sbatch, we need a way to recognize long, long-with-equals, and
@@ -115,23 +133,34 @@ def option_detector(long: str, short: str | None = None) -> Callable[[str], bool
     Get a function that returns true if it sees the long or short
     option.
     """
+
     def is_match(option: str) -> bool:
-        return option == f"--{long}" or option.startswith(f"--{long}=") or (short is not None and option == f"-{short}")
+        return (
+            option == f"--{long}"
+            or option.startswith(f"--{long}=")
+            or (short is not None and option == f"-{short}")
+        )
+
     return is_match
+
 
 def any_option_detector(options: list[str | tuple[str, str]]) -> Callable[[str], bool]:
     """
     Get a function that returns true if it sees any of the long
     options or long or short option pairs.
     """
-    detectors = [option_detector(o) if isinstance(o, str) else option_detector(*o) for o in options]
+    detectors = [
+        option_detector(o) if isinstance(o, str) else option_detector(*o)
+        for o in options
+    ]
+
     def is_match(option: str) -> bool:
         for detector in detectors:
             if detector(option):
                 return True
         return False
-    return is_match
 
+    return is_match
 
 
 class SlurmBatchSystem(AbstractGridEngineBatchSystem):
@@ -148,19 +177,25 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         Set of available partitions detected on the slurm batch system
         """
 
-        default_gpu_partition: SlurmBatchSystem.PartitionInfo | None
-        all_partitions: list[SlurmBatchSystem.PartitionInfo]
-        gpu_partitions: set[str]
+        default_gpu_partition: SlurmBatchSystem.PartitionInfo | None = None
+        all_partitions: list[SlurmBatchSystem.PartitionInfo] | None = None
+        gpu_partitions: set[str] | None = None
 
         def __init__(self) -> None:
-            self._get_partition_info()
-            self._get_gpu_partitions()
+            try:
+                self._get_partition_info()
+                self._get_gpu_partitions()
+            except CalledProcessErrorStderr as e:
+                logger.warning("Could not retrieve Slurm partition info due to: '%s'.", e)
 
         def _get_gpu_partitions(self) -> None:
             """
             Get all available GPU partitions. Also get the default GPU partition.
             :return: None
             """
+            if not self.all_partitions:
+                return
+
             gpu_partitions = [
                 partition for partition in self.all_partitions if partition.gres
             ]
@@ -222,7 +257,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :param time_limit: Time limit in seconds.
             """
 
-            if time_limit is None:
+            if time_limit is None or self.all_partitions is None:
                 # Just use Slurm's default
                 return None
 
@@ -311,8 +346,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             jobName: str,
             job_environment: dict[str, str] | None = None,
             gpus: int | None = None,
-            usePreferredPartition: Optional[bool] = True,
-            comment: Optional[str] = "",
+            usePreferredPartition: bool | None = True,
+            comment: str | None = "",
         ) -> list[str]:
             # Make sure to use exec so we can get Slurm's signals in the Toil
             # worker instead of having an intervening Bash
@@ -358,17 +393,17 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         ) -> list[int | tuple[int, BatchJobExitReason | None] | None]:
             """
             Collect all job exit codes in a single call.
-            
+
             :param batch_job_id_list: list of Job ID strings, where each string
                 has the form ``<job>[.<task>]``.
-            
+
             :return: list of job exit codes or exit code, exit reason pairs
                 associated with the list of job IDs.
-            
+
             :raises CalledProcessErrorStderr: if communicating with Slurm went
                 wrong.
-            
-            :raises OSError: if job details are not available becasue a Slurm
+
+            :raises OSError: if job details are not available because a Slurm
                 command could not start.
             """
             logger.log(
@@ -429,12 +464,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 value is a tuple containing the job's state and exit code.
             :raises CalledProcessErrorStderr: if communicating with Slurm went
                 wrong.
-            :raises OSError: if job details are not available becasue a Slurm
+            :raises OSError: if job details are not available because a Slurm
                 command could not start.
             """
 
             status_dict = {}
-            scontrol_problem: Optional[Exception] = None
+            scontrol_problem: Exception | None = None
 
             try:
                 # Get all the job details we can from scontrol, which we think
@@ -471,7 +506,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # One of the methods worked, so we have at least (None, None)
             # values filled in for all jobs.
             assert len(status_dict) == len(job_id_list)
-
 
             return status_dict
 
@@ -679,7 +713,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
             return state_token
 
-        def _remaining_jobs(self, job_id_list: list[int], job_details: dict[int, tuple[str | None, int | None]]) -> list[int]:
+        def _remaining_jobs(
+            self,
+            job_id_list: list[int],
+            job_details: dict[int, tuple[str | None, int | None]],
+        ) -> list[int]:
             """
             Given a list of job IDs and a list of job details (state and exit
             code), get the list of job IDs where the details are (None, None)
@@ -713,13 +751,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # Pick a now
             now = datetime.now().astimezone(None)
             # Decide when to start the search (first copy of past midnight)
-            begin_time = now.replace(
-                hour=0,
-                minute=0,
-                second=0,
-                microsecond=0,
-                fold=0
-            )
+            begin_time = now.replace(hour=0, minute=0, second=0, microsecond=0, fold=0)
             # And when to end (a day after that)
             end_time = begin_time + timedelta(days=1)
             while end_time < now:
@@ -738,9 +770,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 # started.
                 results.update(
                     self._get_job_details_from_sacct_for_range(
-                        job_id_list,
-                        begin_time,
-                        end_time
+                        job_id_list, begin_time, end_time
                     )
                 )
                 job_id_list = self._remaining_jobs(job_id_list, results)
@@ -751,14 +781,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 end_time = begin_time + timedelta(seconds=1)
                 begin_time = end_time - timedelta(days=1, seconds=1)
 
-
             if end_time < self.boss.start_time and len(job_id_list) > 0:
                 # This is suspicious.
                 logger.warning(
                     "Could not find any information from sacct after "
                     "workflow start at %s about jobs: %s",
                     self.boss.start_time.isoformat(),
-                    job_id_list
+                    job_id_list,
                 )
 
             return results
@@ -785,6 +814,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
             assert begin_time.tzinfo is not None, "begin_time must be aware"
             assert end_time.tzinfo is not None, "end_time must be aware"
+
             def stringify(t: datetime) -> str:
                 """
                 Convert an aware time local time, and format it *without* a
@@ -825,14 +855,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         raise
                     job_statuses.update(
                         self._get_job_details_from_sacct_for_range(
-                            job_id_list[:len(job_id_list)//2],
+                            job_id_list[: len(job_id_list) // 2],
                             begin_time,
                             end_time,
                         )
                     )
                     job_statuses.update(
                         self._get_job_details_from_sacct_for_range(
-                            job_id_list[len(job_id_list)//2:],
+                            job_id_list[len(job_id_list) // 2 :],
                             begin_time,
                             end_time,
                         )
@@ -1164,8 +1194,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             # Also any extra arguments from --slurmArgs or TOIL_SLURM_ARGS
             nativeConfig: str = self.boss.config.slurm_args  # type: ignore[attr-defined]
 
-            is_any_mem_option = any_option_detector(["mem", "mem-per-cpu", "mem-per-gpu"])
-            is_any_cpus_option = any_option_detector([("cpus-per-task", "c"), "cpus-per-gpu"])
+            is_any_mem_option = any_option_detector(
+                ["mem", "mem-per-cpu", "mem-per-gpu"]
+            )
+            is_any_cpus_option = any_option_detector(
+                [("cpus-per-task", "c"), "cpus-per-gpu"]
+            )
             is_export_option = option_detector("export")
             is_export_file_option = option_detector("export-file")
             is_time_option = option_detector("time", "t")
@@ -1176,7 +1210,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
             # --export=[ALL,]<environment_toil_variables>
             export_all = True
-            export_list = [] # Some items here may be multiple comma-separated values
+            export_list = []  # Some items here may be multiple comma-separated values
             time_limit: int | None = self.boss.config.slurm_time  # type: ignore[attr-defined]
             partition: str | None = None
 
@@ -1286,10 +1320,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     raise RuntimeError(
                         f"The job {jobName} is requesting GPUs, but the Slurm cluster does not appear to have an accessible partition with GPUs"
                     )
-                if (
-                    time_limit is not None
-                    and gpu_partition.time_limit < time_limit
-                ):
+                if time_limit is not None and gpu_partition.time_limit < time_limit:
                     # TODO: find the lowest-priority GPU partition that has at least each job's time limit!
                     logger.warning(
                         "Trying to submit a job that needs %s seconds to partition %s that has a limit of %s seconds",
@@ -1312,7 +1343,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if gpus:
                 # Generate GPU assignment argument
                 sbatch_line.append(f"--gres=gpu:{gpus}")
-                if partition is not None and partition not in self.boss.partitions.gpu_partitions:
+                if self.boss.partitions.gpu_partitions is None:
+                    logger.warning(
+                        f"Job {jobName} needs GPUs, but specified partition {partition} might not have them. This job may not work."
+                        f"Try specifying a different partition"
+                    )
+                elif (
+                    partition is not None
+                    and partition not in self.boss.partitions.gpu_partitions
+                ):
                     # the specified partition is not compatible, so warn the user that the job may not work
                     logger.warning(
                         f"Job {jobName} needs GPUs, but specified partition {partition} does not have them. This job may not work."

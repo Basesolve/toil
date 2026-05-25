@@ -13,21 +13,21 @@
 # limitations under the License.
 import codecs
 import logging
-from pathlib import Path
 import random
 import sys
 import time
 import traceback
-from typing import cast, Any, Literal
+from pathlib import Path
 from threading import Event, Thread
+from typing import Any, Literal, cast
 
 import pytest
 
+from toil.batchSystems import DeadlockException
 from toil.batchSystems.singleMachine import SingleMachineBatchSystem
 from toil.exceptions import FailedJobsException
 from toil.job import Job, ServiceHostJob
 from toil.jobStores.abstractJobStore import AbstractJobStore
-from toil.batchSystems import DeadlockException
 from toil.test import pslow as slow
 
 logger = logging.getLogger(__name__)
@@ -177,9 +177,16 @@ class TestJobService:
         total_jobs = BUNDLE_SIZE * BUNDLE_COUNT * 2 + 1
         p_complete_job_failure = FAIL_FRACTION ** (RETRY_COUNT + 1)
         p_workflow_success = (1 - p_complete_job_failure) ** total_jobs
-        logger.info("Going to run %s total jobs, each of which completely fails %s of the time, so the workflow will succeed with probability %s", total_jobs, p_complete_job_failure, p_workflow_success)
+        logger.info(
+            "Going to run %s total jobs, each of which completely fails %s of the time, so the workflow will succeed with probability %s",
+            total_jobs,
+            p_complete_job_failure,
+            p_workflow_success,
+        )
         p_test_failure = (1 - p_workflow_success) ** MAX_ATTEMPTS
-        logger.info("This test will fail spuriously with probability %s", p_test_failure)
+        logger.info(
+            "This test will fail spuriously with probability %s", p_test_failure
+        )
 
         # We want to run the workflow through several times to test restarting, so we need it to often fail but reliably sometimes succeed, and almost always succeed when repeated.
 
@@ -192,7 +199,8 @@ class TestJobService:
             outFiles = [tmp_path / f"test{test}_{j}" for j in range(BUNDLE_COUNT)]
             # We send 3 messages each in 2 sets, each of which needs a service and a client
             messageBundles = [
-                [random.randint(1, sys.maxsize) for i in range(BUNDLE_SIZE)] for j in range(BUNDLE_COUNT)
+                [random.randint(1, sys.maxsize) for i in range(BUNDLE_SIZE)]
+                for j in range(BUNDLE_COUNT)
             ]
             # Wire up the services/jobs
             t = Job.wrapJobFn(
@@ -233,6 +241,7 @@ class TestJobService:
         options.logLevel = "DEBUG"
 
         options.retryCount = retryCount
+        options.retry_backoff_seconds = 0
         options.badWorker = badWorker
         options.badWorkerFailInterval = badWorkedFailInterval
         options.servicePollingInterval = 1
@@ -247,7 +256,12 @@ class TestJobService:
                 break
             except FailedJobsException as e:
                 i = e.numberOfFailedJobs
-                logger.info("Workflow attempt %s/%s failed with %s failed jobs", total_tries, max_attempts, i)
+                logger.info(
+                    "Workflow attempt %s/%s failed with %s failed jobs",
+                    total_tries,
+                    max_attempts,
+                    i,
+                )
                 if total_tries == max_attempts:
                     pytest.fail(reason="Exceeded a reasonable number of restarts")
                 total_tries += 1
@@ -261,10 +275,7 @@ class TestPerfectServicet(TestJobService):
         Let us run all the tests in the other service test class, but without worker failures.
         """
         kwargs["badWorker"] = 0
-        super().runToil(
-            *args,
-            **kwargs
-        )
+        super().runToil(*args, **kwargs)
 
 
 def serviceTest(job: Job, outFile: Path, messageInt: int) -> None:
@@ -278,9 +289,7 @@ def serviceTest(job: Job, outFile: Path, messageInt: int) -> None:
     # the serviceAccessor, to prove that when service test is checkpointed and
     # restarted there is never a connection made between an earlier service and
     # later serviceAccessor, or vice versa.
-    to_subtract = random.randint(
-        1, sys.maxsize
-    )
+    to_subtract = random.randint(1, sys.maxsize)
     job.addChildJobFn(
         serviceAccessor,
         job.addService(ToyService(messageInt + to_subtract)),
@@ -465,8 +474,8 @@ def serviceAccessor(
 
         # Try reading an integer from the input file and writing out the message
         with job.fileStore.jobStore.read_file_stream(outJobStoreFileID) as fH:
-            fH = codecs.getreader("utf-8")(fH)
-            line = fH.readline()
+            reader = codecs.getreader("utf-8")(fH)
+            line = reader.readline()
 
         tokens = line.split()
         if len(tokens) != 2:
