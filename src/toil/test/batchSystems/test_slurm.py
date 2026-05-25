@@ -284,6 +284,37 @@ class FakeBatchSystem(BatchSystemSupport):
         # Pretend to be a workflow that started before we pretend the jobs
         # we pretend to have ran.
         self.start_time = JOB_BASE_TIME - timedelta(hours=2)
+        self.excluded_nodes: set[str] = set()
+        self.failover_partitions: list[str] = []
+        self.failover_partition_index = 0
+        self.active_failover_partition: str | None = None
+        self.partition_switch_watch: set[int] = set()
+        self._lost_job_first_seen: dict[int, float] = {}
+        self._partition_switch_last_poll = 0.0
+
+    def assessBatchResources(self):
+        raise NotImplementedError()
+
+    def advance_failover_partition(self) -> str | None:
+        if not self.failover_partitions:
+            return None
+        if self.active_failover_partition is None:
+            self.failover_partition_index = 0
+            self.active_failover_partition = self.failover_partitions[0]
+        else:
+            self.failover_partition_index = (
+                self.failover_partition_index + 1
+            ) % len(self.failover_partitions)
+            self.active_failover_partition = self.failover_partitions[
+                self.failover_partition_index
+            ]
+        return self.active_failover_partition
+
+    def on_storage_failure(self, nodes: set[str]) -> None:
+        toil.batchSystems.slurm.SlurmBatchSystem.record_storage_failure_nodes(
+            self, nodes
+        )
+        self.advance_failover_partition()
 
     def getWaitDuration(self):
         return 10
@@ -869,3 +900,140 @@ class SlurmTest(ToilTest):
 
         result = toil.batchSystems.slurm.parse_slurm_time("365-00:00:00")
         self.assertEqual(result, 365 * 86400)
+
+
+class TestSlurmMountRecovery(ToilTest):
+    def setUp(self):
+        self.monkeypatch = pytest.MonkeyPatch()
+        self.worker = toil.batchSystems.slurm.SlurmBatchSystem.GridEngineThread(
+            newJobsQueue=Queue(),
+            updatedJobsQueue=Queue(),
+            killQueue=Queue(),
+            killedJobsQueue=Queue(),
+            boss=FakeBatchSystem(),
+        )
+
+    def test_parse_slurm_nodelist_bracket_range(self):
+        from toil.batchSystems.slurm_mount_recovery import parse_slurm_nodelist
+
+        self.assertEqual(
+            parse_slurm_nodelist("cn[001-003]"),
+            {"cn001", "cn002", "cn003"},
+        )
+
+    def test_is_fatal_storage_oserror_on_coordination_path(self):
+        from toil.batchSystems.slurm_mount_recovery import is_fatal_storage_oserror
+
+        err = OSError(5, "Input/output error", "/var/tmp/coord/jobState")
+        self.assertTrue(
+            is_fatal_storage_oserror(err, ["/var/tmp/coord", "/other"])
+        )
+        self.assertFalse(is_fatal_storage_oserror(err, ["/other"]))
+
+    def test_get_job_return_code_storage_exit(self):
+        code = self.worker._get_job_return_code(
+            ("FAILED", 136, ""), slurm_job_id=999, toil_job_id=1
+        )
+        self.assertEqual(code, (136, BatchJobExitReason.STORAGE))
+
+    def test_lost_job_timeout(self):
+        self.monkeypatch.setenv("TOIL_SLURM_LOST_JOB_TIMEOUT", "10")
+        status = ("NODE_FAIL", 0, "")
+        first = self.worker._get_job_return_code(
+            status, slurm_job_id=42, toil_job_id=1
+        )
+        self.assertIsNone(first)
+        self.worker.boss._lost_job_first_seen[42] = 0.0
+        second = self.worker._get_job_return_code(
+            status, slurm_job_id=42, toil_job_id=1
+        )
+        self.assertEqual(
+            second, (EXIT_STATUS_UNAVAILABLE_VALUE, BatchJobExitReason.LOST)
+        )
+
+    def test_advance_failover_partition(self):
+        boss = FakeBatchSystem()
+        boss.failover_partitions = ["compute-a", "compute-b"]
+        boss.advance_failover_partition()
+        self.assertEqual(boss.active_failover_partition, "compute-a")
+        boss.advance_failover_partition()
+        self.assertEqual(boss.active_failover_partition, "compute-b")
+
+    def test_prepare_sbatch_exclude_and_failover(self):
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sinfo)
+        boss = FakeBatchSystem()
+        boss.excluded_nodes = {"badnode1", "badnode2"}
+        boss.active_failover_partition = "spare"
+        boss.partitions = toil.batchSystems.slurm.SlurmBatchSystem.PartitionSet()
+        worker = toil.batchSystems.slurm.SlurmBatchSystem.GridEngineThread(
+            newJobsQueue=Queue(),
+            updatedJobsQueue=Queue(),
+            killQueue=Queue(),
+            killedJobsQueue=Queue(),
+            boss=boss,
+        )
+        command = worker.prepareSbatch(
+            1, 1000000, 99, "job", {}, None, True, ""
+        )
+        self.assertIn("--partition=spare", command)
+        self.assertTrue(
+            any(arg.startswith("--exclude=") for arg in command)
+        )
+
+    def test_partition_switch_on_high_restarts_not_only_begin_time(self):
+        calls: list[list[str]] = []
+
+        def fake_run_scontrol(*args, **kwargs):
+            calls.append(list(args))
+            if args[:2] == ("show", "partition"):
+                return "PartitionName=main Alternate=spare State=UP"
+            if args[:2] == ("show", "job"):
+                return (
+                    "JobId=999 JobState=PENDING Reason=Resources "
+                    "Restarts=6 Partition=main Comment="
+                )
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        self.monkeypatch.setenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", "5")
+        job_details = {
+            "JobId": "999",
+            "JobState": "PENDING",
+            "Reason": "Resources",
+            "Restarts": "6",
+            "Partition": "main",
+            "Comment": "",
+        }
+        self.worker.check_and_change_partition(job_details, restart_threshold=5)
+        update_calls = [c for c in calls if c and c[0] == "update"]
+        self.assertTrue(update_calls)
+        self.assertTrue(
+            any(
+                "Partition=spare" in arg
+                for call in update_calls
+                for arg in call
+            )
+        )
+
+    def test_record_storage_failure_nodes_exclude_cap_warning(self):
+        boss = FakeBatchSystem()
+        boss.excluded_nodes = {f"node{i}" for i in range(64)}
+        self.monkeypatch.setenv("TOIL_SLURM_MAX_EXCLUDED_NODES", "64")
+        with self.assertLogs("toil.batchSystems.slurm", level="WARNING") as cm:
+            toil.batchSystems.slurm.SlurmBatchSystem.record_storage_failure_nodes(
+                boss, {"newbad"}
+            )
+        self.assertNotIn("newbad", boss.excluded_nodes)
+        self.assertTrue(
+            any(
+                "TOIL_SLURM_MAX_EXCLUDED_NODES=64" in msg and "newbad" in msg
+                for msg in cm.output
+            )
+        )
+
+    def test_apply_storage_failure_outcome_empty_nodes_warning(self):
+        with self.assertLogs("toil.batchSystems.slurm", level="WARNING") as cm:
+            self.worker._apply_storage_failure_outcome(7, 999, None)
+        self.assertTrue(
+            any("no node names from Slurm job details" in msg for msg in cm.output)
+        )

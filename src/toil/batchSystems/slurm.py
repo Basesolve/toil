@@ -39,6 +39,22 @@ from toil.batchSystems.abstractGridEngineBatchSystem import (
     AbstractGridEngineBatchSystem,
 )
 from toil.batchSystems.options import OptionSetter
+from toil.batchSystems.slurm_mount_recovery import (
+    DEFAULT_MAX_EXCLUDED_NODES,
+    DEFAULT_PARTITION_SWITCH_COOLDOWN,
+    DEFAULT_PARTITION_SWITCH_POLL_INTERVAL,
+    PARTITION_SWITCH_STATES,
+    STORAGE_FAILURE_EXIT_CODE,
+    batch_logs_indicate_storage_failure,
+    env_bool,
+    env_csv,
+    env_float,
+    env_int,
+    parse_slurm_nodelist,
+    parse_scontrol_job_lines,
+    partition_switch_reason_matches,
+    run_scontrol,
+)
 from toil.bus import get_job_kind
 from toil.common import Config
 from toil.job import JobDescription, Requirer
@@ -340,6 +356,106 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         def killJob(self, jobID: int) -> None:
             call_command(["scancel", self.getBatchSystemID(jobID)])
 
+        def _slurm_restart_threshold(self) -> int:
+            return env_int("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5)
+
+        def checkOnJobs(self) -> bool:
+            if self.boss.partition_switch_watch:
+                interval = env_float(
+                    "TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL",
+                    DEFAULT_PARTITION_SWITCH_POLL_INTERVAL,
+                )
+                now = time.time()
+                if now - self.boss._partition_switch_last_poll >= interval:
+                    self.boss._partition_switch_last_poll = now
+                    self._poll_partition_switch_watch()
+                self._checkOnJobsTimestamp = None
+            return super().checkOnJobs()
+
+        def _poll_partition_switch_watch(self) -> None:
+            threshold = self._slurm_restart_threshold()
+            for slurm_job_id in list(self.boss.partition_switch_watch):
+                try:
+                    stdout = run_scontrol("show", "job", str(slurm_job_id), quiet=True)
+                except (CalledProcessErrorStderr, OSError) as e:
+                    logger.debug(
+                        "Partition switch watch: could not query job %s: %s",
+                        slurm_job_id,
+                        e,
+                    )
+                    continue
+                for record in stdout.strip().split("\n\n"):
+                    job_details = self._parse_scontrol_show_job_record(record)
+                    if not job_details:
+                        continue
+                    self._track_partition_switch_watch(slurm_job_id, job_details, threshold)
+                    self._maybe_invoke_partition_switch(slurm_job_id, job_details, threshold)
+                    state = self._canonicalize_state(job_details.get("JobState", ""))
+                    if state in TERMINAL_STATES:
+                        self.boss.partition_switch_watch.discard(slurm_job_id)
+
+        @staticmethod
+        def _parse_scontrol_show_job_record(record: str) -> dict[str, str]:
+            lines: list[str] = []
+            for line in record.splitlines():
+                lines.extend(line.split())
+            if not lines:
+                return {}
+            return parse_scontrol_job_lines(lines)
+
+        def _track_partition_switch_watch(
+            self, slurm_job_id: int, job_details: dict[str, str], threshold: int
+        ) -> None:
+            try:
+                restarts = int(job_details.get("Restarts", 0))
+            except ValueError:
+                restarts = 0
+            if restarts >= max(0, threshold - 1):
+                self.boss.partition_switch_watch.add(slurm_job_id)
+
+        def _nodes_from_job_details(self, job_details: dict[str, str]) -> set[str]:
+            nodes: set[str] = set()
+            for key in ("NodeList", "BatchHost", "AllocNode"):
+                nodes.update(parse_slurm_nodelist(job_details.get(key)))
+            return nodes
+
+        def _terminal_job_storage_failure(
+            self,
+            toil_job_id: int,
+            slurm_job_id: int,
+            status: JobStatusDetail,
+            job_details: dict[str, str] | None,
+        ) -> bool:
+            state, rc, _reason = status
+            if rc == STORAGE_FAILURE_EXIT_CODE:
+                return True
+            if job_details:
+                nodes = self._nodes_from_job_details(job_details)
+                if nodes and batch_logs_indicate_storage_failure(self.boss, toil_job_id):
+                    return True
+            return batch_logs_indicate_storage_failure(self.boss, toil_job_id)
+
+        def _apply_storage_failure_outcome(
+            self,
+            toil_job_id: int,
+            slurm_job_id: int,
+            job_details: dict[str, str] | None,
+        ) -> tuple[int, BatchJobExitReason]:
+            nodes: set[str] = set()
+            if job_details:
+                nodes = self._nodes_from_job_details(job_details)
+            if not nodes:
+                logger.warning(
+                    "Storage I/O failure for Toil job %s (Slurm job %s) but no node "
+                    "names from Slurm job details; sbatch --exclude and drain will "
+                    "not target a host for this incident",
+                    toil_job_id,
+                    slurm_job_id,
+                )
+            self.boss.on_storage_failure(nodes)
+            self.boss._lost_job_first_seen.pop(slurm_job_id, None)
+            return (STORAGE_FAILURE_EXIT_CODE, BatchJobExitReason.STORAGE)
+
         def prepareSubmission(
             self,
             cpu: int,
@@ -416,8 +532,22 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             job_id_list = [int(id.split(".")[0]) for id in batch_job_id_list]
             status_dict = self._get_job_details(job_id_list)
             exit_codes: list[int | tuple[int, BatchJobExitReason | None] | None] = []
-            for _, status in status_dict.items():
-                exit_codes.append(self._get_job_return_code(status))
+            with self.runningJobsLock:
+                slurm_to_toil = {
+                    int(self.batchJobIDs[x][0].split(".")[0]): x
+                    for x in self.runningJobs
+                    if x in self.batchJobIDs
+                }
+            for slurm_job_id, status in status_dict.items():
+                toil_job_id = slurm_to_toil.get(slurm_job_id)
+                code = self._get_job_return_code(
+                    status, slurm_job_id=slurm_job_id, toil_job_id=toil_job_id
+                )
+                if toil_job_id is not None:
+                    code = self._finalize_exit_code(
+                        code, toil_job_id, slurm_job_id, status
+                    )
+                exit_codes.append(code)
             return exit_codes
 
         def getJobExitCode(
@@ -433,7 +563,21 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             job_id = int(batchJobID.split(".")[0])
             status_dict = self._get_job_details([job_id])
             status = status_dict[job_id]
-            return self._get_job_return_code(status)
+            toil_job_id = None
+            with self.runningJobsLock:
+                for running_id in self.runningJobs:
+                    if (
+                        running_id in self.batchJobIDs
+                        and int(self.batchJobIDs[running_id][0].split(".")[0]) == job_id
+                    ):
+                        toil_job_id = running_id
+                        break
+            code = self._get_job_return_code(
+                status, slurm_job_id=job_id, toil_job_id=toil_job_id
+            )
+            if toil_job_id is not None:
+                code = self._finalize_exit_code(code, toil_job_id, job_id, status)
+            return code
 
         def getUpdatedBatchJob(self, maxWait):
             try:
@@ -513,7 +657,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             return status_dict
 
         def _get_job_return_code(
-            self, status: JobStatusDetail
+            self,
+            status: JobStatusDetail,
+            slurm_job_id: int | None = None,
+            toil_job_id: int | None = None,
         ) -> int | tuple[int, BatchJobExitReason | None] | None:
             """
             Given a Slurm return code, status pair, summarize them into a Toil return code, exit reason pair.
@@ -554,10 +701,37 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 return (rc, exit_reason)  # type: ignore[return-value] # mypy doesn't understand enums well
 
             if exit_reason == BatchJobExitReason.LOST:
-                # logger.debug(
-                #     "[SlurmJobHandler] NODE_FAIL encountered. Waiting for slurm to use other nodes in partition."
-                # )
+                lost_timeout = env_float("TOIL_SLURM_LOST_JOB_TIMEOUT", None)
+                if lost_timeout is not None and slurm_job_id is not None:
+                    now = time.time()
+                    first_seen = self.boss._lost_job_first_seen.get(slurm_job_id)
+                    if first_seen is None:
+                        self.boss._lost_job_first_seen[slurm_job_id] = now
+                        logger.debug(
+                            "Slurm job %s in LOST-related state %s; waiting up to %ss for Slurm",
+                            slurm_job_id,
+                            state,
+                            lost_timeout,
+                        )
+                        return None
+                    if now - first_seen < lost_timeout:
+                        return None
+                    logger.warning(
+                        "Slurm job %s remained in LOST-related state %s for %ss; "
+                        "treating as failed so Toil can retry",
+                        slurm_job_id,
+                        state,
+                        lost_timeout,
+                    )
+                    self.boss._lost_job_first_seen.pop(slurm_job_id, None)
+                    return (EXIT_STATUS_UNAVAILABLE_VALUE, BatchJobExitReason.LOST)
                 return None
+
+            if slurm_job_id is not None:
+                self.boss._lost_job_first_seen.pop(slurm_job_id, None)
+
+            if rc == STORAGE_FAILURE_EXIT_CODE:
+                return (STORAGE_FAILURE_EXIT_CODE, BatchJobExitReason.STORAGE)
 
             if rc == 0:
                 # The job claims to be in a state other than COMPLETED, but
@@ -566,6 +740,47 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 return (EXIT_STATUS_UNAVAILABLE_VALUE, exit_reason)
             # If the code is nonzero, pass it along.
             return (rc, exit_reason)  # type: ignore[return-value] # mypy doesn't understand enums well
+
+        def _finalize_exit_code(
+            self,
+            code: int | tuple[int, BatchJobExitReason | None] | None,
+            toil_job_id: int,
+            slurm_job_id: int,
+            status: JobStatusDetail,
+        ) -> int | tuple[int, BatchJobExitReason | None] | None:
+            if code is None:
+                return None
+            if isinstance(code, BatchJobExitReason):
+                return code
+            if isinstance(code, int):
+                exit_code, exit_reason = code, None
+            else:
+                exit_code, exit_reason = code
+            if exit_code == STORAGE_FAILURE_EXIT_CODE:
+                job_details = self._fetch_scontrol_job_details(slurm_job_id)
+                return self._apply_storage_failure_outcome(
+                    toil_job_id, slurm_job_id, job_details
+                )
+            job_details = self._fetch_scontrol_job_details(slurm_job_id)
+            if self._terminal_job_storage_failure(
+                toil_job_id, slurm_job_id, status, job_details
+            ):
+                return self._apply_storage_failure_outcome(
+                    toil_job_id, slurm_job_id, job_details
+                )
+            if isinstance(code, int):
+                return code
+            return (exit_code, exit_reason)
+
+        def _fetch_scontrol_job_details(self, slurm_job_id: int) -> dict[str, str] | None:
+            try:
+                stdout = run_scontrol("show", "job", str(slurm_job_id), quiet=True)
+            except (CalledProcessErrorStderr, OSError):
+                return None
+            records = stdout.strip().split("\n\n")
+            if not records:
+                return None
+            return self._parse_scontrol_show_job_record(records[0])
 
         def get_last_partition_switch_details(self, comment):
             """Get last partition switch time if comment contains it and the switch was done before 2 min
@@ -599,101 +814,141 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             logger.debug("Updated Comment: %s", updated_comment)
             return (last_switch_time, switch_count, updated_comment)
 
-        def check_and_change_partition(self, job_details, restart_threshold=5):
-            """Get the job restart count and switch partition.
-            TODO: restart_threshold=-1 implies node count per partition.
-
-            :param job_id: pending jobs id
-            :type job_id: int
-            :param restart_threshold: number of restarts to wait for before updating partition, defaults to 5
-            :type restart_threshold: int, optional
-            """
-            # logger.debug("Slurm job details: %s", job_details)
-            # comment would not be available if not definied during submission
-            job_id = job_details.get("JobId")
-            comment = job_details.get("Comment")
-            restart_count = int(job_details.get("Restarts"))
-            partition = job_details.get("Partition")
-            alternate_partition = (
-                os.popen(
-                    f"""
-                scontrol -o show partition {partition} |
-                sed 's/ /\\n/g' |
-                grep 'Alternate' |
-                cut -d "=" -f2
-                """
-                )
-                .read()
-                .strip()
-            )
-            if alternate_partition:
-                partition_state = (
-                    os.popen(
-                        f"""
-                    scontrol -o show partition {partition} |
-                    sed 's/ /\\n/g' |
-                    grep State |
-                    cut -d "=" -f2
-                    """
-                    )
-                    .read()
-                    .strip()
-                )
-                if partition_state != "UP":
-                    logger.debug(
-                        "Cannot switch partition: Configured alternate partition %s is %s",
-                        alternate_partition,
-                        partition_state,
-                    )
-                    return
-            else:
+        def _get_alternate_partition(self, partition: str | None) -> str | None:
+            if not partition:
+                return None
+            try:
+                stdout = run_scontrol("show", "partition", partition, quiet=True)
+            except (CalledProcessErrorStderr, OSError) as e:
+                logger.debug("Could not read partition %s: %s", partition, e)
+                return None
+            alternate: str | None = None
+            partition_state: str | None = None
+            for line in stdout.splitlines():
+                for item in line.split():
+                    if item.startswith("Alternate="):
+                        alternate = item.split("=", 1)[1]
+                    elif item.startswith("State="):
+                        partition_state = item.split("=", 1)[1]
+            if not alternate:
                 logger.debug(
-                    "Cannot switch partition: No alternate partition configured for %s",
+                    "Cannot switch partition: no Alternate= configured for %s",
                     partition,
                 )
-                return
+                return None
+            if partition_state and partition_state != "UP":
+                logger.debug(
+                    "Cannot switch partition: alternate partition %s is %s",
+                    alternate,
+                    partition_state,
+                )
+                return None
+            return alternate
 
-            # set max_possible restart threshold
-            # if restart_threshold == -1:
-            #     restart_threshold = total_nodes
+        def _maybe_invoke_partition_switch(
+            self,
+            slurm_job_id: int,
+            job_details: dict[str, str],
+            restart_threshold: int,
+        ) -> None:
+            state = self._canonicalize_state(job_details.get("JobState", ""))
+            reason = job_details.get("Reason")
+            if state not in PARTITION_SWITCH_STATES:
+                return
+            if not partition_switch_reason_matches(reason):
+                return
+            try:
+                restart_count = int(job_details.get("Restarts", 0))
+            except ValueError:
+                restart_count = 0
+            self._track_partition_switch_watch(slurm_job_id, job_details, restart_threshold)
+            if restart_count < restart_threshold:
+                return
+            partition = job_details.get("Partition")
+            alternate_partition = self._get_alternate_partition(partition)
+            if not alternate_partition:
+                return
+            if partition == alternate_partition:
+                return
+            comment = job_details.get("Comment")
             last_switch_time, switch_count, updated_comment = (
                 self.get_last_partition_switch_details(comment)
             )
-            if last_switch_time:
-                if (int(time.time()) - last_switch_time) < 300000:
-                    logger.debug(
-                        "Seems like last patition switch happened just 5 min before. Skipping switch for now"
-                    )
-                    return
-                restart_threshold *= switch_count + 1
+            cooldown = env_int(
+                "TOIL_SLURM_PARTITION_SWITCH_COOLDOWN",
+                DEFAULT_PARTITION_SWITCH_COOLDOWN,
+            )
+            if last_switch_time and (int(time.time()) - last_switch_time) < cooldown:
                 logger.debug(
-                    "Partition was already switched for the job, doubling the restart threshold to %s",
-                    restart_threshold,
+                    "Skipping partition switch for job %s; last switch was %ss ago",
+                    slurm_job_id,
+                    int(time.time()) - last_switch_time,
                 )
-            if int(restart_count) >= restart_threshold:
-                # make sure comment is not none and contains the partition switch term
-                logger.info(
-                    "Job %s seems to have restarted by slurm beyond the threshold %s. Switching to alternate partition %s",
-                    job_id,
-                    restart_threshold,
-                    alternate_partition,
-                )
-                switch_command = f'scontrol update jobid={job_id} partition={alternate_partition} comment="{updated_comment}"'
-                logger.info(f"Executing: {switch_command}")
-                switch_exit_code = os.system(switch_command)
-                if switch_exit_code == 0:
-                    logger.info(
-                        "Job: %s has been swithced to alternate partition: %s",
-                        job_id,
-                        alternate_partition,
-                    )
+                return
+            if switch_count:
+                restart_threshold *= switch_count + 1
+                if restart_count < restart_threshold:
+                    return
+            self._switch_job_partition(
+                slurm_job_id, alternate_partition, updated_comment, state
+            )
+
+        def _switch_job_partition(
+            self,
+            slurm_job_id: int,
+            alternate_partition: str,
+            updated_comment: str,
+            state: str,
+        ) -> None:
+            update_args = [
+                "update",
+                f"JobId={slurm_job_id}",
+                f"Partition={alternate_partition}",
+                f'Comment={updated_comment}',
+            ]
+            try:
+                if state == "RUNNING":
+                    run_scontrol("hold", str(slurm_job_id), quiet=True)
+                    run_scontrol(*update_args, quiet=True)
+                    run_scontrol("release", str(slurm_job_id), quiet=True)
                 else:
+                    run_scontrol(*update_args, quiet=True)
+                logger.info(
+                    "Job %s switched to alternate partition %s (was %s)",
+                    slurm_job_id,
+                    alternate_partition,
+                    state,
+                )
+                self.boss.partition_switch_watch.discard(slurm_job_id)
+            except (CalledProcessErrorStderr, OSError) as e:
+                logger.warning(
+                    "Job %s could not switch to partition %s (%s); canceling for Toil retry",
+                    slurm_job_id,
+                    alternate_partition,
+                    e,
+                )
+                try:
+                    call_command(["scancel", str(slurm_job_id)])
+                except (CalledProcessErrorStderr, OSError) as cancel_err:
                     logger.warning(
-                        "Job: %s could not be swithced to alternate partition: %s, Error Code: %s",
-                        job_id,
-                        alternate_partition,
-                        switch_exit_code,
+                        "Could not cancel job %s after failed partition switch: %s",
+                        slurm_job_id,
+                        cancel_err,
                     )
+
+        def check_and_change_partition(
+            self, job_details: dict[str, str], restart_threshold: int | None = None
+        ) -> None:
+            """Switch a Slurm-requeued job to its partition's Alternate= target when restarts exceed threshold."""
+            if restart_threshold is None:
+                restart_threshold = self._slurm_restart_threshold()
+            job_id_raw = job_details.get("JobId")
+            if job_id_raw is None:
+                return
+            slurm_job_id = int(str(job_id_raw).split(".")[0])
+            self._maybe_invoke_partition_switch(
+                slurm_job_id, job_details, restart_threshold
+            )
 
         def _canonicalize_state(self, state: str) -> str:
             """
@@ -898,48 +1153,18 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 signal: int
                 status, signal = (int(n) for n in exitcode.split(":"))
                 reason = ""
-                if state == "PENDING":
-                    # sacct does not report the job pending reason in realtime. but scontrol does.
-                    job_details = (
-                        os.popen(
-                            f"""
-                        scontrol -o show job {job_id} |
-                        sed 's/ /\\n/g'
-                        """
-                        )
-                        .read()
-                        .strip()
-                        .splitlines()
-                    )
-                    # 'Reason|Comment|Restarts|Partition'
-                    jdict = {}
-                    for item in job_details:
-                        bits = item.split("=", 1)
-                        if len(bits) == 1:
-                            jdict[key] += " " + bits[0]
-                        else:
-                            key = bits[0]
-                            jdict[key] = bits[1]
-                    reason = jdict.get("Reason")
+                if state in PARTITION_SWITCH_STATES:
+                    job_details = self._fetch_scontrol_job_details(job_id) or {}
+                    reason = job_details.get("Reason", "")
                     if reason == "BadConstraints":
                         status = 7
-                    if reason == "BeginTime":
-                        logger.debug(
-                            "Job: %s is in %s state. Checking if alternate partition to be used.",
-                            job_id,
-                            state,
-                        )
-                        user_slurm_restart_thresh = int(
-                            os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5)
-                        )
-                        logger.debug(
-                            "User override value for slurm job restart: %i",
-                            user_slurm_restart_thresh,
-                        )
-                        self.check_and_change_partition(
-                            job_details=jdict,
-                            restart_threshold=user_slurm_restart_thresh,
-                        )
+                    logger.debug(
+                        "Job %s in %s (reason=%s); checking Slurm partition switch",
+                        job_id,
+                        state,
+                        reason,
+                    )
+                    self.check_and_change_partition(job_details)
                 if signal > 0:
                     # A non-zero signal may indicate e.g. an out-of-memory killed job
                     status = 128 + signal
@@ -1020,26 +1245,17 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 state = job["JobState"]
                 state = self._canonicalize_state(state)
                 reason = ""
-                if state == "PENDING":
-                    reason = job.get("Reason")
+                if state in PARTITION_SWITCH_STATES:
+                    reason = job.get("Reason", "")
                     if reason == "BadConstraints":
                         job["ExitCode"] = 7
-                    if reason == "BeginTime":
-                        logger.debug(
-                            "Job: %s is in %s state. Checking if alternate partition to be used.",
-                            job_id,
-                            state,
-                        )
-                        user_slurm_restart_thresh = int(
-                            os.getenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5)
-                        )
-                        logger.debug(
-                            "User override value for slurm job restart: %i",
-                            user_slurm_restart_thresh,
-                        )
-                        self.check_and_change_partition(
-                            job_details=job, restart_threshold=user_slurm_restart_thresh
-                        )
+                    logger.debug(
+                        "Job %s in %s (reason=%s); checking Slurm partition switch",
+                        job_id,
+                        state,
+                        reason,
+                    )
+                    self.check_and_change_partition(job)
                 logger.log(TRACE, "%s state of job %s is %s", args[0], job_id, state)
                 try:
                     exitcode = job["ExitCode"]
@@ -1339,12 +1555,24 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 # Pick a partition based on time limit
                 partition = self.boss.partitions.get_partition(time_limit)
 
+            if self.boss.active_failover_partition:
+                partition = self.boss.active_failover_partition
+
             # Now generate all the arguments
             if len(export_list) > 0:
                 # add --export to the sbatch
                 sbatch_line.append("--export=" + ",".join(export_list))
             if partition is not None:
                 sbatch_line.append(f"--partition={partition}")
+            if self.boss.excluded_nodes:
+                max_excluded = env_int(
+                    "TOIL_SLURM_MAX_EXCLUDED_NODES", DEFAULT_MAX_EXCLUDED_NODES
+                )
+                exclude_list = ",".join(
+                    sorted(self.boss.excluded_nodes)[:max_excluded]
+                )
+                if exclude_list:
+                    sbatch_line.append(f"--exclude={exclude_list}")
             if gpus:
                 # Generate GPU assignment argument
                 sbatch_line.append(f"--gres=gpu:{gpus}")
@@ -1411,6 +1639,105 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         # Record when the workflow started, so we know when to stop looking for
         # jobs we ran.
         self.start_time = datetime.now().astimezone(None)
+        self.excluded_nodes: set[str] = set()
+        failover = getattr(config, "slurm_partition_failover", None)
+        if isinstance(failover, str):
+            self.failover_partitions = [
+                p.strip() for p in failover.split(",") if p.strip()
+            ]
+        elif failover:
+            self.failover_partitions = list(failover)
+        else:
+            self.failover_partitions = env_csv("TOIL_SLURM_PARTITION_FAILOVER")
+        self.failover_partition_index = 0
+        self.active_failover_partition: str | None = None
+        self.partition_switch_watch: set[int] = set()
+        self._lost_job_first_seen: dict[int, float] = {}
+        self._partition_switch_last_poll = 0.0
+
+    def advance_failover_partition(self) -> str | None:
+        """Rotate to the next configured failover partition for new sbatch submissions."""
+        if not self.failover_partitions:
+            return None
+        if self.active_failover_partition is None:
+            self.failover_partition_index = 0
+            self.active_failover_partition = self.failover_partitions[0]
+        else:
+            self.failover_partition_index = (
+                self.failover_partition_index + 1
+            ) % len(self.failover_partitions)
+            self.active_failover_partition = self.failover_partitions[
+                self.failover_partition_index
+            ]
+        logger.info(
+            "Slurm partition failover: subsequent worker jobs will use partition %s",
+            self.active_failover_partition,
+        )
+        return self.active_failover_partition
+
+    def record_storage_failure_nodes(self, nodes: set[str]) -> None:
+        if not nodes:
+            return
+        max_nodes = env_int("TOIL_SLURM_MAX_EXCLUDED_NODES", DEFAULT_MAX_EXCLUDED_NODES)
+        added: list[str] = []
+        skipped_cap: list[str] = []
+        for node in nodes:
+            if node in self.excluded_nodes:
+                continue
+            if len(self.excluded_nodes) >= max_nodes:
+                skipped_cap.append(node)
+                continue
+            self.excluded_nodes.add(node)
+            added.append(node)
+        if skipped_cap:
+            logger.warning(
+                "Cannot add %s to sbatch --exclude: cap TOIL_SLURM_MAX_EXCLUDED_NODES=%s "
+                "(%s nodes already excluded). Enable --slurmDrainBadNodes for persistently "
+                "bad nodes on large clusters.",
+                ", ".join(sorted(skipped_cap)),
+                max_nodes,
+                len(self.excluded_nodes),
+            )
+        if added:
+            logger.warning(
+                "Excluding Slurm nodes after storage I/O failure: %s",
+                ", ".join(sorted(added)),
+            )
+
+    def drain_nodes_if_enabled(self, nodes: set[str]) -> None:
+        drain = env_bool("TOIL_SLURM_DRAIN_BAD_NODES") or bool(
+            getattr(self.config, "slurm_drain_bad_nodes", False)
+        )
+        if not drain:
+            return
+        reason = "Toil: mount I/O failure"
+        for node in sorted(nodes):
+            try:
+                info = run_scontrol("show", "node", node, quiet=True)
+            except (CalledProcessErrorStderr, OSError) as e:
+                logger.warning("Could not inspect node %s before drain: %s", node, e)
+                continue
+            if "State=IDLE" not in info and "State=ALLOCATED" not in info and (
+                "DRAIN" in info or "DOWN" in info
+            ):
+                logger.debug("Node %s already drained or down", node)
+                continue
+            try:
+                run_scontrol(
+                    "update",
+                    f"NodeName={node}",
+                    "State=DRAIN",
+                    f"Reason={reason}",
+                    quiet=True,
+                )
+                logger.info("Drained Slurm node %s (%s)", node, reason)
+            except (CalledProcessErrorStderr, OSError) as e:
+                logger.warning("Could not drain Slurm node %s: %s", node, e)
+
+    def on_storage_failure(self, nodes: set[str]) -> None:
+        self.record_storage_failure_nodes(nodes)
+        self.advance_failover_partition()
+        self.drain_nodes_if_enabled(nodes)
 
     # Override issuing jobs so we can check if we need to use Slurm's magic
     # whole-node-memory feature.
@@ -1630,6 +1957,23 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             env_var="TOIL_SLURM_ARGS",
             help="Extra arguments to pass to Slurm.",
         )
+        parser.add_argument(
+            "--slurmPartitionFailover",
+            dest="slurm_partition_failover",
+            default=None,
+            env_var="TOIL_SLURM_PARTITION_FAILOVER",
+            help="Comma-separated Slurm partitions to rotate through after storage I/O failures "
+            "(applies to newly submitted worker jobs).",
+        )
+        parser.add_argument(
+            "--slurmDrainBadNodes",
+            dest="slurm_drain_bad_nodes",
+            type=strtobool,
+            default=False,
+            env_var="TOIL_SLURM_DRAIN_BAD_NODES",
+            help="If True, drain Slurm nodes where a worker reported mount/storage I/O failure "
+            "(requires permission to run scontrol update on nodes).",
+        )
 
     OptionType = TypeVar("OptionType")
 
@@ -1642,3 +1986,5 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         setOption("slurm_gpu_partition")
         setOption("slurm_pe")
         setOption("slurm_args")
+        setOption("slurm_partition_failover")
+        setOption("slurm_drain_bad_nodes")

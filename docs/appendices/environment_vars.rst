@@ -169,6 +169,37 @@ There are several environment variables that affect the way Toil runs.
 |                                      | example, ``2-07:15:30`` for 2 days, 7 hours, 15     |
 |                                      | minutes and 30 seconds, or ``4:00:00`` for 4 hours. |
 +--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_DRAIN_BAD_NODES           | If true, drain nodes where workers report storage   |
+|                                      | I/O failure (needs ``scontrol`` permission).        |
+|                                      | Primary way to remove persistently bad nodes on     |
+|                                      | large clusters (hundreds to thousands of nodes).    |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SCONTROL                  | Path to ``scontrol`` (default: ``scontrol``).         |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SCONTROL_PREFIX           | Command prefix before ``scontrol``, e.g. ``sudo``.    |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_MAX_EXCLUDED_NODES        | Max nodes in per-workflow ``sbatch --exclude`` after|
+|                                      | mount failures (default: 64). Only failed hosts are |
+|                                      | excluded; the partition is unchanged. Use drain for |
+|                                      | nodes that stay bad; avoid setting this to hundreds.|
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_LOST_JOB_TIMEOUT          | Seconds before Slurm LOST/NODE_FAIL jobs surface to |
+|                                      | the leader for retry (unset = wait indefinitely).   |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_JOB_RESTART_THRESHOLD     | Slurm ``Restarts`` count before in-place partition  |
+|                                      | switch via cluster ``Alternate=`` (default: 5).     |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_PARTITION_SWITCH_COOLDOWN | Seconds between in-place partition switches (default |
+|                                      | 300).                                               |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL | Fast-poll interval (seconds) for partition-switch |
+|                                      | watch list on busy clusters (default: 0.25).        |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_PARTITION_FAILOVER        | Optional. Comma-separated partitions Toil rotates   |
+|                                      | through after each storage failure for **new**      |
+|                                      | worker submissions. Unset for node-only recovery    |
+|                                      | (``--exclude`` + drain) on the same partition.      |
++--------------------------------------+-----------------------------------------------------+
 | TOIL_GRIDENGINE_ARGS                 | Arguments for qsub for the gridengine batch         |
 |                                      | system. Do not pass CPU or memory specifications    |
 |                                      | here. Instead, define resource requirements for     |
