@@ -64,6 +64,8 @@ class BatchJobExitReason(enum.IntEnum):
     """Process was killed by scheduler due constraints"""
     CONTAINER_MEMLIMIT: int = 137
     """Container memory limit is exceeded"""
+    STORAGE: int = 10
+    """Node-local or mount storage I/O failure on the compute node."""
 
     @classmethod
     def to_string(cls, value: int) -> str:
