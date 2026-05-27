@@ -17,13 +17,12 @@ Helpers for Slurm mount / storage I/O failure detection and recovery.
 from __future__ import annotations
 
 import errno
-import glob
 import logging
 import os
 import re
 from typing import TYPE_CHECKING
 
-from toil.lib.misc import call_command
+from toil.lib.misc import CalledProcessErrorStderr, call_command
 
 if TYPE_CHECKING:
     from toil.batchSystems.slurm import SlurmBatchSystem
@@ -120,31 +119,73 @@ def storage_failure_in_text(text: str) -> bool:
     return any(marker in text for marker in STORAGE_FAILURE_LOG_MARKERS)
 
 
+def _split_slurm_list_at_depth_zero(value: str) -> list[str]:
+    """Split a Slurm list on commas that appear outside of ``[...]`` bracket groups."""
+    segments: list[str] = []
+    depth = 0
+    start = 0
+    for index, char in enumerate(value):
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth = max(0, depth - 1)
+        elif char == "," and depth == 0:
+            segments.append(value[start:index])
+            start = index + 1
+    segments.append(value[start:])
+    return segments
+
+
+def _expand_slurm_bracket_token(prefix: str, token: str, nodes: set[str]) -> None:
+    """Expand one inner bracket token (e.g. ``001-003`` or ``005``) into hostnames."""
+    token = token.strip()
+    if not token:
+        return
+    range_match = re.match(r"^(\d+)(?:-(\d+))?$", token)
+    if not range_match:
+        nodes.add(f"{prefix}{token}")
+        return
+    start, end = range_match.group(1), range_match.group(2)
+    if end is None:
+        nodes.add(f"{prefix}{start}")
+        return
+    width = len(start)
+    for i in range(int(start), int(end) + 1):
+        nodes.add(f"{prefix}{str(i).zfill(width)}")
+
+
+def _parse_slurm_nodelist_local(nodelist: str) -> set[str]:
+    """Parse a NodeList without calling Slurm (comma-safe inside brackets)."""
+    nodes: set[str] = set()
+    for segment in _split_slurm_list_at_depth_zero(nodelist):
+        segment = segment.strip()
+        if not segment:
+            continue
+        bracket_match = re.match(r"^([^\[]+)\[(.+)\]$", segment)
+        if bracket_match:
+            prefix, inner = bracket_match.group(1), bracket_match.group(2)
+            for token in _split_slurm_list_at_depth_zero(inner):
+                _expand_slurm_bracket_token(prefix, token, nodes)
+        else:
+            nodes.add(segment)
+    return nodes
+
+
 def parse_slurm_nodelist(nodelist: str | None) -> set[str]:
     """
     Parse Slurm NodeList / BatchHost values into individual node hostnames.
     """
     if not nodelist:
         return set()
-    nodes: set[str] = set()
-    for segment in nodelist.split(","):
-        segment = segment.strip()
-        if not segment:
-            continue
-        bracket_match = re.match(r"^([^\[]+)\[(\d+)(?:-(\d+))?\]$", segment)
-        if bracket_match:
-            prefix, start, end = bracket_match.group(1), bracket_match.group(2), bracket_match.group(
-                3
-            )
-            if end is None:
-                nodes.add(f"{prefix}{start}")
-            else:
-                width = len(start)
-                for i in range(int(start), int(end) + 1):
-                    nodes.add(f"{prefix}{str(i).zfill(width)}")
-        else:
-            nodes.add(segment)
-    return nodes
+    nodelist = nodelist.strip()
+    try:
+        stdout = run_scontrol("show", "hostnames", nodelist, quiet=True)
+        nodes = {line.strip() for line in stdout.splitlines() if line.strip()}
+        if nodes:
+            return nodes
+    except (CalledProcessErrorStderr, OSError):
+        pass
+    return _parse_slurm_nodelist_local(nodelist)
 
 
 def build_scontrol_argv(*args: str) -> list[str]:
@@ -187,13 +228,17 @@ def partition_switch_reason_matches(reason: str | None) -> bool:
     return any(p.lower() in reason_lower for p in patterns)
 
 
-def batch_logs_indicate_storage_failure(boss: SlurmBatchSystem, job_id: int) -> bool:
-    """Scan Slurm stdout/stderr logs for this batch job for I/O error markers."""
-    try:
-        pattern = boss.format_std_out_err_glob(job_id)
-    except Exception:
-        return False
-    for path in glob.glob(pattern):
+def batch_logs_indicate_storage_failure(
+    boss: SlurmBatchSystem, toil_job_id: int, slurm_job_id: int
+) -> bool:
+    """Scan this Slurm attempt's stdout/stderr logs for I/O error markers."""
+    for std in ("out", "err"):
+        try:
+            path = boss.format_std_out_err_path(
+                toil_job_id, str(slurm_job_id), std
+            )
+        except Exception:
+            continue
         try:
             with open(path, "rb") as handle:
                 chunk = handle.read(65536)

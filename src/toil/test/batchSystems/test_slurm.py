@@ -2,6 +2,7 @@ import errno
 import inspect
 import logging
 import sys
+import tempfile
 import textwrap
 from datetime import datetime, timedelta
 from queue import Queue
@@ -954,10 +955,76 @@ class TestSlurmMountRecovery(ToilTest):
     def test_parse_slurm_nodelist_bracket_range(self):
         from toil.batchSystems.slurm_mount_recovery import parse_slurm_nodelist
 
+        def reject_scontrol(*_args, **_kwargs):
+            raise CalledProcessErrorStderr(1, "scontrol", stderr="unavailable")
+
+        self.monkeypatch.setattr(
+            toil.batchSystems.slurm_mount_recovery,
+            "run_scontrol",
+            reject_scontrol,
+        )
         self.assertEqual(
             parse_slurm_nodelist("cn[001-003]"),
             {"cn001", "cn002", "cn003"},
         )
+
+    def test_parse_slurm_nodelist_bracket_comma_list(self):
+        from toil.batchSystems.slurm_mount_recovery import parse_slurm_nodelist
+
+        def reject_scontrol(*_args, **_kwargs):
+            raise CalledProcessErrorStderr(1, "scontrol", stderr="unavailable")
+
+        self.monkeypatch.setattr(
+            toil.batchSystems.slurm_mount_recovery,
+            "run_scontrol",
+            reject_scontrol,
+        )
+        self.assertEqual(
+            parse_slurm_nodelist("cn[001-003,005]"),
+            {"cn001", "cn002", "cn003", "cn005"},
+        )
+
+    def test_parse_slurm_nodelist_mixed_segments(self):
+        from toil.batchSystems.slurm_mount_recovery import parse_slurm_nodelist
+
+        def reject_scontrol(*_args, **_kwargs):
+            raise CalledProcessErrorStderr(1, "scontrol", stderr="unavailable")
+
+        self.monkeypatch.setattr(
+            toil.batchSystems.slurm_mount_recovery,
+            "run_scontrol",
+            reject_scontrol,
+        )
+        self.assertEqual(
+            parse_slurm_nodelist("cn001,cn[002-003]"),
+            {"cn001", "cn002", "cn003"},
+        )
+
+    def test_batch_logs_storage_failure_current_slurm_job_only(self):
+        from toil.batchSystems.slurm_mount_recovery import (
+            STORAGE_FAILURE_LOG_MARKERS,
+            batch_logs_indicate_storage_failure,
+        )
+
+        boss = FakeBatchSystem()
+        with tempfile.TemporaryDirectory() as logs_dir:
+            boss.config.batch_logs_dir = logs_dir
+            workflow_id = boss.config.workflowID
+            toil_job_id = 1
+            marker = STORAGE_FAILURE_LOG_MARKERS[0]
+            old_path = boss.format_std_out_err_path(toil_job_id, "100", "out")
+            current_path = boss.format_std_out_err_path(toil_job_id, "200", "out")
+            with open(old_path, "w", encoding="utf-8") as handle:
+                handle.write(marker)
+            with open(current_path, "w", encoding="utf-8") as handle:
+                handle.write("completed ok\n")
+            self.assertTrue(
+                batch_logs_indicate_storage_failure(boss, toil_job_id, 100)
+            )
+            self.assertFalse(
+                batch_logs_indicate_storage_failure(boss, toil_job_id, 200)
+            )
+            self.assertIn(workflow_id, old_path)
 
     def test_is_fatal_storage_oserror_on_coordination_path(self):
         from toil.batchSystems.slurm_mount_recovery import is_fatal_storage_oserror
@@ -1024,7 +1091,57 @@ class TestSlurmMountRecovery(ToilTest):
         def fake_run_scontrol(*args, **kwargs):
             calls.append(list(args))
             if args[:2] == ("show", "partition"):
+                if len(args) >= 3 and args[2] == "spare":
+                    return "PartitionName=spare State=UP"
                 return "PartitionName=main Alternate=spare State=UP"
+            if args[:2] == ("show", "job"):
+                return (
+                    "JobId=999 JobState=PENDING Reason=Resources "
+                    "Restarts=6 Partition=main Comment="
+                )
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        self.monkeypatch.setenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", "5")
+        job_details = {
+            "JobId": "999",
+            "JobState": "PENDING",
+            "Reason": "Resources",
+            "Restarts": "6",
+            "Partition": "main",
+            "Comment": "",
+        }
+        self.worker.check_and_change_partition(job_details, restart_threshold=5)
+        update_calls = [c for c in calls if c and c[0] == "update"]
+        self.assertTrue(update_calls)
+        self.assertTrue(
+            any(
+                "Partition=spare" in arg
+                for call in update_calls
+                for arg in call
+            )
+        )
+
+    def test_get_alternate_partition_when_current_down_alternate_up(self):
+        def fake_run_scontrol(*args, **kwargs):
+            if args[:2] == ("show", "partition"):
+                if len(args) >= 3 and args[2] == "spare":
+                    return "PartitionName=spare State=UP"
+                return "PartitionName=main Alternate=spare State=DOWN"
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        self.assertEqual(self.worker._get_alternate_partition("main"), "spare")
+
+    def test_partition_switch_when_current_partition_down(self):
+        calls: list[list[str]] = []
+
+        def fake_run_scontrol(*args, **kwargs):
+            calls.append(list(args))
+            if args[:2] == ("show", "partition"):
+                if len(args) >= 3 and args[2] == "spare":
+                    return "PartitionName=spare State=UP"
+                return "PartitionName=main Alternate=spare State=DOWN"
             if args[:2] == ("show", "job"):
                 return (
                     "JobId=999 JobState=PENDING Reason=Resources "

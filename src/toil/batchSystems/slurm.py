@@ -441,9 +441,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 return True
             if job_details:
                 nodes = self._nodes_from_job_details(job_details)
-                if nodes and batch_logs_indicate_storage_failure(self.boss, toil_job_id):
+                if nodes and batch_logs_indicate_storage_failure(
+                    self.boss, toil_job_id, slurm_job_id
+                ):
                     return True
-            return batch_logs_indicate_storage_failure(self.boss, toil_job_id)
+            return batch_logs_indicate_storage_failure(
+                self.boss, toil_job_id, slurm_job_id
+            )
 
         def _apply_storage_failure_outcome(
             self,
@@ -834,24 +838,41 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 logger.debug("Could not read partition %s: %s", partition, e)
                 return None
             alternate: str | None = None
-            partition_state: str | None = None
             for line in stdout.splitlines():
                 for item in line.split():
                     if item.startswith("Alternate="):
                         alternate = item.split("=", 1)[1]
-                    elif item.startswith("State="):
-                        partition_state = item.split("=", 1)[1]
+                        break
+                if alternate:
+                    break
             if not alternate:
                 logger.debug(
                     "Cannot switch partition: no Alternate= configured for %s",
                     partition,
                 )
                 return None
-            if partition_state and partition_state != "UP":
+            try:
+                alt_stdout = run_scontrol("show", "partition", alternate, quiet=True)
+            except (CalledProcessErrorStderr, OSError) as e:
+                logger.debug(
+                    "Cannot switch partition: could not read alternate %s: %s",
+                    alternate,
+                    e,
+                )
+                return None
+            alternate_state: str | None = None
+            for line in alt_stdout.splitlines():
+                for item in line.split():
+                    if item.startswith("State="):
+                        alternate_state = item.split("=", 1)[1]
+                        break
+                if alternate_state:
+                    break
+            if alternate_state and alternate_state != "UP":
                 logger.debug(
                     "Cannot switch partition: alternate partition %s is %s",
                     alternate,
-                    partition_state,
+                    alternate_state,
                 )
                 return None
             return alternate
