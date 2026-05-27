@@ -192,8 +192,8 @@ There are several environment variables that affect the way Toil runs.
 | TOIL_SLURM_PARTITION_SWITCH_COOLDOWN | Seconds between in-place partition switches (default |
 |                                      | 300).                                               |
 +--------------------------------------+-----------------------------------------------------+
-| TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL | Fast-poll interval (seconds) for partition-switch |
-|                                      | watch list on busy clusters (default: 0.25).        |
+| TOIL_SLURM_PARTITION_SWITCH_POLL_    | Fast-poll interval (seconds) for partition-switch   |
+| INTERVAL                             | watch list on busy clusters (default: 0.25).        |
 +--------------------------------------+-----------------------------------------------------+
 | TOIL_SLURM_PARTITION_FAILOVER        | Optional. Comma-separated partitions Toil rotates   |
 |                                      | through after each storage failure for **new**      |
