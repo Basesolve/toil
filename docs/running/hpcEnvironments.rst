@@ -59,6 +59,48 @@ Slurm Tips
 
 #. If running CWL workflows on Slurm, with a shared filesystem, you can try the ``--bypass-file-store`` option to ``toil-cwl-runner``. It may speed up your workflow, but you may also need to make sure to change Toil's work directory to a shared directory provided with the ``--workDir`` option in order for it to work properly across machines.
 
+Mount / storage I/O failures on compute nodes
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If a worker hits ``OSError: [Errno 5] Input/output error`` on node-local paths (especially under ``--coordinationDir``), Toil workers exit with code **136** so the leader can retry. The default recovery path keeps the **same Slurm partition** and avoids only the node(s) that failed:
+
+#. Workers exit with code **136**; the leader classifies the failure as storage-related and retries the Toil job.
+#. Failed host names are added to an in-memory exclude list; subsequent ``sbatch`` calls include ``--exclude`` for those nodes only (see ``TOIL_SLURM_MAX_EXCLUDED_NODES``).
+#. Optionally, ``--slurmDrainBadNodes`` removes bad nodes from the cluster schedule via ``scontrol`` (recommended at scale on AWS ParallelCluster when you have ``sudo`` access to ``scontrol``).
+
+You do **not** need ``--slurmPartitionFailover`` for this behavior. Leave it unset when the rest of the partition is healthy and only isolated nodes lose mounts.
+
+**Recommended settings (large pools, hundreds to thousands of nodes):**
+
+* ``--coordinationDir`` on fast, node-local disk; job store on shared storage.
+* ``--batchLogsDir`` on shared storage (backup detection from batch logs).
+* ``--slurmDrainBadNodes`` and ``TOIL_SLURM_SCONTROL_PREFIX`` (e.g. ``sudo``) when the leader may drain failed nodes cluster-wide.
+* ``TOIL_SLURM_MAX_EXCLUDED_NODES`` (default 64): workflow-local ``sbatch --exclude`` cap. Mount failures are usually sparse; do not raise this to hundreds—use drain for nodes that stay bad. The cap keeps ``sbatch`` command lines and scheduler overhead reasonable.
+* ``TOIL_SLURM_LOST_JOB_TIMEOUT`` (e.g. ``600``): fail ``NODE_FAIL`` / ``LOST`` Slurm jobs back to the leader instead of waiting indefinitely.
+
+**Slurm ``Alternate=`` (safer partition move, cluster-configured):**
+
+Configure ``Alternate=`` on your partition in Slurm (e.g. ParallelCluster ``PartitionSettings``). Toil switches **that Slurm job** in place when ``Restarts`` reach ``TOIL_SLURM_JOB_RESTART_THRESHOLD`` (default 5). On busy clusters, set ``TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL`` so short ``PENDING`` windows are not missed. This is independent of Toil's exclude list and does not move the whole workflow unless Slurm keeps requeueing the same job ID.
+
+**Optional: leader-driven partition rotation**
+
+``--slurmPartitionFailover`` / ``TOIL_SLURM_PARTITION_FAILOVER``: comma-separated partitions Toil rotates through on each storage failure for **all new** worker submissions. Use only if you want every subsequent worker on a different partition; not required for node-only recovery.
+
+.. _slurmMountRecoveryValidation:
+
+Validating mount recovery on a real cluster
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use this checklist on a ParallelCluster (or other Slurm) head node **without** ``--slurmPartitionFailover``:
+
+#. **Preflight:** ``scontrol show partition <your-partition>`` shows ``Alternate=`` if you rely on in-place partition switch. From the leader host, confirm ``scontrol`` works (``TOIL_SLURM_SCONTROL_PREFIX=sudo`` if needed).
+#. **Run** a small Toil workflow with ``--batchSystem slurm``, ``--coordinationDir`` on node-local disk, ``--batchLogsDir`` on shared storage, and your usual ``--slurmPartition``.
+#. **Trigger or observe** one mount/storage I/O failure (exit 136 in batch logs or ``Input/output error`` in stderr).
+#. **Leader log:** look for ``Excluding Slurm nodes after storage I/O failure: <hostname>``.
+#. **Next submission:** confirm later workers still use the same ``--slurmPartition`` and that ``sbatch`` includes ``--exclude=<hostname>`` (enable debug logging or inspect Slurm job submit lines if your site allows).
+#. **If drain enabled:** ``scontrol show node <hostname>`` shows ``DRAIN`` with reason ``Toil: mount I/O failure``.
+#. **Partition unchanged:** spare/alternate partitions appear only if Slurm ``Alternate=`` fired on a **requeued** Slurm job (high ``Restarts``), not on every Toil retry by default.
+
 
 Standard Output/Error from Batch System Jobs
 --------------------------------------------

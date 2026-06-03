@@ -260,6 +260,14 @@ levels in toil are based on priority from the logging module:
                         multi-core jobs.
   --slurmArgs SLURM_ARGS
                         Extra arguments to pass to Slurm.
+  --slurmPartitionFailover SLURM_PARTITION_FAILOVER
+                        Comma-separated Slurm partitions to rotate through after
+                        storage I/O failures (applies to newly submitted worker
+                        jobs).
+  --slurmDrainBadNodes BOOL
+                        If True, drain Slurm nodes where a worker reported
+                        mount/storage I/O failure (requires permission to run
+                        scontrol update on nodes).
   --kubernetesHostPath KUBERNETES_HOST_PATH
                         Path on Kubernetes hosts to use as shared inter-pod temp
                         directory.

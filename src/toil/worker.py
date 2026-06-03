@@ -49,6 +49,10 @@ from toil.job import (
     JobDescription,
 )
 from toil.jobStores.abstractJobStore import AbstractJobStore
+from toil.batchSystems.slurm_mount_recovery import (
+    STORAGE_FAILURE_EXIT_CODE,
+    is_fatal_storage_oserror,
+)
 from toil.lib.io import make_public_dir, path_union
 from toil.lib.resources import ResourceMonitor
 from toil.statsAndLogging import StatsDict, configure_root_logger, install_log_color, set_log_level
@@ -738,6 +742,20 @@ def workerScript(
         elif isinstance(e, SystemExit) and isinstance(e.code, int) and e.code != 0:
             # We're meant to be exiting with a particular code.
             failure_exit_code = e.code
+        elif is_fatal_storage_oserror(
+            e,
+            [toil_coordination_dir, toilWorkflowDir, local_worker_temp_dir],
+        ):
+            logger.error(
+                "Storage I/O failure (errno %s) on host %s under coordination dir %s "
+                "or workflow dir %s; exiting with code %s",
+                getattr(e, "errno", None),
+                socket.gethostname(),
+                toil_coordination_dir,
+                toilWorkflowDir,
+                STORAGE_FAILURE_EXIT_CODE,
+            )
+            failure_exit_code = STORAGE_FAILURE_EXIT_CODE
         else:
             try:
                 from WDL.runtime.error import CommandFailed
