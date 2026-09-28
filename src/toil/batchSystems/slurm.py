@@ -192,6 +192,23 @@ def any_option_detector(options: list[str | tuple[str, str]]) -> Callable[[str],
     return is_match
 
 
+def parse_slurm_option_value(args: list[str], i: int) -> tuple[str, int]:
+    """
+    Parse a Slurm option value in either ``--opt=value`` or ``--opt value`` form.
+
+    Returns the extracted value and the last consumed index.
+
+    :param args: list of command-line arguments
+    :param i: index of the option argument in the list to parse
+    """
+    arg = args[i]
+    if "=" not in arg:
+        if i + 1 >= len(args):
+            raise ValueError(f"No value supplied for Slurm {arg} argument")
+        return args[i + 1], i + 1
+    return arg.split("=", 1)[1], i
+
+
 class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     class PartitionInfo(NamedTuple):
         partition_name: str
@@ -1457,6 +1474,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             is_export_file_option = option_detector("export-file")
             is_time_option = option_detector("time", "t")
             is_partition_option = option_detector("partition", "p")
+            is_qos_option = option_detector("qos")
 
             # We will fill these in with stuff parsed from TOIL_SLURM_ARGS, or
             # with our own determinations if they aren't there.
@@ -1466,6 +1484,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             export_list = []  # Some items here may be multiple comma-separated values
             time_limit: int | None = self.boss.config.slurm_time  # type: ignore[attr-defined]
             partition: str | None = None
+            qos: str | None = None
 
             if nativeConfig is not None:
                 logger.debug(
@@ -1487,15 +1506,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     elif is_export_option(arg):
                         # Capture the export argument value so we can modify it
                         export_all = False
-                        if "=" not in arg:
-                            if i + 1 >= len(args):
-                                raise ValueError(
-                                    f"No value supplied for Slurm {arg} argument"
-                                )
-                            i += 1
-                            export_list.append(args[i])
-                        else:
-                            export_list.append(arg.split("=", 1)[1])
+                        export_value, i = parse_slurm_option_value(args, i)
+                        export_list.append(export_value)
                     elif is_export_file_option(arg):
                         # Keep --export-file but turn off --export=ALL in that
                         # case.
@@ -1503,27 +1515,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         sbatch_line.append(arg)
                     elif is_time_option(arg):
                         # Capture the time limit in seconds so we can use it for picking a partition
-                        if "=" not in arg:
-                            if i + 1 >= len(args):
-                                raise ValueError(
-                                    f"No value supplied for Slurm {arg} argument"
-                                )
-                            i += 1
-                            time_string = args[i]
-                        else:
-                            time_string = arg.split("=", 1)[1]
+                        time_string, i = parse_slurm_option_value(args, i)
                         time_limit = parse_slurm_time(time_string)
                     elif is_partition_option(arg):
                         # Capture the partition so we can run checks on it and know not to assign one
-                        if "=" not in arg:
-                            if i + 1 >= len(args):
-                                raise ValueError(
-                                    f"No value supplied for Slurm {arg} argument"
-                                )
-                            i += 1
-                            partition = args[i]
-                        else:
-                            partition = arg.split("=", 1)[1]
+                        partition, i = parse_slurm_option_value(args, i)
+                    elif is_qos_option(arg):
+                        # Capture the QOS so we can avoid assigning one on top of it
+                        qos, i = parse_slurm_option_value(args, i)
                     else:
                         # Other arguments pass through.
                         sbatch_line.append(arg)
@@ -1590,6 +1589,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if self.boss.active_failover_partition:
                 partition = self.boss.active_failover_partition
 
+            if qos is None:
+                # Apply a configured QOS if one wasn't already supplied.
+                gpu_qos_override: str | None = self.boss.config.slurm_gpu_qos  # type: ignore[attr-defined]
+                qos_override: str | None = self.boss.config.slurm_qos  # type: ignore[attr-defined]
+                if gpus and gpu_qos_override:
+                    qos = gpu_qos_override
+                elif qos_override:
+                    qos = qos_override
+
             # Now generate all the arguments
             if len(export_list) > 0:
                 # add --export to the sbatch
@@ -1605,6 +1613,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 )
                 if exclude_list:
                     sbatch_line.append(f"--exclude={exclude_list}")
+            if qos is not None:
+                sbatch_line.append(f"--qos={qos}")
             if gpus:
                 # Generate GPU assignment argument
                 sbatch_line.append(f"--gres=gpu:{gpus}")
@@ -1971,11 +1981,25 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             help="Partition to send Slurm jobs to.",
         )
         parser.add_argument(
+            "--slurmQOS",
+            dest="slurm_qos",
+            default=None,
+            env_var="TOIL_SLURM_QOS",
+            help="Quality Of Service to request for Slurm jobs.",
+        )
+        parser.add_argument(
             "--slurmGPUPartition",
             dest="slurm_gpu_partition",
             default=None,
             env_var="TOIL_SLURM_GPU_PARTITION",
             help="Partition to send Slurm jobs to if they ask for GPUs.",
+        )
+        parser.add_argument(
+            "--slurmGPUQOS",
+            dest="slurm_gpu_qos",
+            default=None,
+            env_var="TOIL_SLURM_GPU_QOS",
+            help="Quality Of Service to request for Slurm jobs if they ask for GPUs.",
         )
         parser.add_argument(
             "--slurmPE",
@@ -2017,7 +2041,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         setOption("slurm_default_all_mem")
         setOption("slurm_time")
         setOption("slurm_partition")
+        setOption("slurm_qos")
         setOption("slurm_gpu_partition")
+        setOption("slurm_gpu_qos")
         setOption("slurm_pe")
         setOption("slurm_args")
         setOption("slurm_partition_failover")

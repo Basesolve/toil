@@ -25,3 +25,4 @@ tmp/
 /contrib/admin/.issue_cache/
 .docker_cache/
 .venv
+graphify-out/cache

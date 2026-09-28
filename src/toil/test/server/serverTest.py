@@ -749,6 +749,9 @@ class ToilWESServerWorkflowTest(AbstractToilWESServerTest):
             self.assertLess(cancel_seconds, WAIT_FOR_DEATH_TIMEOUT)
 
     @pytest.mark.timeout(60)
+    # TODO: This test fails in CI on Python before 3.14, with the workflow
+    # failing with SYSTEM_ERROR instead of being canceled, but nobody has been
+    # able to replicate this outside CI to fix it.
     @pytest.mark.skipif(
         sys.version_info < (3, 14) and parseBool(os.environ.get("CI", "False")),
         reason="mysteriously fails in CI on Python <3.14 but passes locally",
