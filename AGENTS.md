@@ -19,3 +19,4 @@
 - `parse_slurm_nodelist` must split commas only at bracket depth zero (for example `cn[001-003,005]`).
 - `batch_logs_indicate_storage_failure` scans only the current Slurm attempt's stdout/stderr logs, not all retries for a Toil job.
 - Remote deployment context uses paths like `/opt/augmet/augmet-engine-ro` and shared job stores under `/augmet-mp/job_stores/`.
+- Spot/SIGTERM per-job failover (opt-in): `TOIL_SLURM_SPOT_FAILOVER=1` (or `--slurmSpotFailover`). After N strikes (`TOIL_SLURM_SPOT_FAILOVER_STRIKES`, default 2), the next Toil retry for that jobStoreID submits to Slurm `Alternate=` on the failed partition; `TOIL_SLURM_PARTITION_FAILOVER` is only an optional fallback. Typical ParallelCluster setup: `PartitionName=*-cs Alternate=*-cod`, enable spot failover + keep in-place `TOIL_SLURM_JOB_RESTART_THRESHOLD` / poll interval for same-JobId switches.

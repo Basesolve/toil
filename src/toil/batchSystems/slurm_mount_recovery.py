@@ -56,6 +56,15 @@ DEFAULT_PARTITION_SWITCH_POLL_INTERVAL = 0.25
 DEFAULT_MAX_EXCLUDED_NODES = 64
 DEFAULT_LOST_JOB_TIMEOUT: float | None = None
 
+# Spot / SIGTERM per-job failover defaults (opt-in via TOIL_SLURM_SPOT_FAILOVER).
+DEFAULT_SPOT_FAILOVER_STRIKES = 2
+DEFAULT_SPOT_FAILOVER_COOLDOWN = 60
+DEFAULT_SPOT_FAILOVER_EXIT_CODES = frozenset({143})
+DEFAULT_SPOT_FAILOVER_STATES = frozenset({"NODE_FAIL", "PREEMPTED"})
+DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS = ("user", "cancel")
+# Never treat these exit codes as spot interruptions (storage / OOM / SIGKILL).
+SPOT_FAILOVER_NEVER_EXIT_CODES = frozenset({9, 136, 137})
+
 
 def env_float(name: str, default: float | None) -> float | None:
     raw = os.getenv(name)
@@ -226,6 +235,73 @@ def partition_switch_reason_matches(reason: str | None) -> bool:
         return True
     reason_lower = reason.lower()
     return any(p.lower() in reason_lower for p in patterns)
+
+
+def spot_failover_enabled() -> bool:
+    """Return True when opt-in spot/SIGTERM per-job failover is enabled."""
+    return env_bool("TOIL_SLURM_SPOT_FAILOVER")
+
+
+def _spot_failover_exit_codes() -> set[int]:
+    raw = env_csv("TOIL_SLURM_SPOT_FAILOVER_EXIT_CODES")
+    if not raw:
+        return set(DEFAULT_SPOT_FAILOVER_EXIT_CODES)
+    codes: set[int] = set()
+    for part in raw:
+        try:
+            codes.add(int(part))
+        except ValueError:
+            logger.debug("Ignoring invalid spot failover exit code %r", part)
+    return codes or set(DEFAULT_SPOT_FAILOVER_EXIT_CODES)
+
+
+def _spot_failover_states() -> set[str]:
+    raw = env_csv("TOIL_SLURM_SPOT_FAILOVER_STATES")
+    if not raw:
+        return set(DEFAULT_SPOT_FAILOVER_STATES)
+    return {s.upper() for s in raw}
+
+
+def spot_interruption_matches(
+    state: str | None,
+    exit_code: int | None,
+    reason: str | None,
+) -> bool:
+    """
+    Return True if a terminal Slurm outcome looks like spot interruption / SIGTERM.
+
+    Conservative: never matches storage (136), OOM (137), or SIGKILL (9).
+    User cancel / scancel reasons are excluded by default.
+
+    Does not check the master enable switch; callers gate with
+    ``spot_failover_enabled()`` or ``SlurmBatchSystem.slurm_spot_failover``.
+    """
+    reason_text = reason or ""
+    reason_lower = reason_text.lower()
+    exclude = env_csv("TOIL_SLURM_SPOT_FAILOVER_EXCLUDE_REASONS")
+    if not exclude:
+        exclude = list(DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS)
+    if any(p.lower() in reason_lower for p in exclude):
+        return False
+
+    if exit_code is not None and exit_code in SPOT_FAILOVER_NEVER_EXIT_CODES:
+        return False
+
+    state_token = (state or "").split(" ", 1)[0].upper()
+    exit_codes = _spot_failover_exit_codes()
+    states = _spot_failover_states()
+
+    if exit_code is not None and exit_code in exit_codes:
+        return True
+    if state_token in states:
+        return True
+
+    # CANCELLED / TIMEOUT only qualify when an optional reason allow-list matches.
+    reason_patterns = env_csv("TOIL_SLURM_SPOT_FAILOVER_REASONS")
+    if reason_patterns and state_token in ("CANCELLED", "TIMEOUT"):
+        return any(p.lower() in reason_lower for p in reason_patterns)
+
+    return False
 
 
 def batch_logs_indicate_storage_failure(

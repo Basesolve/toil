@@ -202,8 +202,20 @@ There are several environment variables that affect the way Toil runs.
 +--------------------------------------+-----------------------------------------------------+
 | TOIL_SLURM_PARTITION_FAILOVER        | Optional. Comma-separated partitions Toil rotates   |
 |                                      | through after each storage failure for **new**      |
-|                                      | worker submissions. Unset for node-only recovery    |
-|                                      | (``--exclude`` + drain) on the same partition.      |
+|                                      | worker submissions. Also used as optional fallback  |
+|                                      | for spot/SIGTERM per-job failover when Slurm        |
+|                                      | ``Alternate=`` is unavailable.                      |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SPOT_FAILOVER             | If ``1``/``true``, after repeated spot/SIGTERM-like |
+|                                      | failures for the same logical job, submit retries   |
+|                                      | to Slurm ``Alternate=`` (preferred) or              |
+|                                      | ``TOIL_SLURM_PARTITION_FAILOVER``. Default off.     |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SPOT_FAILOVER_STRIKES     | Qualifying terminal failures per jobStoreID before  |
+|                                      | spot partition escalate (default: 2).               |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SPOT_FAILOVER_COOLDOWN    | Seconds between spot failover advances for the same |
+|                                      | jobStoreID (default: 60).                           |
 +--------------------------------------+-----------------------------------------------------+
 | TOIL_GRIDENGINE_ARGS                 | Arguments for qsub for the gridengine batch         |
 |                                      | system. Do not pass CPU or memory specifications    |

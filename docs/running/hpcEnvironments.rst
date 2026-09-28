@@ -82,9 +82,13 @@ You do **not** need ``--slurmPartitionFailover`` for this behavior. Leave it uns
 
 Configure ``Alternate=`` on your partition in Slurm (e.g. ParallelCluster ``PartitionSettings``). Toil switches **that Slurm job** in place when ``Restarts`` reach ``TOIL_SLURM_JOB_RESTART_THRESHOLD`` (default 5). On busy clusters, set ``TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL`` so short ``PENDING`` windows are not missed. This is independent of Toil's exclude list and does not move the whole workflow unless Slurm keeps requeueing the same job ID.
 
-**Optional: leader-driven partition rotation**
+**Optional: leader-driven partition rotation (storage, global)**
 
 ``--slurmPartitionFailover`` / ``TOIL_SLURM_PARTITION_FAILOVER``: comma-separated partitions Toil rotates through on each storage failure for **all new** worker submissions. Use only if you want every subsequent worker on a different partition; not required for node-only recovery.
+
+**Optional: spot/SIGTERM per-job failover**
+
+``--slurmSpotFailover`` / ``TOIL_SLURM_SPOT_FAILOVER=1``: after ``TOIL_SLURM_SPOT_FAILOVER_STRIKES`` (default 2) terminal spot/SIGTERM-like failures for the **same** logical job, Toil submits that job's next retries to the partition from Slurm ``Alternate=`` on the failed attempt's partition. ``TOIL_SLURM_PARTITION_FAILOVER`` is only a fallback when ``Alternate=`` is unset. Other workflow jobs stay on their original partition until they escalate independently.
 
 .. _slurmMountRecoveryValidation:
 
