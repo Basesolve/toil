@@ -1,6 +1,7 @@
 import errno
 import inspect
 import logging
+import os
 import sys
 import tempfile
 import textwrap
@@ -294,6 +295,7 @@ class FakeBatchSystem(BatchSystemSupport):
         self._lost_job_first_seen: dict[int, float] = {}
         self._partition_switch_last_poll = 0.0
         self._batch_to_job_store_id: dict[int, str] = {}
+        self._batch_submitted_partition: dict[int, str] = {}
         self._job_failover_partition: dict[str, str] = {}
         self._job_failover_index: dict[str, int] = {}
         self._job_spot_strikes: dict[str, int] = {}
@@ -315,14 +317,49 @@ class FakeBatchSystem(BatchSystemSupport):
             self, job_store_id, failed_partition
         )
 
+    def spot_failover_strikes(self) -> int:
+        return toil.batchSystems.slurm.SlurmBatchSystem.spot_failover_strikes(self)
+
+    def spot_failover_cooldown(self) -> int:
+        return toil.batchSystems.slurm.SlurmBatchSystem.spot_failover_cooldown(self)
+
+    def spot_failover_exit_codes(self) -> set[int]:
+        return toil.batchSystems.slurm.SlurmBatchSystem.spot_failover_exit_codes(self)
+
+    def spot_failover_states(self) -> set[str]:
+        return toil.batchSystems.slurm.SlurmBatchSystem.spot_failover_states(self)
+
+    def spot_failover_exclude_reasons(self) -> list[str]:
+        return toil.batchSystems.slurm.SlurmBatchSystem.spot_failover_exclude_reasons(
+            self
+        )
+
+    def spot_failover_reasons(self) -> list[str]:
+        return toil.batchSystems.slurm.SlurmBatchSystem.spot_failover_reasons(self)
+
+    def spot_interruption_matches_configured(
+        self,
+        state: str | None,
+        exit_code: int | None,
+        reason: str | None,
+    ) -> bool:
+        return toil.batchSystems.slurm.SlurmBatchSystem.spot_interruption_matches_configured(
+            self, state, exit_code, reason
+        )
+
     def record_spot_interruption(
         self,
         toil_batch_id: int,
         status: tuple,
         job_details: dict[str, str] | None,
+        submitted_partition: str | None = None,
     ) -> None:
         toil.batchSystems.slurm.SlurmBatchSystem.record_spot_interruption(
-            self, toil_batch_id, status, job_details
+            self,
+            toil_batch_id,
+            status,
+            job_details,
+            submitted_partition=submitted_partition,
         )
 
     def advance_failover_partition(self) -> str | None:
@@ -1311,19 +1348,28 @@ class TestSlurmMountRecovery(ToilTest):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
         status = ("FAILED", 143, "")
         details = {"Partition": "cs"}
-        boss.record_spot_interruption(7, status, details)
-        self.assertNotIn("job-store-1", boss._job_failover_partition)
-        boss.record_spot_interruption(7, status, details)
-        self.assertEqual(boss._job_failover_partition["job-store-1"], "cod")
-        # Cooldown: second advance should not change partition / index unnecessarily.
-        boss.failover_partitions = ["other"]
-        boss.record_spot_interruption(7, status, details)
-        self.assertEqual(boss._job_failover_partition["job-store-1"], "cod")
+        with self.assertLogs("toil.batchSystems.slurm", level="INFO") as cm:
+            boss.record_spot_interruption(7, status, details)
+            self.assertNotIn("job-store-1", boss._job_failover_partition)
+            boss.record_spot_interruption(7, status, details)
+            self.assertEqual(boss._job_failover_partition["job-store-1"], "cod")
+            # Cooldown: second advance should not change partition / index unnecessarily.
+            boss.failover_partitions = ["other"]
+            boss.record_spot_interruption(7, status, details)
+            self.assertEqual(boss._job_failover_partition["job-store-1"], "cod")
+        self.assertTrue(
+            any("Spot interruption strike 1/2" in msg for msg in cm.output)
+        )
+        self.assertTrue(
+            any("subsequent attempts use partition cod" in msg for msg in cm.output)
+        )
+        self.assertTrue(any("cooldown active" in msg for msg in cm.output))
 
     def test_finalize_exit_code_spot_failover_updates_boss(self):
         boss = self.worker.boss
         boss.slurm_spot_failover = True
         boss._batch_to_job_store_id[1] = "js-finalize"
+        boss._batch_submitted_partition[1] = "cs"
         self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_STRIKES", "1")
         self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", "0")
 
@@ -1343,8 +1389,178 @@ class TestSlurmMountRecovery(ToilTest):
             999,
             ("FAILED", 143, ""),
         )
-        self.assertEqual(result, (143, BatchJobExitReason.FAILED))
+        # Spot phase: failover before doubleMem.
+        self.assertEqual(result, (143, BatchJobExitReason.SPOT))
         self.assertEqual(boss._job_failover_partition["js-finalize"], "cod")
+
+    def test_spot_failover_uses_remembered_partition_when_scontrol_job_gone(self):
+        boss = FakeBatchSystem()
+        boss.slurm_spot_failover = True
+        boss._batch_to_job_store_id[7] = "js-remember"
+        boss._batch_submitted_partition[7] = "hcs"
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_STRIKES", "1")
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", "0")
+
+        def fake_run_scontrol(*args, **kwargs):
+            if args[:2] == ("show", "job"):
+                raise CalledProcessErrorStderr(1, "scontrol", stderr="Invalid job id")
+            if args[:2] == ("show", "partition"):
+                if args[2] == "hcod":
+                    return "PartitionName=hcod State=UP"
+                return "PartitionName=hcs Alternate=hcod State=UP"
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        worker = toil.batchSystems.slurm.SlurmBatchSystem.GridEngineThread(
+            newJobsQueue=Queue(),
+            updatedJobsQueue=Queue(),
+            killQueue=Queue(),
+            killedJobsQueue=Queue(),
+            boss=boss,
+        )
+        result = worker._finalize_exit_code(
+            (143, BatchJobExitReason.FAILED),
+            7,
+            999,
+            ("FAILED", 143, ""),
+        )
+        self.assertEqual(result, (143, BatchJobExitReason.SPOT))
+        self.assertEqual(boss._job_failover_partition["js-remember"], "hcod")
+
+    def test_spot_failover_no_target_warns_and_allows_doublemem(self):
+        boss = FakeBatchSystem()
+        boss.slurm_spot_failover = True
+        boss._batch_to_job_store_id[7] = "js-no-target"
+        boss._batch_submitted_partition[7] = "hcs"
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_STRIKES", "1")
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", "0")
+
+        def fake_run_scontrol(*args, **kwargs):
+            if args[:2] == ("show", "job"):
+                return ""
+            if args[:2] == ("show", "partition"):
+                return "PartitionName=hcs State=UP"
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        worker = toil.batchSystems.slurm.SlurmBatchSystem.GridEngineThread(
+            newJobsQueue=Queue(),
+            updatedJobsQueue=Queue(),
+            killQueue=Queue(),
+            killedJobsQueue=Queue(),
+            boss=boss,
+        )
+        with self.assertLogs("toil.batchSystems.slurm", level="WARNING") as cm:
+            result = worker._finalize_exit_code(
+                (143, BatchJobExitReason.FAILED),
+                7,
+                999,
+                ("FAILED", 143, ""),
+            )
+        self.assertEqual(result, (143, BatchJobExitReason.FAILED))
+        self.assertTrue(
+            any("fall through to --doubleMem" in msg for msg in cm.output)
+        )
+
+    def test_finalize_exit_code_spot_already_on_failover_returns_failed(self):
+        boss = self.worker.boss
+        boss.slurm_spot_failover = True
+        boss.failover_partitions = ["hcod", "hcod2"]
+        boss._batch_to_job_store_id[1] = "js-od"
+        boss._batch_submitted_partition[1] = "hcod"
+        boss._job_failover_partition["js-od"] = "hcod"
+        boss._job_failover_index["js-od"] = 0
+        boss._job_spot_strikes["js-od"] = 2
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_STRIKES", "1")
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", "0")
+
+        def fake_run_scontrol(*args, **kwargs):
+            if args[:2] == ("show", "job"):
+                return "JobId=999 JobState=FAILED Partition=hcod ExitCode=0:15"
+            if args[:2] == ("show", "partition"):
+                return "PartitionName=hcod State=UP"
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        with self.assertLogs("toil.batchSystems.slurm", level="INFO") as cm:
+            result = self.worker._finalize_exit_code(
+                (143, BatchJobExitReason.FAILED),
+                1,
+                999,
+                ("FAILED", 143, ""),
+            )
+        self.assertEqual(result, (143, BatchJobExitReason.FAILED))
+        # No further strike / env-list rotation while already on failover.
+        self.assertEqual(boss._job_spot_strikes["js-od"], 2)
+        self.assertEqual(boss._job_failover_partition["js-od"], "hcod")
+        self.assertEqual(boss._job_failover_index.get("js-od"), 0)
+        self.assertTrue(
+            any("allowing --doubleMem" in msg for msg in cm.output)
+        )
+
+    def test_spot_failover_config_strikes_override_env(self):
+        boss = FakeBatchSystem()
+        boss.slurm_spot_failover = True
+        boss.config.slurm_spot_failover_strikes = 3
+        boss._batch_to_job_store_id[7] = "js-cfg"
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_STRIKES", "1")
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", "0")
+
+        def fake_run_scontrol(*args, **kwargs):
+            if args[:2] == ("show", "partition"):
+                if args[2] == "cod":
+                    return "PartitionName=cod State=UP"
+                return "PartitionName=cs Alternate=cod State=UP"
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        status = ("FAILED", 143, "")
+        details = {"Partition": "cs"}
+        boss.record_spot_interruption(7, status, details)
+        boss.record_spot_interruption(7, status, details)
+        self.assertNotIn("js-cfg", boss._job_failover_partition)
+        boss.record_spot_interruption(7, status, details)
+        self.assertEqual(boss._job_failover_partition["js-cfg"], "cod")
+
+    def test_setup_job_after_failure_spot_before_double_mem(self):
+        from toil.job import JobDescription
+
+        job = JobDescription(
+            requirements={"memory": 1024**3, "cores": 1, "disk": 1024**3},
+            jobName="spotjob",
+            unitName="",
+        )
+        config = Config()
+        config.doubleMem = True
+        config.retryCount = 2
+        config.defaultMemory = 1024**3
+        config.defaultDisk = 1024**3
+        job.assignConfig(config)
+        job.remainingTryCount = 2
+        original_memory = job.memory
+        job.setupJobAfterFailure(exit_status=143, exit_reason=BatchJobExitReason.SPOT)
+        self.assertEqual(job.remainingTryCount, 2)
+        self.assertEqual(job.memory, original_memory)
+        # Avoid scontrol probing of max node memory in this unit test.
+        self.monkeypatch.setattr(os, "popen", lambda *_a, **_k: type("P", (), {"read": lambda self: ""})())
+        job.setupJobAfterFailure(exit_status=143, exit_reason=BatchJobExitReason.FAILED)
+        self.assertEqual(job.memory, original_memory * 2)
+
+    def test_prepare_sbatch_remembers_submitted_partition(self):
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sinfo)
+        boss = FakeBatchSystem()
+        boss.active_failover_partition = "hcs"
+        boss.partitions = toil.batchSystems.slurm.SlurmBatchSystem.PartitionSet()
+        worker = toil.batchSystems.slurm.SlurmBatchSystem.GridEngineThread(
+            newJobsQueue=Queue(),
+            updatedJobsQueue=Queue(),
+            killQueue=Queue(),
+            killedJobsQueue=Queue(),
+            boss=boss,
+        )
+        command = worker.prepareSbatch(1, 1000000, 42, "job", {}, None, True, "")
+        self.assertIn("--partition=hcs", command)
+        self.assertEqual(boss._batch_submitted_partition[42], "hcs")
 
     def test_prepare_sbatch_per_job_override_precedence(self):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_sinfo)

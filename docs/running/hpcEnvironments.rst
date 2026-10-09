@@ -88,7 +88,9 @@ Configure ``Alternate=`` on your partition in Slurm (e.g. ParallelCluster ``Part
 
 **Optional: spot/SIGTERM per-job failover**
 
-``--slurmSpotFailover`` / ``TOIL_SLURM_SPOT_FAILOVER=1``: after ``TOIL_SLURM_SPOT_FAILOVER_STRIKES`` (default 2) terminal spot/SIGTERM-like failures for the **same** logical job, Toil submits that job's next retries to the partition from Slurm ``Alternate=`` on the failed attempt's partition. ``TOIL_SLURM_PARTITION_FAILOVER`` is only a fallback when ``Alternate=`` is unset. Other workflow jobs stay on their original partition until they escalate independently.
+``--slurmSpotFailover`` / ``TOIL_SLURM_SPOT_FAILOVER=1``: after ``--slurmSpotFailoverStrikes`` / ``TOIL_SLURM_SPOT_FAILOVER_STRIKES`` (default 2) terminal spot/SIGTERM-like failures for the **same** logical job, Toil submits that job's next retries to the partition from Slurm ``Alternate=`` on the failed attempt's partition. ``TOIL_SLURM_PARTITION_FAILOVER`` / ``--slurmPartitionFailover`` is only a fallback when ``Alternate=`` is unset. Other workflow jobs stay on their original partition until they escalate independently.
+
+Spot-phase failures (exit reason ``SPOT``) keep the job's memory and try count so failover can complete under the usual ``--retryCount``. ``--doubleMem`` applies to a later 143 only after that job has already been submitted on its failover partition. Related knobs: ``--slurmSpotFailoverCooldown``, ``--slurmSpotFailoverExitCodes``, ``--slurmSpotFailoverStates``, ``--slurmSpotFailoverExcludeReasons``, ``--slurmSpotFailoverReasons``.
 
 .. _slurmMountRecoveryValidation:
 

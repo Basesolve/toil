@@ -209,13 +209,36 @@ There are several environment variables that affect the way Toil runs.
 | TOIL_SLURM_SPOT_FAILOVER             | If ``1``/``true``, after repeated spot/SIGTERM-like |
 |                                      | failures for the same logical job, submit retries   |
 |                                      | to Slurm ``Alternate=`` (preferred) or              |
-|                                      | ``TOIL_SLURM_PARTITION_FAILOVER``. Default off.     |
+|                                      | ``TOIL_SLURM_PARTITION_FAILOVER``. Spot-phase        |
+|                                      | failures keep memory and try count; ``--doubleMem`` |
+|                                      | applies only after the job has already run on the   |
+|                                      | failover partition. Same as ``--slurmSpotFailover``.|
+|                                      | Default off.                                       |
 +--------------------------------------+-----------------------------------------------------+
 | TOIL_SLURM_SPOT_FAILOVER_STRIKES     | Qualifying terminal failures per jobStoreID before  |
-|                                      | spot partition escalate (default: 2).               |
+|                                      | spot partition escalate (default: 2). Same as       |
+|                                      | ``--slurmSpotFailoverStrikes``.                    |
 +--------------------------------------+-----------------------------------------------------+
 | TOIL_SLURM_SPOT_FAILOVER_COOLDOWN    | Seconds between spot failover advances for the same |
-|                                      | jobStoreID (default: 60).                           |
+|                                      | jobStoreID (default: 60). Same as                   |
+|                                      | ``--slurmSpotFailoverCooldown``.                   |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SPOT_FAILOVER_EXIT_CODES  | Comma-separated exit codes treated as spot          |
+|                                      | interruptions (default: ``143``). Same as           |
+|                                      | ``--slurmSpotFailoverExitCodes``.                  |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SPOT_FAILOVER_STATES      | Comma-separated Slurm states treated as spot        |
+|                                      | interruptions (default: ``NODE_FAIL,PREEMPTED``).  |
+|                                      | Same as ``--slurmSpotFailoverStates``.             |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SPOT_FAILOVER_EXCLUDE_    | Reason substrings that exclude a failure from spot  |
+| REASONS                              | failover (default: ``user,cancel``). Same as        |
+|                                      | ``--slurmSpotFailoverExcludeReasons``.             |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_SPOT_FAILOVER_REASONS     | Optional reason substrings that allow               |
+|                                      | ``CANCELLED``/``TIMEOUT`` to count as spot          |
+|                                      | interruptions. Same as                              |
+|                                      | ``--slurmSpotFailoverReasons``.                    |
 +--------------------------------------+-----------------------------------------------------+
 | TOIL_GRIDENGINE_ARGS                 | Arguments for qsub for the gridengine batch         |
 |                                      | system. Do not pass CPU or memory specifications    |

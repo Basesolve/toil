@@ -242,12 +242,18 @@ def spot_failover_enabled() -> bool:
     return env_bool("TOIL_SLURM_SPOT_FAILOVER")
 
 
-def _spot_failover_exit_codes() -> set[int]:
-    raw = env_csv("TOIL_SLURM_SPOT_FAILOVER_EXIT_CODES")
-    if not raw:
+def parse_spot_failover_exit_codes(raw: str | list[str] | None) -> set[int]:
+    """Parse comma-separated exit codes, or return the default set."""
+    if raw is None:
+        return set(DEFAULT_SPOT_FAILOVER_EXIT_CODES)
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+    else:
+        parts = list(raw)
+    if not parts:
         return set(DEFAULT_SPOT_FAILOVER_EXIT_CODES)
     codes: set[int] = set()
-    for part in raw:
+    for part in parts:
         try:
             codes.add(int(part))
         except ValueError:
@@ -255,17 +261,36 @@ def _spot_failover_exit_codes() -> set[int]:
     return codes or set(DEFAULT_SPOT_FAILOVER_EXIT_CODES)
 
 
-def _spot_failover_states() -> set[str]:
-    raw = env_csv("TOIL_SLURM_SPOT_FAILOVER_STATES")
-    if not raw:
+def _spot_failover_exit_codes() -> set[int]:
+    return parse_spot_failover_exit_codes(env_csv("TOIL_SLURM_SPOT_FAILOVER_EXIT_CODES") or None)
+
+
+def parse_spot_failover_states(raw: str | list[str] | None) -> set[str]:
+    """Parse comma-separated Slurm states, or return the default set."""
+    if raw is None:
         return set(DEFAULT_SPOT_FAILOVER_STATES)
-    return {s.upper() for s in raw}
+    if isinstance(raw, str):
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+    else:
+        parts = list(raw)
+    if not parts:
+        return set(DEFAULT_SPOT_FAILOVER_STATES)
+    return {s.upper() for s in parts}
+
+
+def _spot_failover_states() -> set[str]:
+    return parse_spot_failover_states(env_csv("TOIL_SLURM_SPOT_FAILOVER_STATES") or None)
 
 
 def spot_interruption_matches(
     state: str | None,
     exit_code: int | None,
     reason: str | None,
+    *,
+    exit_codes: set[int] | None = None,
+    states: set[str] | None = None,
+    exclude_reasons: list[str] | None = None,
+    reason_patterns: list[str] | None = None,
 ) -> bool:
     """
     Return True if a terminal Slurm outcome looks like spot interruption / SIGTERM.
@@ -275,12 +300,18 @@ def spot_interruption_matches(
 
     Does not check the master enable switch; callers gate with
     ``spot_failover_enabled()`` or ``SlurmBatchSystem.slurm_spot_failover``.
+
+    Optional keyword overrides come from CLI/config when set; otherwise env
+    defaults are used.
     """
     reason_text = reason or ""
     reason_lower = reason_text.lower()
-    exclude = env_csv("TOIL_SLURM_SPOT_FAILOVER_EXCLUDE_REASONS")
-    if not exclude:
-        exclude = list(DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS)
+    if exclude_reasons is None:
+        exclude = env_csv("TOIL_SLURM_SPOT_FAILOVER_EXCLUDE_REASONS")
+        if not exclude:
+            exclude = list(DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS)
+    else:
+        exclude = exclude_reasons
     if any(p.lower() in reason_lower for p in exclude):
         return False
 
@@ -288,8 +319,10 @@ def spot_interruption_matches(
         return False
 
     state_token = (state or "").split(" ", 1)[0].upper()
-    exit_codes = _spot_failover_exit_codes()
-    states = _spot_failover_states()
+    if exit_codes is None:
+        exit_codes = _spot_failover_exit_codes()
+    if states is None:
+        states = _spot_failover_states()
 
     if exit_code is not None and exit_code in exit_codes:
         return True
@@ -297,7 +330,8 @@ def spot_interruption_matches(
         return True
 
     # CANCELLED / TIMEOUT only qualify when an optional reason allow-list matches.
-    reason_patterns = env_csv("TOIL_SLURM_SPOT_FAILOVER_REASONS")
+    if reason_patterns is None:
+        reason_patterns = env_csv("TOIL_SLURM_SPOT_FAILOVER_REASONS")
     if reason_patterns and state_token in ("CANCELLED", "TIMEOUT"):
         return any(p.lower() in reason_lower for p in reason_patterns)
 

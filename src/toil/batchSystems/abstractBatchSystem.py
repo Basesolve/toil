@@ -66,6 +66,8 @@ class BatchJobExitReason(enum.IntEnum):
     """Container memory limit is exceeded"""
     STORAGE: int = 10
     """Node-local or mount storage I/O failure on the compute node."""
+    SPOT: int = 11
+    """Spot / SIGTERM-like interruption; partition failover before memory doubling."""
 
     @classmethod
     def to_string(cls, value: int) -> str:

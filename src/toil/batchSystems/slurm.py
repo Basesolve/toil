@@ -44,6 +44,9 @@ from toil.batchSystems.slurm_mount_recovery import (
     DEFAULT_PARTITION_SWITCH_COOLDOWN,
     DEFAULT_PARTITION_SWITCH_POLL_INTERVAL,
     DEFAULT_SPOT_FAILOVER_COOLDOWN,
+    DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS,
+    DEFAULT_SPOT_FAILOVER_EXIT_CODES,
+    DEFAULT_SPOT_FAILOVER_STATES,
     DEFAULT_SPOT_FAILOVER_STRIKES,
     PARTITION_SWITCH_STATES,
     STORAGE_FAILURE_EXIT_CODE,
@@ -54,6 +57,8 @@ from toil.batchSystems.slurm_mount_recovery import (
     env_int,
     parse_slurm_nodelist,
     parse_scontrol_job_lines,
+    parse_spot_failover_exit_codes,
+    parse_spot_failover_states,
     partition_switch_reason_matches,
     run_scontrol,
     spot_failover_enabled,
@@ -389,6 +394,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
         def forgetJob(self, jobID: int) -> None:
             self.boss._batch_to_job_store_id.pop(jobID, None)
+            self.boss._batch_submitted_partition.pop(jobID, None)
             super().forgetJob(jobID)
 
         def _slurm_restart_threshold(self) -> int:
@@ -764,23 +770,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         lost_timeout,
                     )
                     self.boss._lost_job_first_seen.pop(slurm_job_id, None)
-                    # Spot/SIGTERM failover for LOST after timeout (e.g. NODE_FAIL).
-                    if (
-                        toil_job_id is not None
-                        and (
-                            getattr(self.boss, "slurm_spot_failover", False)
-                            or spot_failover_enabled()
-                        )
-                        and spot_interruption_matches(
-                            state,
-                            rc if rc is not None else EXIT_STATUS_UNAVAILABLE_VALUE,
-                            reason,
-                        )
-                    ):
-                        job_details = self._fetch_scontrol_job_details(slurm_job_id)
-                        self.boss.record_spot_interruption(
-                            toil_job_id, (state, rc, reason), job_details
-                        )
+                    # Spot/SIGTERM handling runs in _finalize_exit_code once the
+                    # LOST timeout has expired and the job is treated as terminal.
                     return (EXIT_STATUS_UNAVAILABLE_VALUE, BatchJobExitReason.LOST)
                 return None
 
@@ -797,6 +788,74 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 return (EXIT_STATUS_UNAVAILABLE_VALUE, exit_reason)
             # If the code is nonzero, pass it along.
             return (rc, exit_reason)  # type: ignore[return-value] # mypy doesn't understand enums well
+
+        def _apply_spot_failover_if_matched(
+            self,
+            toil_job_id: int | None,
+            slurm_job_id: int,
+            status: JobStatusDetail,
+            exit_code: int | None,
+            job_details: dict[str, str] | None = None,
+        ) -> BatchJobExitReason | None:
+            """
+            Record a spot strike when enabled and matching.
+
+            Returns ``BatchJobExitReason.SPOT`` while partition failover should
+            run before ``--doubleMem``, ``FAILED`` when the attempt already used
+            the failover partition or no target can be resolved after the
+            strike threshold, or ``None`` when spot failover does not apply.
+            """
+            if toil_job_id is None:
+                return None
+            if not (
+                getattr(self.boss, "slurm_spot_failover", False)
+                or spot_failover_enabled()
+            ):
+                return None
+            state, _rc, reason = status
+            if not self.boss.spot_interruption_matches_configured(
+                state, exit_code, reason
+            ):
+                return None
+            if job_details is None:
+                job_details = self._fetch_scontrol_job_details(slurm_job_id)
+            job_store_id = self.boss._batch_to_job_store_id.get(toil_job_id)
+            submitted = self.boss._batch_submitted_partition.get(toil_job_id)
+            if submitted is None and job_details:
+                submitted = job_details.get("Partition")
+            failover = (
+                self.boss._job_failover_partition.get(job_store_id)
+                if job_store_id
+                else None
+            )
+            already_on_failover = (
+                failover is not None
+                and submitted is not None
+                and submitted == failover
+            )
+            if already_on_failover:
+                # Failover partition already tried; allow --doubleMem via FAILED.
+                # Do not record another strike (avoids rotating env failover lists).
+                logger.info(
+                    "Spot interruption on failover partition %s for jobStoreID=%s "
+                    "(batch=%s); allowing --doubleMem / normal retry accounting",
+                    submitted,
+                    job_store_id,
+                    toil_job_id,
+                )
+                return BatchJobExitReason.FAILED
+            self.boss.record_spot_interruption(
+                toil_job_id, status, job_details, submitted_partition=submitted
+            )
+            if job_store_id is None:
+                return BatchJobExitReason.SPOT
+            failover = self.boss._job_failover_partition.get(job_store_id)
+            strikes = self.boss._job_spot_strikes.get(job_store_id, 0)
+            threshold = self.boss.spot_failover_strikes()
+            if failover is not None or strikes < threshold:
+                return BatchJobExitReason.SPOT
+            # Threshold reached but no Alternate=/failover list: fall through.
+            return BatchJobExitReason.FAILED
 
         def _finalize_exit_code(
             self,
@@ -826,14 +885,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                     toil_job_id, slurm_job_id, job_details
                 )
             # Opt-in spot/SIGTERM per-job failover (after storage handling).
-            state, _rc, reason = status
-            if (
-                getattr(self.boss, "slurm_spot_failover", False)
-                or spot_failover_enabled()
-            ) and spot_interruption_matches(state, exit_code, reason):
-                self.boss.record_spot_interruption(
-                    toil_job_id, status, job_details
-                )
+            spot_reason = self._apply_spot_failover_if_matched(
+                toil_job_id,
+                slurm_job_id,
+                status,
+                exit_code,
+                job_details=job_details,
+            )
+            if spot_reason is not None:
+                return (exit_code, spot_reason)
             if isinstance(code, int):
                 return code
             return (exit_code, exit_reason)
@@ -1677,6 +1737,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             stdoutfile: str = self.boss.format_std_out_err_path(jobID, "%j", "out")
             stderrfile: str = self.boss.format_std_out_err_path(jobID, "%j", "err")
             sbatch_line.extend(["-o", stdoutfile, "-e", stderrfile])
+            # Remember the partition actually requested so spot failover can
+            # resolve Alternate= after Slurm has dropped the job record.
+            if partition is not None:
+                self.boss._batch_submitted_partition[jobID] = partition
             return sbatch_line
 
     def __init__(
@@ -1688,6 +1752,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         self._lost_job_first_seen: dict[int, float] = {}
         self._partition_switch_last_poll = 0.0
         self._batch_to_job_store_id: dict[int, str] = {}
+        self._batch_submitted_partition: dict[int, str] = {}
         self._job_failover_partition: dict[str, str] = {}
         self._job_failover_index: dict[str, int] = {}
         self._job_spot_strikes: dict[str, int] = {}
@@ -1712,6 +1777,19 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         self.slurm_spot_failover = bool(
             getattr(config, "slurm_spot_failover", False)
         ) or spot_failover_enabled()
+        if self.slurm_spot_failover:
+            failover_list = (
+                ",".join(self.failover_partitions)
+                if self.failover_partitions
+                else "(none; Alternate= only)"
+            )
+            logger.info(
+                "Slurm spot/SIGTERM per-job failover enabled: strikes=%s, "
+                "cooldown=%ss, partition_failover_list=%s",
+                self.spot_failover_strikes(),
+                self.spot_failover_cooldown(),
+                failover_list,
+            )
 
     def get_alternate_partition(self, partition: str | None) -> str | None:
         """Return Slurm Alternate= for partition when that alternate is UP."""
@@ -1762,6 +1840,71 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             return None
         return alternate
 
+    def spot_failover_strikes(self) -> int:
+        configured = getattr(self.config, "slurm_spot_failover_strikes", None)
+        if configured is not None:
+            return int(configured)
+        return env_int("TOIL_SLURM_SPOT_FAILOVER_STRIKES", DEFAULT_SPOT_FAILOVER_STRIKES)
+
+    def spot_failover_cooldown(self) -> int:
+        configured = getattr(self.config, "slurm_spot_failover_cooldown", None)
+        if configured is not None:
+            return int(configured)
+        return env_int(
+            "TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", DEFAULT_SPOT_FAILOVER_COOLDOWN
+        )
+
+    def spot_failover_exit_codes(self) -> set[int]:
+        configured = getattr(self.config, "slurm_spot_failover_exit_codes", None)
+        if configured is not None:
+            return parse_spot_failover_exit_codes(configured)
+        return parse_spot_failover_exit_codes(
+            env_csv("TOIL_SLURM_SPOT_FAILOVER_EXIT_CODES") or None
+        )
+
+    def spot_failover_states(self) -> set[str]:
+        configured = getattr(self.config, "slurm_spot_failover_states", None)
+        if configured is not None:
+            return parse_spot_failover_states(configured)
+        return parse_spot_failover_states(
+            env_csv("TOIL_SLURM_SPOT_FAILOVER_STATES") or None
+        )
+
+    def spot_failover_exclude_reasons(self) -> list[str]:
+        configured = getattr(self.config, "slurm_spot_failover_exclude_reasons", None)
+        if configured is not None:
+            if isinstance(configured, str):
+                parts = [p.strip() for p in configured.split(",") if p.strip()]
+            else:
+                parts = [str(p).strip() for p in configured if str(p).strip()]
+            return parts or list(DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS)
+        exclude = env_csv("TOIL_SLURM_SPOT_FAILOVER_EXCLUDE_REASONS")
+        return exclude or list(DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS)
+
+    def spot_failover_reasons(self) -> list[str]:
+        configured = getattr(self.config, "slurm_spot_failover_reasons", None)
+        if configured is not None:
+            if isinstance(configured, str):
+                return [p.strip() for p in configured.split(",") if p.strip()]
+            return [str(p).strip() for p in configured if str(p).strip()]
+        return env_csv("TOIL_SLURM_SPOT_FAILOVER_REASONS")
+
+    def spot_interruption_matches_configured(
+        self,
+        state: str | None,
+        exit_code: int | None,
+        reason: str | None,
+    ) -> bool:
+        return spot_interruption_matches(
+            state,
+            exit_code,
+            reason,
+            exit_codes=self.spot_failover_exit_codes(),
+            states=self.spot_failover_states(),
+            exclude_reasons=self.spot_failover_exclude_reasons(),
+            reason_patterns=self.spot_failover_reasons() or None,
+        )
+
     def resolve_spot_failover_partition(
         self, job_store_id: str, failed_partition: str | None
     ) -> tuple[str | None, str]:
@@ -1792,6 +1935,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         toil_batch_id: int,
         status: JobStatusDetail,
         job_details: dict[str, str] | None,
+        submitted_partition: str | None = None,
     ) -> None:
         """
         Count a spot/SIGTERM strike for the logical job and escalate partition
@@ -1801,56 +1945,60 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             return
         job_store_id = self._batch_to_job_store_id.get(toil_batch_id)
         if not job_store_id:
-            logger.debug(
+            logger.warning(
                 "Spot interruption for batch job %s but no jobStoreID mapping; skipping",
                 toil_batch_id,
             )
             return
         strikes = self._job_spot_strikes.get(job_store_id, 0) + 1
         self._job_spot_strikes[job_store_id] = strikes
-        threshold = env_int(
-            "TOIL_SLURM_SPOT_FAILOVER_STRIKES", DEFAULT_SPOT_FAILOVER_STRIKES
-        )
-        logger.debug(
-            "Spot interruption strike %s/%s for jobStoreID=%s (batch=%s, status=%s)",
+        threshold = self.spot_failover_strikes()
+        failed_partition = submitted_partition
+        if failed_partition is None and job_details:
+            failed_partition = job_details.get("Partition")
+        if failed_partition is None:
+            failed_partition = self._batch_submitted_partition.get(toil_batch_id)
+        logger.info(
+            "Spot interruption strike %s/%s for jobStoreID=%s (batch=%s, "
+            "submitted_partition=%s, status=%s)",
             strikes,
             threshold,
             job_store_id,
             toil_batch_id,
+            failed_partition,
             status,
         )
         if strikes < threshold:
             return
-        cooldown = env_int(
-            "TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", DEFAULT_SPOT_FAILOVER_COOLDOWN
-        )
+        cooldown = self.spot_failover_cooldown()
         now = time.time()
         last = self._job_spot_last_advance.get(job_store_id)
         if last is not None and (now - last) < cooldown:
-            logger.debug(
+            remaining = int(cooldown - (now - last))
+            logger.info(
                 "Skipping spot failover advance for jobStoreID=%s; "
-                "last advance was %ss ago (cooldown=%ss)",
+                "cooldown active (%ss remaining of %ss)",
                 job_store_id,
-                int(now - last),
+                remaining,
                 cooldown,
             )
             return
-        failed_partition = None
-        if job_details:
-            failed_partition = job_details.get("Partition")
         target, source = self.resolve_spot_failover_partition(
             job_store_id, failed_partition
         )
         if not target:
-            logger.debug(
-                "Spot failover for jobStoreID=%s: no Alternate= or env failover list",
+            logger.warning(
+                "Spot failover for jobStoreID=%s: no Alternate= for partition %s "
+                "and no TOIL_SLURM_PARTITION_FAILOVER / --slurmPartitionFailover list; "
+                "this failure will fall through to --doubleMem if enabled",
                 job_store_id,
+                failed_partition,
             )
             return
         # Idempotent when already on the same target (e.g. re-applying Alternate=).
         if self._job_failover_partition.get(job_store_id) == target:
             self._job_spot_last_advance[job_store_id] = now
-            logger.debug(
+            logger.info(
                 "Spot failover for jobStoreID=%s already on partition %s (%s)",
                 job_store_id,
                 target,
@@ -2203,7 +2351,60 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             env_var="TOIL_SLURM_SPOT_FAILOVER",
             help="If True, after repeated spot/SIGTERM-like Slurm failures for the same "
             "logical job, submit subsequent retries to the partition from Slurm "
-            "Alternate= (or TOIL_SLURM_PARTITION_FAILOVER if Alternate= is unset).",
+            "Alternate= (or TOIL_SLURM_PARTITION_FAILOVER if Alternate= is unset). "
+            "Spot-phase failures keep memory and try count; --doubleMem applies only "
+            "after the job has already run on the failover partition.",
+        )
+        parser.add_argument(
+            "--slurmSpotFailoverStrikes",
+            dest="slurm_spot_failover_strikes",
+            type=int,
+            default=None,
+            env_var="TOIL_SLURM_SPOT_FAILOVER_STRIKES",
+            help="Qualifying terminal spot/SIGTERM failures per jobStoreID before "
+            f"escalating partition (default: {DEFAULT_SPOT_FAILOVER_STRIKES}).",
+        )
+        parser.add_argument(
+            "--slurmSpotFailoverCooldown",
+            dest="slurm_spot_failover_cooldown",
+            type=int,
+            default=None,
+            env_var="TOIL_SLURM_SPOT_FAILOVER_COOLDOWN",
+            help="Seconds between spot failover partition advances for the same "
+            f"jobStoreID (default: {DEFAULT_SPOT_FAILOVER_COOLDOWN}).",
+        )
+        parser.add_argument(
+            "--slurmSpotFailoverExitCodes",
+            dest="slurm_spot_failover_exit_codes",
+            default=None,
+            env_var="TOIL_SLURM_SPOT_FAILOVER_EXIT_CODES",
+            help="Comma-separated exit codes treated as spot/SIGTERM interruptions "
+            f"(default: {','.join(str(c) for c in sorted(DEFAULT_SPOT_FAILOVER_EXIT_CODES))}).",
+        )
+        parser.add_argument(
+            "--slurmSpotFailoverStates",
+            dest="slurm_spot_failover_states",
+            default=None,
+            env_var="TOIL_SLURM_SPOT_FAILOVER_STATES",
+            help="Comma-separated Slurm states treated as spot interruptions "
+            f"(default: {','.join(sorted(DEFAULT_SPOT_FAILOVER_STATES))}).",
+        )
+        parser.add_argument(
+            "--slurmSpotFailoverExcludeReasons",
+            dest="slurm_spot_failover_exclude_reasons",
+            default=None,
+            env_var="TOIL_SLURM_SPOT_FAILOVER_EXCLUDE_REASONS",
+            help="Comma-separated substrings in the Slurm reason that exclude a "
+            "failure from spot failover "
+            f"(default: {','.join(DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS)}).",
+        )
+        parser.add_argument(
+            "--slurmSpotFailoverReasons",
+            dest="slurm_spot_failover_reasons",
+            default=None,
+            env_var="TOIL_SLURM_SPOT_FAILOVER_REASONS",
+            help="Optional comma-separated reason substrings that allow CANCELLED/"
+            "TIMEOUT states to count as spot interruptions (default: unset).",
         )
         parser.add_argument(
             "--slurmDrainBadNodes",
@@ -2230,4 +2431,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         setOption("slurm_args")
         setOption("slurm_partition_failover")
         setOption("slurm_spot_failover")
+        setOption("slurm_spot_failover_strikes")
+        setOption("slurm_spot_failover_cooldown")
+        setOption("slurm_spot_failover_exit_codes")
+        setOption("slurm_spot_failover_states")
+        setOption("slurm_spot_failover_exclude_reasons")
+        setOption("slurm_spot_failover_reasons")
         setOption("slurm_drain_bad_nodes")

@@ -1501,6 +1501,15 @@ class JobDescription(Requirer):
                 self,
                 self.jobStoreID,
             )
+        elif exit_reason == BatchJobExitReason.SPOT:
+            # Spot/SIGTERM failover runs before memory doubling: keep size and tries.
+            logger.info(
+                "Leaving try count (%s) and memory unchanged for job %s with ID %s "
+                "after spot/SIGTERM interruption (partition failover before doubleMem)",
+                self.remainingTryCount,
+                self,
+                self.jobStoreID,
+            )
         elif (
             exit_reason in (
                 BatchJobExitReason.MEMLIMIT,
