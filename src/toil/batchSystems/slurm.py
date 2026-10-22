@@ -355,6 +355,37 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             else:
                 return winning_partition.partition_name
 
+        def get_partition_memory_capacity(self, partition_name: str) -> int | None:
+            """
+            Get the memory capacity (in megabytes) of a specific partition.
+            Returns None if partition not found or memory cannot be determined.
+            """
+            if not self.all_partitions:
+                return None
+
+            for partition in self.all_partitions:
+                if partition.partition_name == partition_name:
+                    try:
+                        # Parse memory string (e.g., "128000" or "128G")
+                        memory_str = partition.memory
+                        if memory_str.endswith("G"):
+                            # Convert gigabytes to megabytes
+                            return int(memory_str[:-1]) * 1024
+                        elif memory_str.endswith("M"):
+                            # Already in megabytes
+                            return int(memory_str[:-1])
+                        else:
+                            # Assume megabytes if no unit specified
+                            return int(memory_str)
+                    except (ValueError, AttributeError):
+                        logger.debug(
+                            "Could not parse memory for partition %s: %s",
+                            partition_name,
+                            partition.memory,
+                        )
+                        return None
+            return None
+
     class GridEngineThread(AbstractGridEngineBatchSystem.GridEngineThread):
         # Our boss is always the enclosing class
         boss: SlurmBatchSystem
@@ -1634,17 +1665,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if partition is None:
                 # Pick a partition based on time limit
                 partition = self.boss.partitions.get_partition(time_limit)
-
-            # Partition precedence: per-job spot failover > global storage failover > normal.
-            job_store_id = self.boss._batch_to_job_store_id.get(jobID)
-            per_job_partition: str | None = None
-            if job_store_id:
-                per_job_partition = self.boss._job_failover_partition.get(job_store_id)
-            if per_job_partition:
-                partition = per_job_partition
-            elif self.boss.active_failover_partition:
-                partition = self.boss.active_failover_partition
-
             if qos is None:
                 # Apply a configured QOS if one wasn't already supplied.
                 gpu_qos_override: str | None = self.boss.config.slurm_gpu_qos  # type: ignore[attr-defined]
@@ -1702,6 +1722,42 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 sbatch_line.append(f"--time=0:{time_limit}")
 
             if slurm_mem and slurm_cpu:
+                # Partition precedence: per-job spot failover > global storage failover > normal.
+                job_store_id = self.boss._batch_to_job_store_id.get(jobID)
+                per_job_partition: str | None = None
+                if job_store_id:
+                    per_job_partition = self.boss._job_failover_partition.get(job_store_id)
+
+                # If we have a per-job failover partition, check if it can handle the memory requirements
+                if per_job_partition and slurm_mem is not None:
+                    partition_capacity = self.boss.partitions.get_partition_memory_capacity(per_job_partition)
+                    if partition_capacity is not None and slurm_mem > partition_capacity:
+                        # Failover partition can't handle the memory requirements, allow normal selection
+                        logger.info(
+                            "Per-job failover partition %s cannot handle memory requirement %dMB "
+                            "(capacity: %dMB); allowing normal partition selection",
+                            per_job_partition, slurm_mem, partition_capacity
+                        )
+                        per_job_partition = None
+
+                if per_job_partition:
+                    partition = per_job_partition
+                elif self.boss.active_failover_partition:
+                    # Check if global failover partition can handle memory requirements
+                    if slurm_mem is not None:
+                        partition_capacity = self.boss.partitions.get_partition_memory_capacity(self.boss.active_failover_partition)
+                        if partition_capacity is not None and slurm_mem > partition_capacity:
+                            # Global failover partition can't handle the memory requirements
+                            logger.info(
+                                "Global failover partition %s cannot handle memory requirement %dMB "
+                                "(capacity: %dMB); allowing normal partition selection",
+                                self.boss.active_failover_partition, slurm_mem, partition_capacity
+                            )
+                            # Let normal selection proceed by not setting partition
+                        else:
+                            partition = self.boss.active_failover_partition
+                    else:
+                        partition = self.boss.active_failover_partition
                 # Keep per-job / storage failover override over resource-based selection.
                 if not per_job_partition and not self.boss.active_failover_partition:
                     partition = self.select_partition(
@@ -2165,25 +2221,6 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     ###
     ### The interface for SLURM
     ###
-    @classmethod
-    def _check_accelerator_request(self, requirer: Requirer) -> None:
-        for accelerator in requirer.accelerators:
-            if accelerator["kind"] != "gpu":
-                # We can only provide GPUs, and of those only nvidia ones.
-                raise InsufficientSystemResources(
-                    requirer,
-                    "accelerators",
-                    details=[
-                        f"The accelerator {accelerator} could not be provided.",
-                        "Slurm can only provide gpu accelerators.",
-                    ],
-                )
-            # if not any(self.batchSystemResources['gputot'] >= accelerator['count']):
-            #     raise InsufficientSystemResources(requirer, 'accelerators', details=[
-            #         f'The requested number of accelerators {accelerator} could not be provided.',
-            #         f'Slurm cluster currently has {self.batchSystemResources["gputot"]}.'
-            #     ])
-
     @classmethod
     def assessBatchResources(cls):
         slurm_partition_configs = (
