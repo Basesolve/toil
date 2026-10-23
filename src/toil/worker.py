@@ -19,6 +19,7 @@ import logging
 import os
 import dill as pickle
 import random
+import re
 import shutil
 import signal
 import socket
@@ -48,16 +49,43 @@ from toil.job import (
     Job,
     JobDescription,
 )
-from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchJobStoreException, TOIL_WORKER_NO_JOB_STORE_EXIT_CODE
+from toil.jobStores.abstractJobStore import AbstractJobStore, NoSuchJobStoreException
 from toil.batchSystems.slurm_mount_recovery import (
     STORAGE_FAILURE_EXIT_CODE,
     is_fatal_storage_oserror,
 )
-from toil.lib.io import make_public_dir, path_union
+from toil.lib.io import make_public_dir, path_union, ensure_dir_exists
 from toil.lib.resources import ResourceMonitor
 from toil.statsAndLogging import StatsDict, configure_root_logger, install_log_color, set_log_level
 
 logger = logging.getLogger(__name__)
+
+# Value the worker exits with when it cannot access the job store, so the
+# leader can produce a useful error message.
+NO_JOB_STORE_EXIT_CODE = 76
+
+# Value the worker exits with when warned that it is told it is out of time, so
+# th time limit can be increased.
+WALLTIME_EXIT_CODE = 77
+
+# Signal the worker expects to tell it that it is out of time.
+# Batch systems that can signal before timeout should be set up to send this.
+# Should be a signal that shouldn't arrive for other reasons.
+WALLTIME_SIGNAL = signal.SIGUSR2
+
+# When a walltime signal arrives, we set this.
+_walltime_expired = False
+
+def handle_walltime_signal(signal_number: int, frame: Any) -> None:
+    """
+    Signal handler to stop the worker due to running out of time.
+
+    Raises KeyboardInterrupt, because third-party code will probably shut down
+    cleanly when one happens in an arbirary location.
+    """
+    global _walltime_expired
+    _walltime_expired = True
+    raise KeyboardInterrupt()
 
 
 def nextChainable(
@@ -337,6 +365,10 @@ def workerScript(
     unstick_thread = threading.Thread(target=unstick_worker, args=())
     unstick_thread.daemon = True
     unstick_thread.start()
+    
+    # Make sure the directories we need exist.
+    ensure_dir_exists(config.workDir, "--workDir")
+    ensure_dir_exists(config.coordination_dir, "--coordinationDir")
 
     ##########################################
     # Load the environment for the job
@@ -756,12 +788,30 @@ def workerScript(
                 STORAGE_FAILURE_EXIT_CODE,
             )
             failure_exit_code = STORAGE_FAILURE_EXIT_CODE
+        elif _walltime_expired:
+            # We got here after we got a time's-up signal from the backing
+            # scheduler.
+            failure_exit_code = WALLTIME_EXIT_CODE
         else:
             try:
-                from WDL.runtime.error import CommandFailed
+                from WDL.runtime.error import CommandFailed, Interrupted
 
                 if isinstance(e, CommandFailed):
                     failure_exit_code = e.exit_status
+                elif isinstance(e, Interrupted):
+                    # Try to work around
+                    # https://github.com/chanzuckerberg/miniwdl/issues/902 at
+                    # least enough to pass the tests.
+                    # If we observed a container supposedly running with a
+                    # nonzero exit code, MiniWDL will bail out with an
+                    # Interrupted with "exit code = {exit_code}" in the
+                    # message. We need to parse it out and use it to at least
+                    # cover the cases where that code was indeed supposed to be
+                    # a failure and needs to make it to the leader.
+                    found = re.search("exit code = ([0-9]+)", str(e))
+                    if found:
+                        failure_exit_code = int(found.group(1))
+
             except ImportError:
                 # WDL dependency not available
                 pass
@@ -999,6 +1049,9 @@ def main(argv: list[str] | None = None) -> None:
     # Parse our command line
     options = parse_args(argv)
 
+    # Watch for time-up messages from the backing scheduler
+    signal.signal(WALLTIME_SIGNAL, handle_walltime_signal)
+
     ##########################################
     # Load the jobStore/config file
     ##########################################
@@ -1015,8 +1068,8 @@ def main(argv: list[str] | None = None) -> None:
             "a local path.",
             options.jobStoreLocator,
         )
-        sys.exit(TOIL_WORKER_NO_JOB_STORE_EXIT_CODE)
-    
+        sys.exit(NO_JOB_STORE_EXIT_CODE)
+
     config = job_store.config
 
     with in_contexts(options.context):

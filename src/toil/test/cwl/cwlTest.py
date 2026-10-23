@@ -40,6 +40,7 @@ sys.path.insert(0, pkg_root)  # noqa
 
 from schema_salad.exceptions import ValidationException
 
+from toil.common import Toil
 from toil.cwl.utils import (
     DirectoryStructure,
     download_structure,
@@ -51,7 +52,7 @@ from toil.fileStores import FileID
 from toil.fileStores.abstractFileStore import AbstractFileStore
 from toil.job import WorkerImportJob
 from toil.lib.threading import cpu_count
-from toil.test import get_data
+from toil.test import get_data, get_cwltool_data
 from toil.test import pneeds_aws_s3 as needs_aws_s3
 from toil.test import pneeds_cwl as needs_cwl
 from toil.test import pneeds_docker as needs_docker
@@ -66,6 +67,7 @@ from toil.test import pneeds_slurm as needs_slurm
 from toil.test import pneeds_torque as needs_torque
 from toil.test import pneeds_wes_server as needs_wes_server
 from toil.test import pslow as slow
+from toil.utils.toilStats import get_stats, process_data
 
 log = logging.getLogger(__name__)
 CONFORMANCE_TEST_TIMEOUT = 10000
@@ -247,6 +249,26 @@ class TestCWLWorkflow:
             st = StringIO()
             # If the workflow runs, it must have had options
             cwltoil.main(args, stdout=st)
+
+    def test_cwl_run_dir(self, tmp_path: Path) -> None:
+        """
+        Test that the CWL image cache location is derived from --runDir.
+        """
+        from toil.cwl import cwltoil
+
+        run_dir = tmp_path / "rundir"
+        with get_data("test/cwl/echo.cwl") as cwlfile:
+            args = [
+                f"--runDir={run_dir}",
+                "--outdir",
+                str(tmp_path / "out"),
+                str(cwlfile),
+                "--message",
+                "str",
+            ]
+            st = StringIO()
+            cwltoil.main(args, stdout=st)
+        assert (run_dir / "image-cache").is_dir()
 
     def _tester(
         self,
@@ -485,6 +507,44 @@ class TestCWLWorkflow:
     @needs_docker
     @pytest.mark.docker
     @pytest.mark.online
+    @pytest.mark.timeout(180)
+    def test_cpu_memory_monitoring(self, tmp_path: Path) -> None:
+        """Container CPU and memory usage is recorded in Toil job stats."""
+        from toil.cwl import cwltoil
+
+        with get_data("test/cwl/waste_cpu_memory.cwl") as cwl_file:
+            with get_data("test/cwl/empty.json") as inputs_file:
+                job_store = tmp_path / "jobStore"
+                main_args = [
+                    "--logDebug",
+                    "--outdir",
+                    str(tmp_path / "output_dir"),
+                    str(cwl_file),
+                    str(inputs_file),
+                    "--jobStore",
+                    str(job_store),
+                    "--stats",
+                    # TODO: this relies on the default container engine for
+                    # toil-cwl-runner being Docker, because we don't have a
+                    # --docker option to make it explicit.
+                ]
+                cwltoil.main(main_args)
+
+                resumed_job_store = Toil.resumeJobStore(str(job_store))
+                stats = get_stats(resumed_job_store)
+                collated_stats = process_data(resumed_job_store.config, stats)
+
+                # The tool burns ~30s of CPU and ~1 GiB of RAM inside Docker.
+                # Per-job stats use KiB for memory and include injected container usage.
+                assert hasattr(collated_stats, "jobs")
+                assert hasattr(collated_stats.jobs, "total_clock")
+                assert hasattr(collated_stats.jobs, "max_memory")
+                assert collated_stats.jobs.total_clock >= 30, f"Total clock of {collated_stats.jobs.total_clock} is too low"
+                assert collated_stats.jobs.max_memory >= 1024 * 1024, f"Max memory of {collated_stats.jobs.max_memory} is too low"
+
+    @needs_docker
+    @pytest.mark.docker
+    @pytest.mark.online
     def test_run_revsort(self, tmp_path: Path) -> None:
         self.revsort("revsort.cwl", self._tester, tmp_path)
 
@@ -566,6 +626,175 @@ class TestCWLWorkflow:
         with get_data("test/cwl/not_run_required_input.cwl") as cwl_file:
             with get_data("test/cwl/empty.json") as inputs_file:
                 self._tester(cwl_file, inputs_file, {}, tmp_path)
+    
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_single_variable(self, tmp_path: Path) -> None:
+        """cwltool:Loop with one rebound input runs to completion (outputMethod=last)."""
+        with get_cwltool_data("loop-ext/single-var-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/single-var-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": 10}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_iteration_limit_exceeded(self, tmp_path: Path) -> None:
+        """--cwl-loop-iteration-limit aborts runaway loops."""
+        from toil.cwl import cwltoil
+        with get_cwltool_data("loop-ext/single-var-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/single-var-loop-job.yml") as job_file:
+                rc = cwltoil.main(
+                    [
+                        "--enable-ext",
+                        "--cwl-loop-iteration-limit=3",
+                        f"--outdir={tmp_path}",
+                        str(cwl_file),
+                        str(job_file),
+                    ]
+                )
+        assert rc != 0
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_single_variable_no_iteration(self, tmp_path: Path) -> None:
+        """cwltool:Loop with loopWhen=false on entry skips the step and yields null."""
+        with get_cwltool_data("loop-ext/single-var-loop-no-iteration.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/single-var-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": None}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_two_variables(self, tmp_path: Path) -> None:
+        """cwltool:Loop with two rebound inputs runs to completion (outputMethod=last)."""
+        with get_cwltool_data("loop-ext/two-vars-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": 10}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_all_output_method_no_iteration(self, tmp_path: Path) -> None:
+        """cwltool:Loop with outputMethod=all and loopWhen=false on entry yields empty array."""
+        with get_cwltool_data("loop-ext/all-output-loop-no-iteration.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/single-var-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": []}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_with_all_output_method(self, tmp_path: Path) -> None:
+        """cwltool:Loop with outputMethod=all accumulates each iteration's outputs into an array."""
+        with get_cwltool_data("loop-ext/all-output-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/single-var-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": [2, 3, 4, 5, 6, 7, 8, 9, 10]}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_value_from(self, tmp_path: Path) -> None:
+        """cwltool:Loop with a LoopInput valueFrom expression: next input derived from previous joborder."""
+        with get_cwltool_data("loop-ext/value-from-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": 10}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_default_value_loop(self, tmp_path: Path) -> None:
+        """cwltool:Loop with a LoopInput default: fallback used when loopSource resolves to None."""
+        with get_cwltool_data("loop-ext/default-value-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/single-var-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": [8, 11, 14, 17, 20]}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_multi_source_loop_input(self, tmp_path: Path) -> None:
+        """cwltool:Loop with multi-source loopSource and pickValue."""
+        with get_cwltool_data("loop-ext/multi-source-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/single-var-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": [2, 3, 4, 5, 8, 11, 14, 17, 20]}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_nested_loops(self, tmp_path: Path) -> None:
+        """cwltool:Loop nested inside another cwltool:Loop, inner uses outputMethod=last, outer uses outputMethod=all."""
+        with get_cwltool_data("loop-ext/loop-inside-loop.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": [2, 3, 4]}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_nested_loops_all(self, tmp_path: Path) -> None:
+        """cwltool:Loop nested inside another cwltool:Loop, both outputMethod=all."""
+        with get_cwltool_data("loop-ext/loop-inside-loop-all.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": [[2], [2, 3], [2, 3, 4]]}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_inside_scatter(self, tmp_path: Path) -> None:
+        """Scatter over a Workflow step whose embedded workflow contains a cwltool:Loop step."""
+        with get_cwltool_data("loop-ext/loop-inside-scatter.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/loop-inside-scatter-job.yml") as job_file:
+                self._tester(cwl_file, job_file, {"o1": [10, 10, 10, 10, 10]}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_validate_fail_scatter(self, tmp_path: Path) -> None:
+        """cwltool:Loop combined with scatter on the same step is rejected at validation time."""
+        with get_cwltool_data("loop-ext/invalid-loop-scatter.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                with pytest.raises(ValidationException):
+                    self._tester(cwl_file, job_file, {}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_validate_fail_when(self, tmp_path: Path) -> None:
+        """cwltool:Loop combined with when on the same step is rejected at validation time."""
+        with get_cwltool_data("loop-ext/invalid-loop-when.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                with pytest.raises(ValidationException):
+                    self._tester(cwl_file, job_file, {}, tmp_path, main_args=["--enable-ext"])
+
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_fail_non_boolean_loop_when(self, tmp_path: Path) -> None:
+        """A loopWhen expression that evaluates to a non-boolean fails at runtime."""
+        from toil.cwl import cwltoil
+        from io import StringIO 
+        with get_cwltool_data("loop-ext/invalid-non-boolean-loopWhen.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                rc = cwltoil.main(
+                    ["--enable-ext", f"--outdir={tmp_path}", str(cwl_file), str(job_file)],
+                    stdout=StringIO(),
+                )
+        assert rc != 0
+
+    # This test fails due to AssertionError, needs more looking into it. It is disabled for now.
+    @needs_cwl
+    @pytest.mark.cwl
+    @pytest.mark.cwl_small
+    def test_loop_value_from_fail_no_requirement(self, tmp_path: Path) -> None:
+        """cwltool:Loop with valueFrom but no StepInputExpressionRequirement is rejected."""
+        from toil.cwl import cwltoil
+        from io import StringIO
+        with get_cwltool_data("loop-ext/invalid-value-from-loop-no-requirement.cwl") as cwl_file:
+            with get_cwltool_data("loop-ext/two-vars-loop-job.yml") as job_file:
+                rc = cwltoil.main(
+                    ["--enable-ext", f"--outdir={tmp_path}", str(cwl_file), str(job_file)],
+                    stdout=StringIO(),
+                )
+        assert rc != 0
 
     @needs_slurm
     @pytest.mark.slurm
@@ -1197,10 +1426,18 @@ class TestCWLWorkflow:
             with subtests.test(msg=f"Testing input {in_file} for status {status}"):
                 with get_data(in_file) as jobfile:
                     args = [TRS_SPEC, str(jobfile), f"--outdir={str(tmp_path)}"]
-                    with patch("toil.common.HistoryManager.record_workflow_metadata") as mock_record:
+                    with patch(
+                        "toil.common.HistoryManager.record_workflow_creation",
+                        return_value=True,
+                    ), patch(
+                        "toil.common.HistoryManager.record_workflow_metadata"
+                    ) as mock_record:
                         # History tracking is off for the tests that aren't really
                         # history tests, so we check if the TRS ID goes into the
                         # history system and not really if it goes to Dockstore.
+                        # record_workflow_creation is also mocked to report that
+                        # it created a new record, since record_workflow_metadata
+                        # is only called when it does.
                         #
                         # We know that common.py is talking to the
                         # HistoryManager and that it imports it with as.
@@ -1675,6 +1912,8 @@ class TestCWLv12Conformance:
         )
 
 
+# TODO: Why aren't these in TestCWLWorkflow? They run workflows.
+
 @needs_cwl
 @pytest.mark.cwl
 @pytest.mark.cwl_small_log_dir
@@ -1872,6 +2111,89 @@ def test_pick_value_with_one_null_value(
 @needs_cwl
 @pytest.mark.cwl
 @pytest.mark.cwl_small
+def test_when_false_not_scheduled(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """
+    A step skipped by its `when` condition must only run the CWLJobWrapper not the CWLJob. See: #3990.
+    """
+    from toil.cwl import cwltoil
+
+    with get_data("test/cwl/conditional_wf.cwl") as cwl_file:
+        with get_data("test/cwl/conditional_wf.yaml") as job_file:
+            with caplog.at_level(logging.DEBUG, logger="toil.leader"):
+                cwltoil.main(
+                    ["--logDebug", f"--outdir={tmp_path}", str(cwl_file), str(job_file), "--disableChaining=True"]
+                )
+                assert any(
+                    "Finished toil run successfully" in record.getMessage()
+                    for record in caplog.records
+                ), "Toil run didn't finish"
+                assert any(
+                        "Issued job 'CWLJobWrapper'" in record.getMessage()
+                        for record in caplog.records
+                ), "'CWLJobWrapper' not issued"
+                assert not any(
+                        "Issued job 'CWLJob'" in record.getMessage()
+                        for record in caplog.records
+                ), "'CWLJob' issued"
+
+
+@needs_cwl
+@pytest.mark.cwl
+@pytest.mark.cwl_small
+def test_when_on_step_output_scheduled(
+    caplog: pytest.LogCaptureFixture, tmp_path: Path
+) -> None:
+    """
+    A step whose `when` references an upstream step's output must still only
+    run the CWLJobWrapper when skipped, and the CWLJob when not. See: #3990.
+    """
+    from toil.cwl import cwltoil
+
+    with get_data("test/cwl/conditional_step_depends_on_step.cwl") as cwl_file:
+        # produce/result (1) is not > 1: consume is skipped and only its
+        # CWLJobWrapper should run.
+        with caplog.at_level(logging.DEBUG, logger="toil.leader"):
+            cwltoil.main(
+                ["--logDebug", f"--outdir={tmp_path}", str(cwl_file), "--number", "1", "--disableChaining=True"]
+            )
+            assert any(
+                "Finished toil run successfully" in record.getMessage()
+                for record in caplog.records
+            ), "Toil run didn't finish"
+            assert any(
+                "Issued job 'CWLJobWrapper'" in record.getMessage()
+                and "consume" in record.getMessage()
+                for record in caplog.records
+            ), "consume's 'CWLJobWrapper' not issued"
+            assert not any(
+                "Issued job 'CWLJob'" in record.getMessage()
+                and "consume" in record.getMessage()
+                for record in caplog.records
+            ), "consume's real 'CWLJob' issued despite being skipped"
+
+        caplog.clear()
+
+        # produce/result (2) is > 1: consume should actually run.
+        with caplog.at_level(logging.DEBUG, logger="toil.leader"):
+            cwltoil.main(
+                ["--logDebug", f"--outdir={tmp_path}", str(cwl_file), "--number", "2", "--disableChaining=True"]
+            )
+            assert any(
+                "Finished toil run successfully" in record.getMessage()
+                for record in caplog.records
+            ), "Toil run didn't finish"
+            assert any(
+                "Issued job 'CWLJob'" in record.getMessage()
+                and "consume" in record.getMessage()
+                for record in caplog.records
+            ), "consume's real 'CWLJob' not issued"
+
+
+@needs_cwl
+@pytest.mark.cwl
+@pytest.mark.cwl_small
 def test_workflow_echo_string(tmp_path: Path) -> None:
     with get_data("test/cwl/echo_string.cwl") as cwl_file:
         cmd = [
@@ -1916,6 +2238,40 @@ def test_workflow_echo_string_scatter_capture_stdout(tmp_path: Path) -> None:
                 new_file_loc == file["location"]
             ), f"Toil should have detected conflicts for these stdout files {new_file_loc} and {file}"
 
+        assert "Finished toil run successfully" in p.stderr
+        assert p.returncode == 0
+
+@needs_cwl
+@pytest.mark.cwl
+@pytest.mark.cwl_small
+def test_captured_stderr_for_failed_job_is_reported(tmp_path: Path) -> None:
+    """
+    Make sure that standard error for failed jobs is logged, even when the job
+    is capturing standard error.
+    """
+    with get_data("test/cwl/fail_with_log.cwl") as cwl_file:
+        cmd = [
+            "toil-cwl-runner",
+            f"--jobStore=file:{tmp_path / 'jobStore'}",
+            str(cwl_file),
+        ]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        assert p.returncode != 0
+        assert "Message: This is a test" in p.stderr
+
+
+@needs_cwl
+@pytest.mark.cwl
+@pytest.mark.cwl_small
+def test_timelimit_expression(tmp_path: Path) -> None:
+    with get_data("test/cwl/timelimit.cwl") as cwl_file:
+        cmd = [
+            "toil-cwl-runner",
+            f"--jobStore=file:{tmp_path / 'jobStore'}",
+            str(cwl_file),
+        ]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        assert len(p.stdout) > 0
         assert "Finished toil run successfully" in p.stderr
         assert p.returncode == 0
 
@@ -2282,6 +2638,46 @@ def test_download_structure(tmp_path: Path) -> None:
         any_order=True,
     )
 
+
+@needs_cwl
+@pytest.mark.cwl
+@pytest.mark.cwl_small
+def test_cwl_resource_message_parsing_records_cpu_and_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Resource monitor messages emitted from a container are translated into
+    Toil's extra CPU and memory accounting.
+    """
+    from toil.lib import interpreter
+    from toil.lib.resources import ResourceMonitor
+
+    message_file = tmp_path / "resources.tsv"
+    message_file.write_text(
+        "CPU\t1000000\n"
+        "Memory\t1024\n"
+        "CPU\t4000000\n"
+        "Memory\t2048\n",
+        encoding="utf-8",
+    )
+
+    recorded_memory_ki: list[int] = []
+    recorded_cpu_seconds: list[float] = []
+    monkeypatch.setattr(
+        ResourceMonitor,
+        "record_extra_memory",
+        lambda peak_ki: recorded_memory_ki.append(peak_ki),
+    )
+    monkeypatch.setattr(
+        ResourceMonitor,
+        "record_extra_cpu",
+        lambda seconds: recorded_cpu_seconds.append(seconds),
+    )
+
+    interpreter.handle_message_file(str(message_file))
+
+    assert recorded_memory_ki == [2]
+    assert recorded_cpu_seconds == [3.0]
 
 @needs_cwl
 @pytest.mark.cwl

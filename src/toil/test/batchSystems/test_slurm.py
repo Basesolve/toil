@@ -19,6 +19,8 @@ from toil.batchSystems.abstractBatchSystem import (
 )
 from toil.common import Config
 from toil.lib.misc import CalledProcessErrorStderr
+from toil.worker import WALLTIME_SIGNAL, WALLTIME_EXIT_CODE
+
 from toil.test import ToilTest
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,7 @@ def call_sacct(args, **_) -> str:
         767925: "767925|FAILED|2:0\n767925.extern|COMPLETED|0:0\n767925.0|FAILED|2:0\n",
         785023: "785023|FAILED|127:0\n785023.batch|FAILED|127:0\n785023.extern|COMPLETED|0:0\n",
         789456: "789456|FAILED|1:0\n",
+        789457: f"789457|FAILED|{WALLTIME_EXIT_CODE}:0\n789457.extern|COMPLETED|0:0\n",
         789724: "789724|RUNNING|0:0\n789724.batch|RUNNING|0:0\n789724.extern|RUNNING|0:0\n",
         789868: "789868|PENDING|0:0\n",
         789869: "789869|COMPLETED|0:0\n789869.batch|COMPLETED|0:0\n789869.extern|COMPLETED|0:0\n",
@@ -82,6 +85,7 @@ def call_sacct(args, **_) -> str:
         767925: JOB_BASE_TIME + timedelta(days=2),
         785023: JOB_BASE_TIME + timedelta(days=3),
         789456: JOB_BASE_TIME + timedelta(days=3),
+        789457: JOB_BASE_TIME + timedelta(days=3),
         789724: JOB_BASE_TIME + timedelta(days=4),
         789868: JOB_BASE_TIME + timedelta(days=4),
         789869: JOB_BASE_TIME + timedelta(days=4),
@@ -230,6 +234,17 @@ def call_scontrol(args, **_) -> str:
                NtasksPerTRES:0
             """
         ),
+        790001: textwrap.dedent(
+            """\
+            JobId=790001 JobName=somebody_elses_job
+               UserId=someone(1000) GroupId=someone(1000) MCS_label=N/A
+               Comment=first line of a comment
+            
+            second line of the comment, after a blank line
+               JobState=RUNNING Reason=None Dependency=(null)
+               Requeue=0 Restarts=0 BatchFlag=1 Reboot=0 ExitCode=0:0
+            """
+        ),
     }
     if job_id is not None:
         try:
@@ -244,6 +259,13 @@ def call_scontrol(args, **_) -> str:
         for value in scontrol_info.values():
             stdout += value + "\n"
     return stdout
+
+def call_scontrol_no_jobs(args, **_) -> str:
+    """
+    Return the output scontrol would produce if called when no jobs exist.
+    """
+
+    return "No jobs in the system\n"
 
 
 def call_sacct_raises(*_):
@@ -540,6 +562,20 @@ class SlurmTest(ToilTest):
         result = self.worker._getJobDetailsFromScontrol(list(expected_result))
         assert result == expected_result, f"{result} != {expected_result}"
 
+    def test_getJobDetailsFromScontrol_one_unescaped_newlines(self):
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_scontrol)
+        expected_result = {
+            790001: ("RUNNING", 0),
+        }
+        result = self.worker._getJobDetailsFromScontrol(list(expected_result))
+        assert result == expected_result, f"{result} != {expected_result}"
+
+    def test_getJobDetailsFromScontrol_no_jobs(self):
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_scontrol_no_jobs)
+        expected_result = {1234: (None, None), 1235: (None, None), 1236: (None, None)}
+        result = self.worker._getJobDetailsFromScontrol(list(expected_result))
+        assert result == expected_result, f"{result} != {expected_result}"
+
     ###
     ### tests for getJobExitCode
     ###
@@ -548,6 +584,23 @@ class SlurmTest(ToilTest):
         self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_either)
         job_id = "785023"  # FAILED
         expected_result = (127, BatchJobExitReason.FAILED)
+        result = self.worker.getJobExitCode(job_id)
+        assert result == expected_result, f"{result} != {expected_result}"
+
+    def test_getJobExitCode_job_timed_out(self):
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_either)
+        job_id = "754725"  # TIMEOUT
+        expected_result = (EXIT_STATUS_UNAVAILABLE_VALUE, BatchJobExitReason.TIMELIMIT)
+        result = self.worker.getJobExitCode(job_id)
+        assert result == expected_result, f"{result} != {expected_result}"
+
+    def test_getJobExitCode_job_reported_timeout(self):
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "call_command", call_either)
+        job_id = "789457"  # FAILED with the WALLTIME_EXIT_CODE exit code
+        expected_result = (
+            WALLTIME_EXIT_CODE,
+            BatchJobExitReason.TIMELIMIT,
+        )
         result = self.worker.getJobExitCode(job_id)
         assert result == expected_result, f"{result} != {expected_result}"
 
@@ -635,7 +688,7 @@ class SlurmTest(ToilTest):
         ]  # COMPLETED
         # RUNNING and PENDING jobs should return None
         expected_result = [
-            (EXIT_STATUS_UNAVAILABLE_VALUE, BatchJobExitReason.KILLED),
+            (EXIT_STATUS_UNAVAILABLE_VALUE, BatchJobExitReason.TIMELIMIT),
             (1, BatchJobExitReason.FAILED),
             None,
             None,
@@ -754,14 +807,14 @@ class SlurmTest(ToilTest):
 
         # Without a partition override in the environment, we should get the
         # "short" partition for this job
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--partition=short" in command
 
         # With a partition override, we should not. But the override will be rewritten.
         self.worker.boss.config.slurm_args = (
             "--something --partition foo --somethingElse"
         )
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--partition=short" not in command
         assert "--partition=foo" in command
 
@@ -769,27 +822,27 @@ class SlurmTest(ToilTest):
         self.worker.boss.config.slurm_args = (
             "--something --partition=foo --somethingElse"
         )
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--partition=short" not in command
         assert "--partition=foo" in command
 
         # And short options
         self.worker.boss.config.slurm_args = "--something -p foo --somethingElse"
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--partition=short" not in command
         assert "--partition=foo" in command
 
         # Partition settings from the config should override automatic selection
         self.worker.boss.config.slurm_partition = "foobar"
         self.worker.boss.config.slurm_args = "--something --somethingElse"
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--partition=foobar" in command
 
         # But they should be overridden by the argument overrides
         self.worker.boss.config.slurm_args = (
             "--something --partition=baz --somethingElse"
         )
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--partition=baz" in command
 
     def test_prepareSbatch_time(self):
@@ -801,7 +854,7 @@ class SlurmTest(ToilTest):
 
         # Without a time override in the environment, we should use the normal
         # time and the "short" partition
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         logger.debug("Command: %s", command)
         assert "--time=0:30" in command
         assert "--partition=short" in command
@@ -811,7 +864,7 @@ class SlurmTest(ToilTest):
         self.worker.boss.config.slurm_args = (
             "--something --time 10:00:00 --somethingElse"
         )
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         logger.debug("Command: %s", command)
         assert "--partition=medium" in command
         assert "--time=0:36000" in command
@@ -820,14 +873,14 @@ class SlurmTest(ToilTest):
         self.worker.boss.config.slurm_args = (
             "--something --time=10:00:00 --somethingElse"
         )
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         logger.debug("Command: %s", command)
         assert "--partition=medium" in command
         assert "--time=0:36000" in command
 
         # And short options
         self.worker.boss.config.slurm_args = "--something -t 10:00:00 --somethingElse"
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         logger.debug("Command: %s", command)
         assert "--partition=medium" in command
         assert "--time=0:36000" in command
@@ -838,17 +891,17 @@ class SlurmTest(ToilTest):
         self.worker.boss.partitions = ps
 
         # Without any overrides, we need --export=ALL
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--export=ALL" in command
 
         # With overrides, we don't get --export=ALL
         self.worker.boss.config.slurm_args = "--export=foo"
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--export=ALL" not in command
 
         # With --export-file, we don't get --export=ALL as documented.
         self.worker.boss.config.slurm_args = "--export-file=./thefile.txt"
-        command = self.worker.prepareSbatch(1, 100, 5, "job5", None, None)
+        command = self.worker.prepareSbatch(1, 100, 5, 0, "job5", None, None)
         assert "--export=ALL" not in command
 
     def test_option_detector(self):

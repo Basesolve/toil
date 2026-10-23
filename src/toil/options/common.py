@@ -257,10 +257,6 @@ def add_base_toil_options(
             workDir = values
             if workDir is not None:
                 workDir = os.path.abspath(workDir)
-                if not os.path.exists(workDir):
-                    raise RuntimeError(
-                        f"The path provided to --workDir ({workDir}) does not exist."
-                    )
 
                 if len(workDir) > 80:
                     logger.warning(
@@ -281,10 +277,6 @@ def add_base_toil_options(
             coordination_dir = values
             if coordination_dir is not None:
                 coordination_dir = os.path.abspath(coordination_dir)
-                if not os.path.exists(coordination_dir):
-                    raise RuntimeError(
-                        f"The path provided to --coordinationDir ({coordination_dir}) does not exist."
-                    )
             setattr(namespace, self.dest, coordination_dir)
 
     def make_closed_interval_action(
@@ -356,6 +348,16 @@ def add_base_toil_options(
         help="Absolute path to directory where Toil will keep state and lock files. "
         "When sharing a cache between containers on a host, this directory must be "
         "shared between the containers.",
+    )
+    core_options.add_argument(
+        "--runDir",
+        dest="runDir",
+        default=None,
+        env_var="TOIL_RUN_DIR",
+        metavar="PATH",
+        help="Directory under which to place the job store, work dir, coordination "
+        "dir, and CWL/WDL image caches for this run, unless overridden individually. "
+        "Toil creates the directory and its subdirectories.",
     )
     core_options.add_argument(
         "--noStdOutErr",
@@ -758,6 +760,7 @@ def add_base_toil_options(
     )
     cpu_note = "Fractions of a core (for example 0.1) are supported on some batch systems [mesos, single_machine]"
     disk_mem_note = "Standard suffixes like K, Ki, M, Mi, G or Gi are supported"
+    walltime_note = "Values are assumed to be in seconds. A value of 0 does not limit the walltime"
     accelerators_note = (
         "Each accelerator specification can have a type (gpu [default], nvidia, amd, cuda, rocm, opencl, "
         "or a specific model like nvidia-tesla-k80), and a count [default: 1]. If both a type and a count "
@@ -863,6 +866,16 @@ def add_base_toil_options(
         default=True,
         help="Use preferred partition types for jobs.",
     )
+    resource_options.add_argument(
+        "--defaultWalltime",
+        dest="defaultWalltime",
+        default="0",
+        type=int,
+        action=make_open_interval_action(0),
+        help=resource_help_msg.format(
+            "default", "walltime", walltime_note, str(0)
+        ),
+    )
 
     # Retrying/rescuing jobs
     job_options = parser.add_argument_group(
@@ -926,6 +939,16 @@ def add_base_toil_options(
         help="If set, batch jobs which die to reaching memory limit on batch schedulers "
         "will have their memory doubled and they will be retried. The remaining "
         "retry count will be reduced by 1. Currently supported by LSF.",
+    )
+    job_options.add_argument(
+        "--doubleTime",
+        dest="doubleTime",
+        type=strtobool,
+        default=False,
+        metavar="BOOL",
+        help="If set, batch jobs which the batch system kills for exceeding their "
+        "walltime requirement will have their walltime doubled when retried. The "
+        "remaining retry count will be reduced by 1.",
     )
     job_options.add_argument(
         "--maxJobDuration",

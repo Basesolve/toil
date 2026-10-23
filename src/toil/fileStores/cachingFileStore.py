@@ -227,6 +227,7 @@ class CachingFileStore(AbstractFileStore):
         self.workflowAttemptNumber = self.jobStore.config.workflowAttemptNumber
 
         # Make sure the cache directory exists
+        logger.debug("Local cache directory: %s", self.localCacheDir)
         os.makedirs(self.localCacheDir, exist_ok=True)
 
         # Connect to the cache database in there, or create it if not present.
@@ -237,6 +238,7 @@ class CachingFileStore(AbstractFileStore):
         self.dbPath = os.path.join(
             self.coordination_dir, f"cache-{self.workflowAttemptNumber}.db"
         )
+        logger.debug("Caching database: %s (%s)", self.dbPath, "exists" if os.path.exists(self.dbPath) else "does not exist")
 
         # Database connections are provided by magic properties self.con and
         # self.cur that always have the right object for the current thread to
@@ -997,8 +999,14 @@ class CachingFileStore(AbstractFileStore):
         Get rid of the job with the given ID.
         The job must be owned by us.
 
-        Deletes the job's database entry, all its references, and its whole
-        temporary directory.
+        Deletes the job's database entry and its whole temporary directory, and
+        forgets all its refs.
+
+        Not responsible for shrinking the cache down to fit in the remaining
+        space.
+
+        Any files the job downloaded outside its temporary directory are no
+        longer our problem.
 
         :param sqlite3.Connection con: Connection to the cache database.
         :param sqlite3.Cursor cur: Cursor in the cache database.
@@ -1011,37 +1019,44 @@ class CachingFileStore(AbstractFileStore):
         ):
             jobTemp = row[0]
 
-        for row in cls._static_read(
-            cur, "SELECT path FROM refs WHERE job_id = ?", (jobID,)
-        ):
-            try:
-                # Delete all the reference files.
-                os.unlink(row[0])
-            except OSError:
-                # May not exist
-                pass
-        # And their database entries
-        cls._static_write(con, cur, [("DELETE FROM refs WHERE job_id = ?", (jobID,))])
-
         try:
             # Delete the job's temp directory to the extent that we can.
             shutil.rmtree(jobTemp)
         except OSError:
             pass
 
+        # Forget all the refs
+        cls._static_write(con, cur, [("DELETE FROM refs WHERE job_id = ?", (jobID,))])
+        # We definitely don't want to delete the referenced files, because jobs
+        # are allowed to read/write directly between the job store and other
+        # shared storage (like the WDL call cache).
+
         # Strike the job from the database
         cls._static_write(con, cur, [("DELETE FROM jobs WHERE id = ?", (jobID,))])
 
     def _deallocateSpaceForJob(self):
         """
-        Our current job that was using oldJobReqs space has finished.
+        Our current job has finished.
 
-        We need to record that the job is no longer running, so its space not
-        taken up by files in the cache will be free.
+        We need to record that the job is no longer running, so its disk
+        requirement is no longer available to the cache as space.
+
+        Responsible for shrinking the cache down to fit.
 
         """
 
         self._removeJob(self.con, self.cur, self.jobID)
+
+        available = self.getCacheAvailable()
+
+        logger.debug("Available space without job: %d bytes", available)
+
+        if available >= 0:
+            # We're fine on disk space
+            return
+
+        # Otherwise we need to clear stuff.
+        self._freeUpSpace()
 
     def _tryToFreeUpSpace(self):
         """
@@ -1472,6 +1487,10 @@ class CachingFileStore(AbstractFileStore):
             # Link or maybe copy
             self.jobStore.read_file(fileStoreID, cachedPath, symlink=False)
 
+        assert os.path.exists(cachedPath), (
+            "Downloaded file vanished: %s" % cachedPath
+        )
+
     def _readGlobalFileMutablyWithCache(self, fileStoreID, localFilePath, readerID):
         """
         Read a mutable copy of a file, putting it into the cache if possible.
@@ -1748,12 +1767,14 @@ class CachingFileStore(AbstractFileStore):
                 "SELECT COUNT(*) FROM files WHERE id = ? AND state = ? AND owner = ?",
                 (fileStoreID, "downloading", me),
             )
+
             if self.cur.fetchone()[0] > 0:
                 # Now we have exclusive control of the cached copy of the file, so we can give it away.
 
                 # Don't fake a delay here; this should be a rename always.
 
                 # We are giving it away
+                logger.debug("Giving away %s as %s", cachedPath, localFilePath)
                 shutil.move(cachedPath, localFilePath)
                 # Record that.
                 self._write(
@@ -1789,9 +1810,52 @@ class CachingFileStore(AbstractFileStore):
         :rtype: bool
         """
 
-        assert os.path.exists(cachedPath), (
-            "Cannot create link to missing cache file %s" % cachedPath
-        )
+        if not os.path.exists(cachedPath):
+            # This file should exist; nobody should be calling this function
+            # without a ref. So complain the database is bad.
+
+            logger.critical(
+                "Cannot create link to missing cache file %s", cachedPath
+            )
+
+            try:
+                stats = os.lstat(cachedPath)
+                logger.critical("Is a broken symlink with stats: %s", stats)
+            except OSError:
+                pass
+
+            # Dump relevant bits of the database
+            self._read(
+                "SELECT * FROM files WHERE path = ?",
+                (cachedPath,)
+            )
+            file_id = None
+            row = self.cur.fetchone()
+            while row is not None:
+                logger.critical("File row: %s", row)
+                file_id = row[0]
+                row = self.cur.fetchone()
+            self._read(
+                "SELECT * FROM refs WHERE path = ?",
+                (localFilePath,)
+            )
+            row = self.cur.fetchone()
+            while row is not None:
+                logger.critical("Our ref row: %s", row)
+                row = self.cur.fetchone()
+            if file_id is not None:
+                self._read(
+                    "SELECT * FROM refs WHERE file_id = ?",
+                    (file_id,)
+                )
+                row = self.cur.fetchone()
+                while row is not None:
+                    logger.critical("Cache ref row: %s", row)
+                    row = self.cur.fetchone()
+            else:
+                logger.critical("Cached file not found in database either")
+
+            raise RuntimeError(f"Missing cache file: {cachedPath}")
 
         try:
             # Try and make the hard link.
@@ -2014,7 +2078,7 @@ class CachingFileStore(AbstractFileStore):
     ) -> Generator:
         """
         Get a context manager that gives you either the local file path for a
-        copyuing reference to the given file, or None if that file is not in an
+        copying reference to the given file, or None if that file is not in an
         'uploadable' or 'uploading' state.
 
         It is the caller's responsibility to actually do the copy, if they
@@ -2373,42 +2437,41 @@ class CachingFileStore(AbstractFileStore):
             # can't find the journal).
 
             # So we just go and find the cache-n.db with the largest n value,
-            # and use that.
-            dbFilename = None
-            dbAttempt = float("-inf")
+            # and use that. This holds an absolute path.
+            db_path = None
+            db_attempt = float("-inf")
 
             # We also need to remember all the plausible database files and
-            # journals
+            # journals. This holds absolute paths.
             all_db_files = []
 
-            for dbCandidate in os.listdir(coordination_dir):
+            for basename in os.listdir(coordination_dir):
                 # For each thing in the coordination directory, see if it starts like a database file.
-                match = re.match("^cache-([0-9]+).db.*", dbCandidate)
+                match = re.match("^cache-([0-9]+).db.*", basename)
                 if match:
                     # This is caching-related.
-                    all_db_files.append(dbCandidate)
+                    candidate_path = os.path.join(coordination_dir, basename)
+                    all_db_files.append(candidate_path)
                     attempt_number = int(match.group(1))
                     if (
-                        attempt_number > dbAttempt
-                        and dbCandidate == f"cache-{attempt_number}.db"
+                        attempt_number > db_attempt
+                        and basename == f"cache-{attempt_number}.db"
                     ):
                         # This is a main database, and the newest we have seen.
-                        dbFilename = dbCandidate
-                        dbAttempt = attempt_number
+                        db_path = candidate_path
+                        db_attempt = attempt_number
 
-            if dbFilename is not None:
+            if db_path is not None:
                 # We found a caching database
 
                 logger.debug(
-                    "Connecting to latest caching database %s for cleanup", dbFilename
+                    "Connecting to latest caching database %s for cleanup", db_path
                 )
 
-                dbPath = os.path.join(coordination_dir, dbFilename)
-
-                if os.path.exists(dbPath):
+                if os.path.exists(db_path):
                     try:
                         # The database exists, see if we can open it
-                        con = sqlite3.connect(dbPath, timeout=SQLITE_TIMEOUT_SECS)
+                        con = sqlite3.connect(db_path, timeout=SQLITE_TIMEOUT_SECS)
                     except:
                         # Probably someone deleted it.
                         pass
@@ -2424,15 +2487,34 @@ class CachingFileStore(AbstractFileStore):
                         cls._removeDeadJobs(coordination_dir, con)
 
                         con.close()
+                else:
+                    logger.warning("Latest caching database vanished: %s", db_path)
             else:
                 logger.debug("No caching database found in %s", dir_)
 
             # Whether or not we found a database, we need to clean up the cache
-            # directory. Delete everything cached.
+            # directory.
+
+            # Since we're not actually using any of the reference-counting
+            # logic here, and just blowing away the whole cache, we need to be
+            # very careful about not leaving behind inconsistent states.
+
+            for db_path in all_db_files:
+                # Delete the cache databases first, because we don't want them
+                # somehow being left behind when the files they refer to are gone.
+                logger.debug("Deleting caching database file %s", db_path)
+
+                try:
+                    os.unlink(db_path)
+                    logger.debug("Caching database file %s deleted successfully", db_path)
+                except FileNotFoundError:
+                    logger.warning("Caching database file vanished: %s", db_path)
+                except OSError as e:
+                    logger.warning("Caching database file %s could not be removed: %s", e)
+
+            # Delete all the files that the database refered to
+            logger.debug("Deleting cache directory %s", cache_dir)
             robust_rmtree(cache_dir)
-            for filename in all_db_files:
-                # And delete everything related to the caching database
-                robust_rmtree(filename)
 
     def __del__(self):
         """

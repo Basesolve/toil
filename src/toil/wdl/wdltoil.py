@@ -76,7 +76,12 @@ from WDL.runtime.task_container import TaskContainer
 from WDL.Tree import ReadSourceResult
 
 from toil.batchSystems.abstractBatchSystem import InsufficientSystemResources
-from toil.common import Toil, addOptions, InconsistentConfigurationError
+from toil.common import (
+    Toil,
+    addOptions,
+    derive_run_dir_defaults,
+    InconsistentConfigurationError,
+)
 from toil.exceptions import FailedJobsException
 from toil.fileStores import FileID
 from toil.fileStores.abstractFileStore import AbstractFileStore
@@ -133,6 +138,11 @@ from toil.lib.threading import global_mutex
 from toil.lib.trs import resolve_workflow
 from toil.lib.url import URLAccess
 from toil.provisioners.clusterScaler import JobTooBigError
+from toil.lib.interpreter import (
+    INJECTED_MESSAGE_DIR,
+    add_injections,
+    handle_message_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +254,8 @@ class WDLContext(TypedDict):
 
     execution_dir: NotRequired[str]
     """Directory to use as the working directory for workflow code"""
+    source_dir: NotRequired[str]
+    """Directory containing the WDL source document, for resolving WDL 1.2 source-relative File/Directory paths"""
     container: NotRequired[str]
     """The type of container to use when executing a WDL task. Carries through the value of the commandline --container option."""
     task_path: str
@@ -252,6 +264,10 @@ class WDLContext(TypedDict):
     """Namespace of the WDL that the current job is in"""
     all_call_outputs: bool
     """Whether a job should include all calls outputs"""
+    run_dir: NotRequired[str]
+    """Value of Toil's --runDir option, if set. Used to default container
+    image cache locations when the corresponding environment variables
+    aren't already set."""
 
 
 class InsufficientMountDiskSpace(Exception):
@@ -713,7 +729,7 @@ def make_inode(
     a when a is typed with a TypeVar.
     """
 
-    return cast(AnyINode, type(example_inode)(value, expr))
+    return type(example_inode)(value, expr)
 
 
 def set_inode_value(inode: AnyINode, new_value: str) -> AnyINode:
@@ -853,6 +869,7 @@ def fill_execution_cache(
     output_bindings: WDLBindings,
     file_store: AbstractFileStore,
     wdl_options: WDLContext,
+    input_bindings: WDLBindings,
     miniwdl_logger: logging.Logger | None = None,
     miniwdl_config: WDL.runtime.config.Loader | None = None,
 ) -> WDLBindings:
@@ -941,7 +958,12 @@ def fill_execution_cache(
     )
 
     # Save the bindings to the cache, representing all files with their shared filesystem paths.
-    miniwdl_cache.put(cache_key, view_shared_fs_paths(output_bindings))
+    miniwdl_cache.put(
+        cache_key,
+        view_shared_fs_paths(output_bindings),
+        inputs=view_shared_fs_paths(input_bindings),
+        add_paths=WDL.runtime.cache.CallCacheAddPaths(),
+    )
     logger.debug("Saved result to cache under %s", cache_key)
 
     # Keep using the transformed bindings so that later tasks use
@@ -1506,6 +1528,38 @@ class ToilWDLStdLibBase(WDL.StdLib.Base):
     @property
     def execution_dir(self) -> str:
         return self._wdl_options.get("execution_dir", ".")
+
+    def _resolve_source_relative_path(self, filename: str) -> str:
+        """
+        Resolve a WDL 1.2 source-relative File/Directory path to an absolute path.
+        """
+        if os.path.isabs(filename) or is_any_url(filename):
+            return filename
+        source_dir = self._wdl_options.get("source_dir") or self.execution_dir
+        # The later pass over whole bindings handles virtualization.
+        return urljoin(source_dir, filename)
+
+    def _coerce_source_relative_path(
+        self, value: WDL.Value.Base, desired_type: WDL.Type.Base
+    ) -> WDL.Value.Base:
+        """
+        Coerce a value, resolving source-relative paths in the Files and
+        Directories that Toil hasn't already virtualized.
+        """
+        value = value.coerce(desired_type)
+
+        def rewrite_path(inode: WDL.Value.File | WDL.Value.Directory) -> str:
+            filename: str = inode.value
+            if (
+                get_inode_virtualized_value(inode) is not None
+                or get_shared_fs_path(inode) is not None
+            ):
+                return filename
+            if isinstance(inode, WDL.Value.Directory):
+                filename = filename.rstrip("/") + "/"
+            return self._resolve_source_relative_path(filename)
+
+        return WDL.Value.rewrite_paths(value, rewrite_path).coerce(desired_type)
 
     @property
     def task_path(self) -> str:
@@ -2410,6 +2464,8 @@ class ToilWDLStdLibWorkflow(ToilWDLStdLibBase):
                     WDL.Env.Bindings(
                         WDL.Env.Binding("file", WDL.Value.File(exported_path))
                     ),
+                    inputs=file_input_bindings,
+                    add_paths=WDL.runtime.cache.CallCacheAddPaths(),
                 )
 
                 # Apply the shared filesystem path to the virtualized file
@@ -2592,6 +2648,12 @@ class ToilWDLStdLibTaskOutputs(ToilWDLStdLibBase, WDL.StdLib.TaskOutputs):
                 "glob", [WDL.Type.String()], WDL.Type.Array(WDL.Type.File()), self._glob
             ),
         )
+
+    def _resolve_source_relative_path(self, filename: str) -> str:
+        """
+        Leave relative paths as they are, since they are relative to the task's working directory.
+        """
+        return filename
 
     def _stdout(self) -> WDL.Value.File:
         """
@@ -2811,8 +2873,9 @@ def evaluate_named_expression(
             raise
 
     if expected_type:
-        # Coerce to the type it should be.
-        value = value.coerce(expected_type)
+        # Coerce to the type it should be, resolving source-relative paths
+        # the same way StdLib functions and operators do.
+        value = stdlib._coerce_source_relative_path(value, expected_type)
 
     return value
 
@@ -3871,98 +3934,6 @@ class WDLTaskJob(WDLBaseJob):
         self._cache_key = cache_key
         self._mount_spec = mount_spec
 
-    ###
-    # Runtime code injection system
-    ###
-
-    # WDL runtime code injected in the container communicates back to the rest
-    # of the runtime through files in this directory.
-    INJECTED_MESSAGE_DIR = ".toil_wdl_runtime"
-
-    def add_injections(self, command_string: str, task_container: TaskContainer) -> str:
-        """
-        Inject extra Bash code from the Toil WDL runtime into the command for the container.
-
-        Currently doesn't implement the MiniWDL plugin system, but does add
-        resource usage monitoring to Docker containers.
-        """
-
-        parts = []
-
-        if isinstance(task_container, SwarmContainer):
-            # We're running on Docker Swarm, so we need to monitor CPU usage
-            # and so on from inside the container, since it won't be attributed
-            # to Toil child processes in the leader's self-monitoring.
-            # TODO: Mount this from a file Toil installs instead or something.
-            script = textwrap.dedent(
-                """\
-                function _toil_resource_monitor () {
-                    # Turn off error checking and echo in here
-                    set +ex
-                    MESSAGE_DIR="${1}"
-                    mkdir -p "${MESSAGE_DIR}"
-
-                    function sample_cpu_usec() {
-                        if [[ -f  /sys/fs/cgroup/cpu.stat ]] ; then
-                            awk '{ if ($1 == "usage_usec") {print $2} }' /sys/fs/cgroup/cpu.stat
-                        elif [[ -f /sys/fs/cgroup/cpuacct/cpuacct.stat ]] ; then
-                            echo $(( $(head -n 1 /sys/fs/cgroup/cpuacct/cpuacct.stat | cut -f2 -d' ') * 10000 ))
-                        fi
-                    }
-
-                    function sample_memory_bytes() {
-                        if [[ -f /sys/fs/cgroup/memory.stat ]] ; then
-                            awk '{ if ($1 == "anon") { print $2 } }' /sys/fs/cgroup/memory.stat
-                        elif [[ -f /sys/fs/cgroup/memory/memory.stat ]] ; then
-                            awk '{ if ($1 == "total_rss") { print $2 } }' /sys/fs/cgroup/memory/memory.stat
-                        fi
-                    }
-
-                    while true ; do
-                        printf "CPU\\t" >> ${MESSAGE_DIR}/resources.tsv
-                        sample_cpu_usec >> ${MESSAGE_DIR}/resources.tsv
-                        printf "Memory\\t" >> ${MESSAGE_DIR}/resources.tsv
-                        sample_memory_bytes >> ${MESSAGE_DIR}/resources.tsv
-                        sleep 1
-                    done
-                }
-                """
-            )
-            parts.append(script)
-            # Launch in a subshell so that it doesn't interfere with Bash "wait" in the main shell
-            parts.append(f"(_toil_resource_monitor {self.INJECTED_MESSAGE_DIR} &)")
-
-        if isinstance(task_container, SwarmContainer) and platform.system() == "Darwin":
-            # With gRPC FUSE file sharing, files immediately downloaded before
-            # being mounted may appear as size 0 in the container due to a race
-            # condition. Check for this and produce an approperiate error.
-
-            script = textwrap.dedent(
-                """\
-                function _toil_check_size () {
-                    TARGET_FILE="${1}"
-                    GOT_SIZE="$(stat -c %s "${TARGET_FILE}")"
-                    EXPECTED_SIZE="${2}"
-                    if [[ "${GOT_SIZE}" != "${EXPECTED_SIZE}" ]] ; then
-                        echo >&2 "Toil Error:"
-                        echo >&2 "File size visible in container for ${TARGET_FILE} is size ${GOT_SIZE} but should be size ${EXPECTED_SIZE}"
-                        echo >&2 "Are you using gRPC FUSE file sharing in Docker Desktop?"
-                        echo >&2 "It doesn't work: see <https://github.com/DataBiosphere/toil/issues/4542>."
-                        exit 1
-                    fi
-                }
-            """
-            )
-            parts.append(script)
-            for host_path, job_path in task_container.input_path_map.items():
-                expected_size = os.path.getsize(host_path)
-                if expected_size != 0:
-                    parts.append(f'_toil_check_size "{job_path}" {expected_size}')
-
-        parts.append(command_string)
-
-        return "\n".join(parts)
-
     def handle_injection_messages(
         self, outputs_library: ToilWDLStdLibTaskOutputs
     ) -> None:
@@ -3971,60 +3942,11 @@ class WDLTaskJob(WDLBaseJob):
         """
 
         message_files = outputs_library._glob(
-            WDL.Value.String(os.path.join(self.INJECTED_MESSAGE_DIR, "*"))
+            WDL.Value.String(os.path.join(INJECTED_MESSAGE_DIR, "*"))
         )
         logger.debug("Handling message files: %s", message_files)
         for message_file in message_files.value:
-            self.handle_message_file(message_file.value)
-
-    def handle_message_file(self, file_path: str) -> None:
-        """
-        Handle a message file received from in-container injected code.
-
-        Takes the host-side path of the file.
-        """
-        if os.path.basename(file_path) == "resources.tsv":
-            # This is a TSV of resource usage info.
-            first_cpu_usec: int | None = None
-            last_cpu_usec: int | None = None
-            max_memory_bytes: int | None = None
-
-            for line in open(file_path):
-                if not line.endswith("\n"):
-                    # Skip partial lines
-                    continue
-                # For each full line we got
-                parts = line.strip().split("\t")
-                if len(parts) != 2:
-                    # Skip odd-shaped lines
-                    continue
-                if parts[0] == "CPU":
-                    # Parse CPU usage
-                    cpu_usec = int(parts[1])
-                    # Update summary stats
-                    if first_cpu_usec is None:
-                        first_cpu_usec = cpu_usec
-                    last_cpu_usec = cpu_usec
-                elif parts[0] == "Memory":
-                    # Parse memory usage
-                    memory_bytes = int(parts[1])
-                    # Update summary stats
-                    if max_memory_bytes is None or max_memory_bytes < memory_bytes:
-                        max_memory_bytes = memory_bytes
-
-            if max_memory_bytes is not None:
-                logger.info(
-                    "Container used at about %s bytes of memory at peak",
-                    max_memory_bytes,
-                )
-                # Treat it as if used by a child process
-                ResourceMonitor.record_extra_memory(max_memory_bytes // 1024)
-            if last_cpu_usec is not None:
-                assert first_cpu_usec is not None
-                cpu_seconds = (last_cpu_usec - first_cpu_usec) / 1000000
-                logger.info("Container used about %s seconds of CPU time", cpu_seconds)
-                # Treat it as if used by a child process
-                ResourceMonitor.record_extra_cpu(cpu_seconds)
+            handle_message_file(message_file.value)
 
     ###
     # Helper functions to work out what containers runtime we can use
@@ -4159,6 +4081,9 @@ class WDLTaskJob(WDLBaseJob):
         # MiniWDL guarantees that this will be "work" under the host directory.
         # MiniWDL also insists on creating it.
         wdl_options["execution_dir"] = os.path.join(host_dir, "work")
+        # source_dir must come from pos.abspath, since Toil always loads WDL
+        # via URI and task.source_dir only recognizes bare local paths.
+        wdl_options["source_dir"] = urljoin(self._task.pos.abspath, ".")
 
         # Set up the WDL standard library.
         # We process nonexistent files in WDLTaskWrapperJob as those must be
@@ -4185,14 +4110,22 @@ class WDLTaskJob(WDLBaseJob):
             # Prepare to use Singularity. We will need plenty of space to
             # download images.
             # Default the Singularity and MiniWDL cache directories. This sets the cache to the same place as
-            # Singularity/MiniWDL's default cache directory
+            # Singularity/MiniWDL's default cache directory, unless --runDir was used, in which case we put
+            # them under <runDir>/image-cache to match Toil's other --runDir-derived paths.
             # With launch-cluster, the singularity and miniwdl cache is set to /var/lib/toil in abstractProvisioner.py
             # A current limitation with the singularity/miniwdl cache is it cannot check for image updates if the
             # filename is the same
-            singularity_cache = os.path.join(os.path.expanduser("~"), ".singularity")
-            miniwdl_singularity_cache = os.path.join(
-                os.path.expanduser("~"), ".cache/miniwdl"
-            )
+            run_dir = self._wdl_options.get("run_dir")
+            if run_dir is not None:
+                singularity_cache = os.path.join(run_dir, "image-cache", "singularity")
+                miniwdl_singularity_cache = os.path.join(
+                    run_dir, "image-cache", "miniwdl"
+                )
+            else:
+                singularity_cache = os.path.join(os.path.expanduser("~"), ".singularity")
+                miniwdl_singularity_cache = os.path.join(
+                    os.path.expanduser("~"), ".cache/miniwdl"
+                )
 
             # Cache Singularity's layers somewhere known to have space
             os.environ["SINGULARITY_CACHEDIR"] = os.environ.get(
@@ -4269,7 +4202,7 @@ class WDLTaskJob(WDLBaseJob):
             # to the file on a local disk, which the commnad will be able to
             # actually use, accounting for e.g. containers.
             #
-            # TODO: Figure out whan the command template actually uses File
+            # TODO: Figure out when the command template actually uses File
             # values and lazily download them.
             #
             # For now we just grab all the File values in the inside-the-task
@@ -4501,8 +4434,17 @@ class WDLTaskJob(WDLBaseJob):
                 .value
             )
 
-            # Do any command injection we might need to do
-            command_string = self.add_injections(command_string, task_container)
+            # Do command injection for docker container resource monitoring 
+            # when a docker container is used
+            if isinstance(task_container, SwarmContainer):
+                file_mounts = task_container.input_path_map.items()
+                # For WDL we're allowed to drop things in the current working
+                # directory.
+                command_string = add_injections(
+                    command_string,
+                    file_mounts,
+                    INJECTED_MESSAGE_DIR
+                )
 
             # Grab the standard out and error paths. MyPy complains if we call
             # them because in the current MiniWDL version they are untyped.
@@ -4658,6 +4600,7 @@ class WDLTaskJob(WDLBaseJob):
                 output_bindings,
                 file_store,
                 self._wdl_options,
+                unwrap(self._task_internal_bindings),
                 miniwdl_logger=miniwdl_logger,
                 miniwdl_config=miniwdl_config,
             )
@@ -4768,6 +4711,9 @@ class WDLWorkflowNodeJob(WDLBaseJob):
 
             if isinstance(self._node.callee, WDL.Tree.Workflow):
                 # This is a call of a workflow
+                wdl_options["source_dir"] = urljoin(
+                    self._node.callee.pos.abspath, "."
+                )
                 subjob: WDLBaseJob = WDLWorkflowJob(
                     self._node.callee,
                     [input_bindings, passed_down_bindings],
@@ -5759,6 +5705,7 @@ class WDLWorkflowJob(WDLSectionJob):
             self._enclosing_bindings,
             wdl_options=self._wdl_options,
             cache_key=cache_key,
+            input_bindings=bindings,
             local=True,
         )
         sink.addFollowOn(outputs_job)
@@ -5781,6 +5728,7 @@ class WDLOutputsJob(WDLBaseJob):
         enclosing_bindings: WDLBindings,
         wdl_options: WDLContext,
         cache_key: str | None = None,
+        input_bindings: Promised[WDLBindings] | None = None,
         **kwargs: Any,
     ):
         """
@@ -5794,6 +5742,9 @@ class WDLOutputsJob(WDLBaseJob):
         :param cache_key: If set and storing into the call cache is on, will
                cache the workflow execution result under the given key in a
                MiniWDL-compatible way.
+
+        :param input_bindings: The workflow call's input bindings, matching
+               what cache_key was derived from. Required if cache_key is set.
         """
         super().__init__(wdl_options=wdl_options, **kwargs)
 
@@ -5801,6 +5752,7 @@ class WDLOutputsJob(WDLBaseJob):
         self._enclosing_bindings = enclosing_bindings
         self._workflow = workflow
         self._cache_key = cache_key
+        self._input_bindings = input_bindings
 
     @report_wdl_errors("evaluate outputs")
     def run(self, file_store: AbstractFileStore) -> WDLBindings:
@@ -5884,8 +5836,13 @@ class WDLOutputsJob(WDLBaseJob):
         output_bindings = virtualize_inodes(output_bindings, standard_library)
 
         if self._cache_key is not None:
+            assert self._input_bindings is not None
             output_bindings = fill_execution_cache(
-                self._cache_key, output_bindings, file_store, self._wdl_options
+                self._cache_key,
+                output_bindings,
+                file_store,
+                self._wdl_options,
+                unwrap(self._input_bindings),
             )
 
         # Let Files that are not output or available outside the call go out of
@@ -6100,6 +6057,17 @@ def main() -> None:
     # TODO: the Toil context manager will do this again.
     set_logging_from_options(options)
 
+    if options.runDir is not None:
+        # Apply the --runDir defaults before we fill in a None jobStore below.
+        options.runDir, options.jobStore, options.workDir, options.coordination_dir = (
+            derive_run_dir_defaults(
+                options.runDir,
+                options.jobStore,
+                options.workDir,
+                options.coordination_dir,
+            )
+        )
+
     # Make sure we have a jobStore
     if options.jobStore is None:
         jobstore = mkdtemp(prefix="toil-wdl-", dir=os.getcwd())
@@ -6232,11 +6200,16 @@ def main() -> None:
             # restart. For now we assume we are computing the same values.
             wdl_options: WDLContext = {
                 "execution_dir": execution_dir,
+                "source_dir": urljoin(target.pos.abspath, "."),
                 "container": options.container,
                 "task_path": target.name,
                 "namespace": target.name,
                 "all_call_outputs": options.all_call_outputs,
             }
+
+            if toil.config.runDir is not None:
+                wdl_options["run_dir"] = toil.config.runDir
+
             assert wdl_options.get("container") is not None
 
             if options.restart:

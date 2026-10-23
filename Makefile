@@ -216,37 +216,56 @@ define tag_docker
 	@printf "$(green)Tagged appliance image $1 as $2.$(normal)\n"
 endef
 
+ifeq ($(shell docker buildx inspect >/dev/null 2>/dev/null; echo $$?),0)
+    ifneq ($(shell docker buildx inspect | head -n2 | grep ^Driver | cut -f2 -d':' | tr -d ' '),docker)
+        # Default builder exists and is not docker, so we can use it
+        DOCKER_BUILDER_NAME = $(shell docker buildx inspect | head -n2 | grep ^Name | cut -f2 -d':' | tr -d ' ')
+    else
+        # We need to make a new docker-container builder because this one is the wrong kind
+        DOCKER_BUILDER_NAME = $(shell whoami)-toil-builder
+    endif
+else
+    # We need to make a new docker-container builder because we don't have a builder
+    DOCKER_BUILDER_NAME = $(shell whoami)-toil-builder
+endif
+
+docker_builder:
+	docker builder inspect $(DOCKER_BUILDER_NAME) >/dev/null || docker buildx create --name $(DOCKER_BUILDER_NAME) --driver docker-container
+
+clean_docker_builder:
+	docker builder rm --builder $(shell whoami)-toil-builder -f 2>/dev/null || true
+
 docker: toil_docker prometheus_docker grafana_docker mtail_docker
 
-toil_docker: docker/Dockerfile src/toil/version.py
+toil_docker: docker/Dockerfile src/toil/version.py docker_builder
 	mkdir -p .docker_cache
 	@set -ex \
 	; cd docker \
-	; docker buildx build --platform=$(arch) --tag=$(docker_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(docker_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(docker_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../.docker-cache/toil --cache-to type=local,dest=../.docker-cache/toil -f Dockerfile .
+	; TOIL_APPLIANCE_SELF=$(TOIL_APPLIANCE_SELF) docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform=$(arch) --tag=$(docker_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(docker_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(docker_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../.docker-cache/toil --cache-to type=local,dest=../.docker-cache/toil -f Dockerfile .
 
-prometheus_docker:
+prometheus_docker: docker_builder
 	mkdir -p .docker_cache
 	@set -ex \
 	; cd dashboard/prometheus \
-	; docker buildx build --platform=$(arch) --tag=$(prometheus_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(prometheus_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(prometheus_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/prometheus --cache-to type=local,dest=../../.docker-cache/prometheus -f Dockerfile .
+	; docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform=$(arch) --tag=$(prometheus_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(prometheus_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(prometheus_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/prometheus --cache-to type=local,dest=../../.docker-cache/prometheus -f Dockerfile .
 
-grafana_docker:
+grafana_docker: docker_builder
 	mkdir -p .docker_cache
 	@set -ex \
 	; cd dashboard/grafana \
-	; docker buildx build --platform=$(arch) --tag=$(grafana_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(grafana_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(grafana_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/grafana --cache-to type=local,dest=../../.docker-cache/grafana -f Dockerfile .
+	; docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform=$(arch) --tag=$(grafana_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(grafana_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(grafana_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/grafana --cache-to type=local,dest=../../.docker-cache/grafana -f Dockerfile .
 
-mtail_docker:
+mtail_docker: docker_builder
 	mkdir -p .docker_cache
 	@set -ex \
 	; cd dashboard/mtail \
-	; docker buildx build --platform=$(arch) --tag=$(mtail_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(mtail_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(mtail_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/mtail --cache-to type=local,dest=../../.docker-cache/mtail -f Dockerfile .
+	; docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform=$(arch) --tag=$(mtail_image):$(TOIL_DOCKER_TAG) --cache-from type=registry,ref=$(mtail_image):$(TOIL_DOCKER_MAIN_CACHE_TAG) --cache-from type=registry,ref=$(mtail_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/mtail --cache-to type=local,dest=../../.docker-cache/mtail -f Dockerfile .
 
 docker/$(sdist_name): dist/$(sdist_name)
 	cp $< $@
 
 docker/Dockerfile: docker/Dockerfile.py docker/$(sdist_name)
-	_TOIL_SDIST_NAME=$(sdist_name) python docker/Dockerfile.py > $@
+	TOIL_APPLIANCE_SELF=$(TOIL_APPLIANCE_SELF) _TOIL_SDIST_NAME=$(sdist_name) python docker/Dockerfile.py > $@
 
 clean_docker:
 	-rm docker/Dockerfile docker/$(sdist_name)
@@ -256,39 +275,40 @@ push_docker: docker
 	# Weird if logic is so we fail if all the pushes fail.
 	# We need to build from the local cache to the cache tag and again from the local cache to the real tag.
 	cd docker ; \
+	export TOIL_APPLIANCE_SELF=$(TOIL_APPLIANCE_SELF) ; \
 	for i in $$(seq 1 6); do \
 		if [[ $$i == "6" ]] ; then exit 1 ; fi ; \
-		docker buildx build --platform $(arch) --push --tag=$(docker_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../.docker-cache/toil --cache-to type=inline -f Dockerfile . && \
-			docker buildx build --platform $(arch) --push --tag=$(docker_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../.docker-cache/toil -f Dockerfile . && \
+		docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(docker_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../.docker-cache/toil --cache-to type=inline -f Dockerfile . && \
+			docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(docker_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../.docker-cache/toil -f Dockerfile . && \
 			break || sleep 60; \
 	done
 	cd dashboard/prometheus ; \
 	for i in $$(seq 1 6); do \
 		if [[ $$i == "6" ]] ; then exit 1 ; fi ; \
-		docker buildx build --platform $(arch) --push --tag=$(prometheus_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/prometheus --cache-to type=inline -f Dockerfile . && \
-			docker buildx build --platform $(arch) --push --tag=$(prometheus_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/prometheus -f Dockerfile . && \
+		docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(prometheus_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/prometheus --cache-to type=inline -f Dockerfile . && \
+			docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(prometheus_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/prometheus -f Dockerfile . && \
 			break || sleep 60; \
 	done
 	cd dashboard/grafana ; \
 	for i in $$(seq 1 6); do \
 		if [[ $$i == "6" ]] ; then exit 1 ; fi ; \
-		docker buildx build --platform $(arch) --push --tag=$(grafana_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/grafana --cache-to type=inline -f Dockerfile . && \
-			docker buildx build --platform $(arch) --push --tag=$(grafana_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/grafana -f Dockerfile . && \
+		docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(grafana_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/grafana --cache-to type=inline -f Dockerfile . && \
+			docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(grafana_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/grafana -f Dockerfile . && \
 			break || sleep 60; \
 	done
 	cd dashboard/mtail ; \
 	for i in $$(seq 1 6); do \
 		if [[ $$i == "6" ]] ; then exit 1 ; fi ; \
-		docker buildx build --platform $(arch) --push --tag=$(mtail_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/mtail --cache-to type=inline -f Dockerfile . && \
-			docker buildx build --platform $(arch) --push --tag=$(mtail_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/mtail -f Dockerfile . && \
+		docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(mtail_image):$(TOIL_DOCKER_CACHE_TAG) --cache-from type=local,src=../../.docker-cache/mtail --cache-to type=inline -f Dockerfile . && \
+			docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --push --tag=$(mtail_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/mtail -f Dockerfile . && \
 			break || sleep 60; \
 	done
 
 load_docker: docker
-	cd docker ; docker buildx build --platform $(arch) --load --tag=$(docker_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../.docker-cache/toil -f Dockerfile .
-	cd dashboard/prometheus ; docker buildx build --platform $(arch) --load --tag=$(prometheus_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/prometheus -f Dockerfile .
-	cd dashboard/grafana ; docker buildx build --platform $(arch) --load --tag=$(grafana_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/grafana -f Dockerfile .
-	cd dashboard/mtail ; docker buildx build --platform $(arch) --load --tag=$(mtail_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/mtail -f Dockerfile .
+	cd docker ; TOIL_APPLIANCE_SELF=$(TOIL_APPLIANCE_SELF) docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --load --tag=$(docker_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../.docker-cache/toil -f Dockerfile .
+	cd dashboard/prometheus ; docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --load --tag=$(prometheus_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/prometheus -f Dockerfile .
+	cd dashboard/grafana ; docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --load --tag=$(grafana_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/grafana -f Dockerfile .
+	cd dashboard/mtail ; docker buildx build --builder $(DOCKER_BUILDER_NAME) --platform $(arch) --load --tag=$(mtail_image):$(TOIL_DOCKER_TAG) --cache-from type=local,src=../../.docker-cache/mtail -f Dockerfile .
 
 else
 
@@ -304,7 +324,7 @@ docs: check_venv check_build_reqs
 clean_docs: check_venv
 	- cd docs && ${MAKE} clean
 
-clean: clean_develop clean_sdist clean_docs
+clean: clean_develop clean_sdist clean_docs clean_docker_builder
 
 check_build_reqs:
 	@(python -c 'import pytest' && which sphinx-build >/dev/null) \
@@ -397,5 +417,5 @@ preflight: mypy touched_pylint
 		check_venv \
 		check_clean_working_copy \
 		check_build_reqs \
-		docker clean_docker push_docker \
+		docker_builder docker clean_docker push_docker clean_docker_builder \
 		pre_pull_docker toil_docker prometheus_docker grafana_docker mtail_docker

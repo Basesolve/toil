@@ -83,7 +83,7 @@ from toil.lib.misc import StrPath
 from toil.lib.retry import retry
 from toil.lib.threading import ensure_filesystem_lockable
 from toil.lib.url import URLAccess
-from toil.options.common import JOBSTORE_HELP, add_base_toil_options
+from toil.options.common import JOBSTORE_HELP, add_base_toil_options, parse_jobstore
 from toil.options.cwl import add_cwl_options
 from toil.options.runner import add_runner_options
 from toil.options.wdl import add_wdl_options
@@ -121,6 +121,42 @@ def get_default_config_path() -> str:
     The file at the path will not necessarily exist.
     """
     return os.path.join(get_toil_home(), "default.yaml")
+
+
+def derive_run_dir_defaults(
+    run_dir: str,
+    job_store: str | None,
+    work_dir: str | None,
+    coordination_dir: str | None,
+) -> tuple[str, str, str, str]:
+    """
+    Given --runDir and the current values of --jobStore, --workDir, and
+    --coordinationDir, fill in defaults for any of them left unset,
+    derived from --runDir. Explicit values always win.
+
+    Creates run_dir on disk. The other paths are only computed here;
+    Toil creates them later.
+
+    :return: (run_dir, job_store, work_dir, coordination_dir), with
+             run_dir made absolute and the other three either the
+             original explicit value or the runDir-derived default.
+    """
+    run_dir = os.path.abspath(run_dir)
+    os.makedirs(run_dir, exist_ok=True)
+    if job_store is None:
+        # Give each invocation its own job store directory under runDir,
+        # so concurrent workflows sharing one --runDir don't collide
+        # trying to create the same job store. The exact path is logged
+        # at startup (see Toil._log_resolved_paths) for --restart.
+        job_store = parse_jobstore(
+            os.path.join(run_dir, f"jobstore-{uuid.uuid4().hex}")
+        )
+        # The job store must not already exist, so it isn't created here.
+    if work_dir is None:
+        work_dir = os.path.join(run_dir, "work")
+    if coordination_dir is None:
+        coordination_dir = os.path.join(run_dir, "coordination")
+    return run_dir, job_store, work_dir, coordination_dir
 
 
 class Config:
@@ -173,6 +209,7 @@ class Config:
     colored_logs: bool
     workDir: str | None
     coordination_dir: str | None
+    runDir: str | None
     noStdOutErr: bool
     stats: bool
 
@@ -219,6 +256,7 @@ class Config:
     defaultCores: float | int
     defaultDisk: int
     defaultPreemptible: bool
+    defaultWalltime: int
     # TODO: These names are generated programmatically in
     # Requirer._fetchRequirement so we can't use snake_case until we fix
     # that (and add compatibility getters/setters?)
@@ -234,6 +272,7 @@ class Config:
     stop_on_first_failure: bool
     enableUnlimitedPreemptibleRetries: bool
     doubleMem: bool
+    doubleTime: bool
     enableBadConstraintGpuHandling: bool
     maxJobDuration: int
     rescueJobsFrequency: int
@@ -355,9 +394,18 @@ class Config:
 
         # Core options
         set_option("jobStore")
-        # TODO: LOG LEVEL STRING
         set_option("workDir")
         set_option("coordination_dir")
+        set_option("runDir")
+
+        if self.runDir is not None:
+            # A single --runDir was given. Derive defaults for anything the
+            # user didn't set explicitly; explicit flags always win.
+            self.runDir, self.jobStore, self.workDir, self.coordination_dir = (
+                derive_run_dir_defaults(
+                    self.runDir, self.jobStore, self.workDir, self.coordination_dir
+                )
+            )
 
         set_option("noStdOutErr")
         set_option("stats")
@@ -410,6 +458,7 @@ class Config:
         set_option("maxMemory")
         set_option("maxDisk")
         set_option("defaultPreemptible")
+        set_option("defaultWalltime")
 
         # Retrying/rescuing jobs
         set_option("retryCount")
@@ -419,6 +468,7 @@ class Config:
         set_option("enableUnlimitedPreemptibleRetries")
         set_option("doubleMem")
         set_option("enableBadConstraintGpuHandling")
+        set_option("doubleTime")
         set_option("maxJobDuration")
         set_option("rescueJobsFrequency")
         set_option("job_store_timeout")
@@ -1137,15 +1187,6 @@ class Toil(ContextManager["Toil"]):
         if not config.restart:
             config.prepare_start()
             jobStore.initialize(config)
-            assert config.workflowID is not None
-            # Record that there is a workflow beign run
-            HistoryManager.record_workflow_creation(
-                config.workflowID, self.canonical_locator(config.jobStore)
-            )
-            # And since we have all its metadata now, record that
-            HistoryManager.record_workflow_metadata(
-                config.workflowID, self._workflow_name, self._trs_spec
-            )
         else:
             jobStore.resume()
             # Merge configuration from job store with command line options
@@ -1153,15 +1194,46 @@ class Toil(ContextManager["Toil"]):
             config.prepare_restart()
             config.setOptions(self.options)
             jobStore.write_config()
+
+        assert config.workflowID is not None
+        # Record that there is a workflow being run, in case this history database doesn't know about it yet
+        if HistoryManager.record_workflow_creation(
+            config.workflowID, self.canonical_locator(config.jobStore)
+        ):
+            # And since we have all its metadata now, record that
+            HistoryManager.record_workflow_metadata(
+                config.workflowID, self._workflow_name, self._trs_spec
+            )
         self.config = config
         self._jobStore = jobStore
         self._start_time = time.time()
         self._inContextManager = True
 
+        self._log_resolved_paths(config)
+
         # This will make sure `self.__exit__()` is called when we get a SIGTERM signal.
         signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 
         return self
+
+    def _log_resolved_paths(self, config: "Config") -> None:
+        """
+        Log the resolved job store, work dir, and coordination dir paths
+        at INFO, once, so users can find them without tracing flag
+        precedence themselves. Skips the batch logs dir, since the batch
+        system isn't built yet here; see Leader.run for that.
+        """
+        assert config.workflowID is not None
+        work_dir = self.getLocalWorkflowDir(config.workflowID, config.workDir)
+        coordination_dir = self.get_local_workflow_coordination_dir(
+            config.workflowID, config.workDir, config.coordination_dir
+        )
+        logger.info(
+            "Resolved Toil run paths: job store: %s, work dir: %s, coordination dir: %s",
+            self.canonical_locator(config.jobStore),
+            work_dir,
+            coordination_dir,
+        )
 
     def __exit__(
         self,
@@ -1724,8 +1796,9 @@ class Toil(ContextManager["Toil"]):
         Return a path to a writable directory under which per-workflow directories exist.
 
         This directory is always required to exist on a machine, even if the Toil
-        worker has not run yet.  If your workers and leader have different temp
-        directories, you may need to set TOIL_WORKDIR.
+        worker has not run yet, and is created if it does not already exist. If
+        your workers and leader have different temp directories, you may need to
+        set TOIL_WORKDIR.
 
         :param configWorkDir: Value passed to the program using the --workDir flag
         :return: Path to the Toil work directory, constant across all machines
@@ -1737,9 +1810,13 @@ class Toil(ContextManager["Toil"]):
             or tempfile.gettempdir()
         )
         if not os.path.exists(workDir):
-            raise RuntimeError(
-                f"The directory specified by --workDir or TOIL_WORKDIR ({workDir}) does not exist."
-            )
+            try:
+                os.makedirs(workDir, exist_ok=True)
+            except OSError as e:
+                raise RuntimeError(
+                    f"The directory specified by --workDir or TOIL_WORKDIR "
+                    f"({workDir}) does not exist and could not be created: {e}"
+                )
         return workDir
 
     @classmethod

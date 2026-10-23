@@ -84,6 +84,12 @@ def get_data(filename: str) -> AbstractContextManager[Path]:
     return _fallback_get_data(filename)
 
 
+def get_cwltool_data(filename: str) -> AbstractContextManager[Path]:
+    """Returns an absolute path for a test file from the cwltool package."""
+    filename = os.path.normpath(filename)
+    return as_file(files("cwltool.tests") / filename)
+
+
 @pytest.mark.usefixtures("rootpath")
 class ToilTest(unittest.TestCase):
     """
@@ -970,6 +976,19 @@ def needs_fetchable_appliance(test_item: MT) -> MT:
         )(test_item)
     else:
         return test_item
+
+def needs_stubserver(test_item: MT) -> MT:
+    """
+    Decorate classes or methods that depend on the abandoned stubserver package
+    """
+    test_item = _mark_test("stubserver", test_item)
+    try:
+        import stubserver
+        str(stubserver)
+    except ImportError:
+        return unittest.skip("stubserver needs to be installed to run this test.")(test_item)
+    return test_item
+
 
 
 def integrative(test_item: MT) -> MT:
