@@ -170,6 +170,13 @@ There are several environment variables that affect the way Toil runs.
 |                                      | multi-core jobs.                                    |
 |                                      | There is no default value for this variable.        |
 +--------------------------------------+-----------------------------------------------------+
+| TOIL_SLURM_PARTITION_PREFERED        | Regular expression to match against partition names |
+|                                      | to mark them as "preferred". Jobs with              |
+|                                      | ``usePreferredPartition=True`` will select           |
+|                                      | preferred partitions when possible. Also accepts the |
+|                                      | old spelling ``TOIL_SLURM_PARTITON_PREFERED`` for   |
+|                                      | backward compatibility.                              |
++--------------------------------------+-----------------------------------------------------+
 | TOIL_SLURM_TIME                      | Slurm job time limit, in [DD-]HH:MM:SS format. For  |
 |                                      | example, ``2-07:15:30`` for 2 days, 7 hours, 15     |
 |                                      | minutes and 30 seconds, or ``4:00:00`` for 4 hours. |

@@ -2264,7 +2264,8 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         )
         slurm_resources["gpu"] = ~slurm_resources.gputot.isnull()
         slurm_resources.drop(columns="gres", inplace=True)
-        preference = os.getenv("TOIL_SLURM_PARTITON_PREFERED")
+        # Check for correct spelling first, then old typo for backward compatibility
+        preference = os.getenv("TOIL_SLURM_PARTITION_PREFERED") or os.getenv("TOIL_SLURM_PARTITON_PREFERED")
         if preference:
             logger.info("Setting slurm partition preference: %s", preference)
             slurm_resources["preference"] = slurm_resources.partitions.str.contains(

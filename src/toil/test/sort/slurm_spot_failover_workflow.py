@@ -24,7 +24,7 @@ Expected sequence on a ParallelCluster with ``*-cs`` Alternate=``*-cod``:
 
 Run on a Slurm head node (after deploying the patched Toil), for example::
 
-    export TOIL_SLURM_PARTITON_PREFERED=cs
+    export TOIL_SLURM_PARTITION_PREFERED=cs  # also accepts old spelling TOIL_SLURM_PARTITON_PREFERED for backward compatibility
     export TOIL_SLURM_SPOT_FAILOVER=1
     export TOIL_SLURM_SPOT_FAILOVER_STRIKES=2
     export TOIL_SLURM_JOB_TIMEOUT='02:30:00'
