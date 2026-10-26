@@ -1566,7 +1566,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             """
             timeout = os.getenv("TOIL_SLURM_JOB_TIMEOUT", "02:30:00")
             # Start by naming the job
-            sbatch_line = ["sbatch", "-t", timeout, "-J", f"toil_job_{jobID}_{jobName}"]
+            sbatch_line = ["sbatch", "-J", f"toil_job_{jobID}_{jobName}"]
 
             # Make sure the job gets a signal before it disappears so that e.g.
             # container cleanup finally blocks can run. Make sure to send it to
@@ -1612,6 +1612,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             partition: str | None = None
             qos: str | None = None
 
+            # Track whether time and partition arguments have been set
+            # Precedence: TOIL_SLURM_ARGS > TOIL_SLURM_JOB_TIMEOUT > Toil CLI args
+            time_set = False
+            partition_set = False
+            time_value: str | None = None
+
             if nativeConfig is not None:
                 logger.debug(
                     "Native SLURM options appended to sbatch: %s", nativeConfig
@@ -1643,9 +1649,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         # Capture the time limit in seconds so we can use it for picking a partition
                         time_string, i = parse_slurm_option_value(args, i)
                         time_limit = parse_slurm_time(time_string)
+                        time_set = True
+                        time_value = time_string
                     elif is_partition_option(arg):
                         # Capture the partition so we can run checks on it and know not to assign one
                         partition, i = parse_slurm_option_value(args, i)
+                        partition_set = True
                     elif is_qos_option(arg):
                         # Capture the QOS so we can avoid assigning one on top of it
                         qos, i = parse_slurm_option_value(args, i)
@@ -1724,8 +1733,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if len(export_list) > 0:
                 # add --export to the sbatch
                 sbatch_line.append("--export=" + ",".join(export_list))
-            if partition is not None:
-                sbatch_line.append(f"--partition={partition}")
+            # Partition will be added later if needed (after dynamic selection)
             if self.boss.excluded_nodes:
                 max_excluded = env_int(
                     "TOIL_SLURM_MAX_EXCLUDED_NODES", DEFAULT_MAX_EXCLUDED_NODES
@@ -1763,9 +1771,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             if cpu is not None:
                 slurm_cpu = math.ceil(cpu)
                 sbatch_line.append(f"--cpus-per-task={slurm_cpu}")
-            if time_limit and time_limit > 0:
-                # Put all the seconds in the seconds slot
+            # Add time argument based on precedence: TOIL_SLURM_ARGS > TOIL_SLURM_JOB_TIMEOUT > Toil CLI args
+            if not time_set and timeout:
+                # TOIL_SLURM_JOB_TIMEOUT environment variable
+                sbatch_line.extend(["-t", timeout])
+                time_set = True
+            elif not time_set and time_limit and time_limit > 0:
+                # Toil CLI args (walltime or config.slurm_time)
                 sbatch_line.append(f"--time=0:{time_limit}")
+                time_set = True
 
             if slurm_mem and slurm_cpu:
                 # Partition precedence: per-job spot failover > global storage failover > normal.
@@ -1826,8 +1840,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         jobID,
                         per_job_partition,
                     )
-                if partition is not None:
+
+                # Add partition argument if one was selected and not already set by TOIL_SLURM_ARGS
+                if partition is not None and not partition_set:
                     sbatch_line.append(f"--partition={partition}")
+                    partition_set = True
             else:
                 logger.info(
                     "Skipping slurm partition selection as mem and cpu are not specified."
