@@ -18,6 +18,7 @@ import errno
 import logging
 import math
 import os
+import re
 import shlex
 import sys
 from argparse import SUPPRESS, ArgumentParser, _ArgumentGroup
@@ -41,6 +42,7 @@ from toil.batchSystems.abstractGridEngineBatchSystem import (
 from toil.batchSystems.options import OptionSetter
 from toil.batchSystems.slurm_mount_recovery import (
     DEFAULT_MAX_EXCLUDED_NODES,
+    DEFAULT_PARTITION_CACHE_TTL,
     DEFAULT_PARTITION_SWITCH_COOLDOWN,
     DEFAULT_PARTITION_SWITCH_POLL_INTERVAL,
     DEFAULT_SPOT_FAILOVER_COOLDOWN,
@@ -48,13 +50,17 @@ from toil.batchSystems.slurm_mount_recovery import (
     DEFAULT_SPOT_FAILOVER_EXIT_CODES,
     DEFAULT_SPOT_FAILOVER_STATES,
     DEFAULT_SPOT_FAILOVER_STRIKES,
+    DEFAULT_SPOT_FEATURE,
     PARTITION_SWITCH_STATES,
     STORAGE_FAILURE_EXIT_CODE,
+    PartitionClass,
     batch_logs_indicate_storage_failure,
+    classify_partition,
     env_bool,
     env_csv,
     env_float,
     env_int,
+    parse_glob_list,
     parse_slurm_nodelist,
     parse_scontrol_job_lines,
     parse_spot_failover_exit_codes,
@@ -227,6 +233,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         priority: int
         cpus: str
         memory: str
+        features: str = ""
 
     class PartitionSet:
         """
@@ -270,14 +277,17 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             Then parse the output and store all available Slurm partitions
             :return: None
             """
-            sinfo_command = ["sinfo", "-a", "-o", "%P %G %l %p %c %m"]
+            sinfo_command = ["sinfo", "-a", "-o", "%P %G %l %p %c %m %f"]
 
             sinfo = call_command(sinfo_command)
 
             parsed_partitions = []
             for line in sinfo.split("\n")[1:]:
                 if line.strip():
-                    partition_name, gres, time, priority, cpus, memory = line.split(" ")
+                    fields = line.split(" ")
+                    # Older Slurm versions may not report a features column.
+                    features = fields[6] if len(fields) > 6 else ""
+                    partition_name, gres, time, priority, cpus, memory = fields[:6]
                     try:
                         # Parse time to a number so we can compute on it
                         partition_time: float = parse_slurm_time(time)
@@ -302,6 +312,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                             partition_priority,
                             cpus,
                             memory,
+                            "" if features == "(null)" else features,
                         )
                     )
             self.all_partitions = parsed_partitions
@@ -387,6 +398,101 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         return None
             return None
 
+    class PartitionRegistry:
+        """
+        Cached registry of Slurm partition metadata.
+
+        Merges :class:`PartitionSet` sinfo data (name, capacity, node features)
+        with one batched ``scontrol show partition -o`` (State and Alternate=),
+        and classifies each partition as ``spot`` / ``on_demand`` / ``unknown``
+        from explicit glob lists and node features.
+
+        Refreshed lazily once the TTL expires. All Slurm queries here are
+        best-effort: failures leave the previous cached values in place.
+        """
+
+        class Entry(NamedTuple):
+            name: str
+            state: str | None
+            features: str
+            partition_class: PartitionClass
+            memory: str
+            cpus: str
+            alternate: str | None
+
+        def __init__(
+            self,
+            partitions: SlurmBatchSystem.PartitionSet,
+            ttl: float = DEFAULT_PARTITION_CACHE_TTL,
+            spot_globs: list[str] | None = None,
+            ondemand_globs: list[str] | None = None,
+            spot_feature: str = DEFAULT_SPOT_FEATURE,
+        ) -> None:
+            self._partitions = partitions
+            self._ttl = ttl
+            self._spot_globs = spot_globs or []
+            self._ondemand_globs = ondemand_globs or []
+            self._spot_feature = spot_feature
+            self._cache: dict[str, PartitionRegistry.Entry] = {}
+            self._last_refresh = 0.0
+
+        def _refresh(self) -> None:
+            states: dict[str, str] = {}
+            alternates: dict[str, str] = {}
+            try:
+                stdout = run_scontrol("show", "partition", "-o", quiet=True)
+                for line in stdout.splitlines():
+                    name: str | None = None
+                    state: str | None = None
+                    alternate: str | None = None
+                    for item in line.split():
+                        if item.startswith("PartitionName="):
+                            name = item.split("=", 1)[1]
+                        elif item.startswith("State="):
+                            state = item.split("=", 1)[1]
+                        elif item.startswith("Alternate="):
+                            alternate = item.split("=", 1)[1]
+                    if name is None:
+                        continue
+                    states[name] = state or ""
+                    if alternate:
+                        alternates[name] = alternate
+            except (CalledProcessErrorStderr, OSError) as e:
+                logger.debug("Could not refresh Slurm partition states: %s", e)
+            cache: dict[str, SlurmBatchSystem.PartitionRegistry.Entry] = {}
+            for partition in self._partitions.all_partitions or []:
+                name = partition.partition_name
+                cache[name] = SlurmBatchSystem.PartitionRegistry.Entry(
+                    name=name,
+                    state=states.get(name),
+                    features=partition.features,
+                    partition_class=classify_partition(
+                        name,
+                        partition.features,
+                        self._spot_globs,
+                        self._ondemand_globs,
+                        self._spot_feature,
+                    ),
+                    memory=partition.memory,
+                    cpus=partition.cpus,
+                    alternate=alternates.get(name),
+                )
+            self._cache = cache
+            self._last_refresh = time.time()
+
+        def refresh_if_stale(self) -> None:
+            """Re-query Slurm if the cache is older than the configured TTL."""
+            if time.time() - self._last_refresh >= self._ttl:
+                self._refresh()
+
+        def get(self, partition_name: str) -> PartitionRegistry.Entry | None:
+            self.refresh_if_stale()
+            return self._cache.get(partition_name)
+
+        def all(self) -> dict[str, PartitionRegistry.Entry]:
+            self.refresh_if_stale()
+            return self._cache
+
     class GridEngineThread(AbstractGridEngineBatchSystem.GridEngineThread):
         # Our boss is always the enclosing class
         boss: SlurmBatchSystem
@@ -430,14 +536,38 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             super().forgetJob(jobID)
 
         def _slurm_restart_threshold(self) -> int:
+            configured = getattr(self.boss.config, "slurm_job_restart_threshold", None)
+            if configured is not None:
+                return int(configured)
             return env_int("TOIL_SLURM_JOB_RESTART_THRESHOLD", 5)
+
+        def _partition_switch_poll_interval(self) -> float:
+            configured = getattr(
+                self.boss.config, "slurm_partition_switch_poll_interval", None
+            )
+            if configured is not None:
+                return float(configured)
+            interval = env_float(
+                "TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL",
+                DEFAULT_PARTITION_SWITCH_POLL_INTERVAL,
+            )
+            assert interval is not None
+            return interval
+
+        def _partition_switch_cooldown(self) -> int:
+            configured = getattr(
+                self.boss.config, "slurm_partition_switch_cooldown", None
+            )
+            if configured is not None:
+                return int(configured)
+            return env_int(
+                "TOIL_SLURM_PARTITION_SWITCH_COOLDOWN",
+                DEFAULT_PARTITION_SWITCH_COOLDOWN,
+            )
 
         def checkOnJobs(self) -> bool:
             if self.boss.partition_switch_watch:
-                interval = env_float(
-                    "TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL",
-                    DEFAULT_PARTITION_SWITCH_POLL_INTERVAL,
-                )
+                interval = self._partition_switch_poll_interval()
                 now = time.time()
                 if now - self.boss._partition_switch_last_poll >= interval:
                     self.boss._partition_switch_last_poll = now
@@ -1009,10 +1139,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             last_switch_time, switch_count, updated_comment = (
                 self.get_last_partition_switch_details(comment)
             )
-            cooldown = env_int(
-                "TOIL_SLURM_PARTITION_SWITCH_COOLDOWN",
-                DEFAULT_PARTITION_SWITCH_COOLDOWN,
-            )
+            cooldown = self._partition_switch_cooldown()
             if last_switch_time and (int(time.time()) - last_switch_time) < cooldown:
                 logger.debug(
                     "Skipping partition switch for job %s; last switch was %ss ago",
@@ -1462,6 +1589,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         def select_partition(self, cpus, mem, accelerators, preferred=True):
             """Select suitable slurm partition based on requirements. Checks state of partition.
 
+            When a partition preference is configured, tries the preferred
+            class first and then the other class (at most once), so a single
+            under-provisioned partition cannot cause unbounded recursion.
+
             :param cpus: required cps
             :type cpus: int
             :param mem: required memory
@@ -1492,33 +1623,39 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 usable_resources = self.batchSystemResources[
                     ~self.batchSystemResources["gpu"]
                 ]
+            # Try the requested preference class first, then the other class;
+            # when no preference column exists there is exactly one attempt.
             if "preference" in self.batchSystemResources.columns:
-                possible_partitions = usable_resources.partitions[
-                    (self.batchSystemResources["cputot"] >= cpus)
-                    & (self.batchSystemResources["realmemory"] >= mem)
-                    & (self.batchSystemResources["preference"] == preferred)
-                ].values
+                preference_attempts: list[bool | None] = [preferred, not preferred]
             else:
-                possible_partitions = usable_resources.partitions[
-                    (self.batchSystemResources["cputot"] >= cpus)
-                    & (self.batchSystemResources["realmemory"] >= mem)
-                ].values
-            if len(possible_partitions) != 0:
+                preference_attempts = [None]
+            for attempt, preference in enumerate(preference_attempts):
+                if preference is None:
+                    possible_partitions = usable_resources.partitions[
+                        (self.batchSystemResources["cputot"] >= cpus)
+                        & (self.batchSystemResources["realmemory"] >= mem)
+                    ].values
+                else:
+                    possible_partitions = usable_resources.partitions[
+                        (self.batchSystemResources["cputot"] >= cpus)
+                        & (self.batchSystemResources["realmemory"] >= mem)
+                        & (self.batchSystemResources["preference"] == preference)
+                    ].values
+                if len(possible_partitions) == 0:
+                    if attempt == 0 and preference is not None:
+                        logger.warning(
+                            "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s and preferred type: %s",
+                            cpus,
+                            mem,
+                            accelerators,
+                            preferred,
+                        )
+                        logger.info("Trying with preferred type: %s", not preferred)
+                    continue
                 usable_partitions = []
                 logger.info("Feasible Partitions: %s", possible_partitions)
                 for partition in possible_partitions:
-                    partition_state = (
-                        os.popen(
-                            f"""
-                        scontrol -o show partition {partition} |
-                        sed 's/ /\\n/g' |
-                        grep State |
-                        cut -d "=" -f2
-                        """
-                        )
-                        .read()
-                        .strip()
-                    )
+                    partition_state = self._cached_partition_state(partition)
                     if partition_state == "UP":
                         usable_partitions.append(partition)
                     else:
@@ -1527,27 +1664,31 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                             partition,
                             partition_state,
                         )
-                logger.info("Selectable Partitions: %s", usable_partitions)
-                return usable_partitions[0]
+                if usable_partitions:
+                    logger.info("Selectable Partitions: %s", usable_partitions)
+                    return usable_partitions[0]
+                # Candidates fit the requirements but none are UP; try the
+                # other preference class before giving up.
+            logger.error(
+                "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s",
+                cpus,
+                mem,
+                accelerators,
+            )
+            return None
 
-            if "preference" in self.batchSystemResources.columns:
-                logger.warning(
-                    "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s and preferred type: %s",
-                    cpus,
-                    mem,
-                    accelerators,
-                    preferred,
-                )
-                logger.info("Trying with preferred type: %s", not preferred)
-                return self.select_partition(cpus, mem, accelerators, not preferred)
-            else:
-                logger.error(
-                    "Could not find a partition to suffice cpus: %s, memory: %s, accelerators: %s",
-                    cpus,
-                    mem,
-                    accelerators,
-                )
-                return
+        def _cached_partition_state(self, partition: str) -> str | None:
+            """
+            Get the Slurm State of a partition from the boss's partition
+            registry, refreshing the cache when stale.
+            """
+            registry = getattr(self.boss, "partition_registry", None)
+            if registry is None:
+                return None
+            entry = registry.get(partition)
+            if entry is None:
+                return None
+            return entry.state
 
         def prepareSbatch(
             self,
@@ -1782,64 +1923,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 time_set = True
 
             if slurm_mem and slurm_cpu:
-                # Partition precedence: per-job spot failover > global storage failover > normal.
-                job_store_id = self.boss._batch_to_job_store_id.get(jobID)
-                per_job_partition: str | None = None
-                if job_store_id:
-                    per_job_partition = self.boss._job_failover_partition.get(job_store_id)
-
-                # If we have a per-job failover partition, check if it can handle the memory requirements
-                if per_job_partition and slurm_mem is not None:
-                    partition_capacity = self.boss.partitions.get_partition_memory_capacity(per_job_partition)
-                    if partition_capacity is not None and slurm_mem > partition_capacity:
-                        # Failover partition can't handle the memory requirements, allow normal selection
-                        logger.info(
-                            "Per-job failover partition %s cannot handle memory requirement %dMB "
-                            "(capacity: %dMB); allowing normal partition selection",
-                            per_job_partition, slurm_mem, partition_capacity
-                        )
-                        per_job_partition = None
-
-                if per_job_partition:
-                    partition = per_job_partition
-                elif self.boss.active_failover_partition:
-                    # Check if global failover partition can handle memory requirements
-                    if slurm_mem is not None:
-                        partition_capacity = self.boss.partitions.get_partition_memory_capacity(self.boss.active_failover_partition)
-                        if partition_capacity is not None and slurm_mem > partition_capacity:
-                            # Global failover partition can't handle the memory requirements
-                            logger.info(
-                                "Global failover partition %s cannot handle memory requirement %dMB "
-                                "(capacity: %dMB); allowing normal partition selection",
-                                self.boss.active_failover_partition, slurm_mem, partition_capacity
-                            )
-                            # Let normal selection proceed by not setting partition
-                        else:
-                            partition = self.boss.active_failover_partition
-                    else:
-                        partition = self.boss.active_failover_partition
-                # Keep per-job / storage failover override over resource-based selection.
-                if not per_job_partition and not self.boss.active_failover_partition:
-                    partition = self.select_partition(
-                        slurm_cpu,
-                        slurm_mem,
-                        accelerators=gpus,
-                        preferred=usePreferredPartition,
-                    )
-                    logger.info(
-                        "Selected partition: %s based on cpus: %s and memory: %s of preferred type: %s",
-                        partition,
-                        slurm_cpu,
-                        slurm_mem,
-                        usePreferredPartition,
-                    )
-                elif partition is not None:
-                    logger.info(
-                        "Using failover partition %s for job %s (per-job=%s)",
-                        partition,
-                        jobID,
-                        per_job_partition,
-                    )
+                partition = self.boss.resolve_partition_for_job(
+                    jobID,
+                    slurm_cpu,
+                    slurm_mem,
+                    gpus,
+                    usePreferredPartition,
+                    worker=self,
+                )
 
                 # Add partition argument if one was selected and not already set by TOIL_SLURM_ARGS
                 if partition is not None and not partition_set:
@@ -1878,6 +1969,34 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         self._job_spot_last_advance: dict[str, float] = {}
         super().__init__(config, maxCores, maxMemory, maxDisk)
         self.partitions = SlurmBatchSystem.PartitionSet()
+        # Make node features available to assessBatchResources classification.
+        SlurmBatchSystem._classification_partitions = self.partitions
+        # Spot/on-demand partition classification knobs (config or env).
+        spot_partitions = getattr(config, "slurm_spot_partitions", None)
+        if spot_partitions is None:
+            spot_partitions = os.getenv("TOIL_SLURM_SPOT_PARTITIONS")
+        self._spot_partition_globs = parse_glob_list(spot_partitions)
+        ondemand_partitions = getattr(config, "slurm_ondemand_partitions", None)
+        if ondemand_partitions is None:
+            ondemand_partitions = os.getenv("TOIL_SLURM_ONDEMAND_PARTITIONS")
+        self._ondemand_partition_globs = parse_glob_list(ondemand_partitions)
+        spot_feature = getattr(config, "slurm_spot_feature", None)
+        if not spot_feature:
+            spot_feature = os.getenv("TOIL_SLURM_SPOT_FEATURE")
+        self._spot_feature = spot_feature or DEFAULT_SPOT_FEATURE
+        # Unified cached view of partition state/Alternate=/class/capacity.
+        registry_ttl = getattr(config, "slurm_partition_cache_ttl", None)
+        if registry_ttl is None:
+            registry_ttl = env_float(
+                "TOIL_SLURM_PARTITION_CACHE_TTL", DEFAULT_PARTITION_CACHE_TTL
+            )
+        self.partition_registry = SlurmBatchSystem.PartitionRegistry(
+            self.partitions,
+            ttl=float(registry_ttl),
+            spot_globs=self._spot_partition_globs,
+            ondemand_globs=self._ondemand_partition_globs,
+            spot_feature=self._spot_feature,
+        )
         # Record when the workflow started, so we know when to stop looking for
         # jobs we ran.
         self.start_time = datetime.now().astimezone(None)
@@ -1893,6 +2012,10 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             self.failover_partitions = env_csv("TOIL_SLURM_PARTITION_FAILOVER")
         self.failover_partition_index = 0
         self.active_failover_partition: str | None = None
+        failover_map = getattr(config, "slurm_partition_failover_map", None)
+        if failover_map is None:
+            failover_map = os.getenv("TOIL_SLURM_PARTITION_FAILOVER_MAP")
+        self._partition_failover_map = self._parse_partition_failover_map(failover_map)
         self.slurm_spot_failover = bool(
             getattr(config, "slurm_spot_failover", False)
         ) or spot_failover_enabled()
@@ -1910,10 +2033,182 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 failover_list,
             )
 
+    @staticmethod
+    def _parse_partition_failover_map(raw: str | None) -> dict[str, str]:
+        """Parse ``spot-a:od-a,spot-b:od-b`` failover mappings into a dict."""
+        mapping: dict[str, str] = {}
+        for entry in parse_glob_list(raw):
+            source, sep, target = entry.partition(":")
+            source = source.strip()
+            target = target.strip()
+            if not sep or not source or not target:
+                if entry:
+                    logger.warning(
+                        "Ignoring invalid slurm partition failover map entry %r "
+                        "(expected 'source:target')",
+                        entry,
+                    )
+                continue
+            mapping[source] = target
+        return mapping
+
+    def get_classification_config(
+        self,
+    ) -> tuple[list[str], list[str], str, list[str] | None]:
+        """
+        Get the partition classification configuration for
+        :meth:`assessBatchResources`: spot globs, on-demand globs, the spot
+        feature tag, and the legacy name pattern (or None) to use only as a
+        last-resort fallback.
+        """
+        spot_globs = getattr(self, "_spot_partition_globs", None)
+        if spot_globs is None:
+            spot_globs = parse_glob_list(
+                getattr(self.config, "slurm_spot_partitions", None)
+                if getattr(self.config, "slurm_spot_partitions", None) is not None
+                else os.getenv("TOIL_SLURM_SPOT_PARTITIONS")
+            )
+        ondemand_globs = getattr(self, "_ondemand_partition_globs", None)
+        if ondemand_globs is None:
+            ondemand_globs = parse_glob_list(
+                getattr(self.config, "slurm_ondemand_partitions", None)
+                if getattr(self.config, "slurm_ondemand_partitions", None) is not None
+                else os.getenv("TOIL_SLURM_ONDEMAND_PARTITIONS")
+            )
+        spot_feature = getattr(self, "_spot_feature", None)
+        if not spot_feature:
+            spot_feature = (
+                getattr(self.config, "slurm_spot_feature", None)
+                or os.getenv("TOIL_SLURM_SPOT_FEATURE")
+                or DEFAULT_SPOT_FEATURE
+            )
+        # Check for correct spelling first, then old typo for backward compatibility
+        legacy = os.getenv("TOIL_SLURM_PARTITION_PREFERED") or os.getenv(
+            "TOIL_SLURM_PARTITON_PREFERED"
+        )
+        return spot_globs, ondemand_globs, spot_feature, legacy
+
+    def resolve_partition_for_job(
+        self,
+        job_store_id: str | None,
+        cpus: int,
+        mem: int,
+        gpus: int | None,
+        use_preferred: bool | None,
+        worker: SlurmBatchSystem.GridEngineThread | None = None,
+    ) -> str | None:
+        """
+        Decide which Slurm partition a job submission should target.
+
+        Precedence (unchanged): per-job spot failover
+        (``_job_failover_partition``) > global storage failover
+        (``active_failover_partition``) > resource-based
+        :meth:`GridEngineThread.select_partition`.
+
+        Failover partitions that cannot fit the job's memory requirement are
+        skipped in favor of normal resource-based selection.
+
+        :param worker: the grid engine thread to use for resource-based
+            selection; falls back to ``self.worker`` when not given.
+        """
+        per_job_partition: str | None = None
+        if job_store_id:
+            per_job_partition = self._job_failover_partition.get(job_store_id)
+
+        # If we have a per-job failover partition, check if it can handle the memory requirements
+        if per_job_partition:
+            partition_capacity = self.partitions.get_partition_memory_capacity(
+                per_job_partition
+            )
+            if partition_capacity is not None and mem > partition_capacity:
+                # Failover partition can't handle the memory requirements, allow normal selection
+                logger.info(
+                    "Per-job failover partition %s cannot handle memory requirement %dMB "
+                    "(capacity: %dMB); allowing normal partition selection",
+                    per_job_partition,
+                    mem,
+                    partition_capacity,
+                )
+                per_job_partition = None
+
+        partition: str | None = None
+        use_global_failover = False
+        if per_job_partition:
+            partition = per_job_partition
+        elif self.active_failover_partition:
+            # Check if global failover partition can handle memory requirements
+            partition_capacity = self.partitions.get_partition_memory_capacity(
+                self.active_failover_partition
+            )
+            if partition_capacity is not None and mem > partition_capacity:
+                # Global failover partition can't handle the memory requirements
+                logger.info(
+                    "Global failover partition %s cannot handle memory requirement %dMB "
+                    "(capacity: %dMB); allowing normal partition selection",
+                    self.active_failover_partition,
+                    mem,
+                    partition_capacity,
+                )
+                # Let normal selection proceed by not setting partition
+            else:
+                partition = self.active_failover_partition
+                use_global_failover = True
+        # Keep per-job / storage failover override over resource-based selection.
+        if not per_job_partition and not use_global_failover:
+            if worker is None:
+                worker = getattr(self, "worker", None)
+            if worker is None:
+                logger.debug(
+                    "No grid engine thread available for resource-based "
+                    "partition selection; leaving partition to Slurm"
+                )
+                return None
+            partition = worker.select_partition(
+                cpus,
+                mem,
+                accelerators=gpus,
+                preferred=use_preferred,
+            )
+            logger.info(
+                "Selected partition: %s based on cpus: %s and memory: %s of preferred type: %s",
+                partition,
+                cpus,
+                mem,
+                use_preferred,
+            )
+        elif partition is not None:
+            logger.info(
+                "Using failover partition %s (per-job=%s)",
+                partition,
+                per_job_partition,
+            )
+        return partition
+
     def get_alternate_partition(self, partition: str | None) -> str | None:
         """Return Slurm Alternate= for partition when that alternate is UP."""
         if not partition:
             return None
+        registry = getattr(self, "partition_registry", None)
+        if registry is not None:
+            # Prefer the cached registry when it knows this partition.
+            entry = registry.get(partition)
+            if entry is not None:
+                if not entry.alternate:
+                    logger.debug(
+                        "Cannot switch partition: no Alternate= configured for %s",
+                        partition,
+                    )
+                    return None
+                alternate_entry = registry.get(entry.alternate)
+                if alternate_entry is not None:
+                    if alternate_entry.state and alternate_entry.state != "UP":
+                        logger.debug(
+                            "Cannot switch partition: alternate partition %s is %s",
+                            entry.alternate,
+                            alternate_entry.state,
+                        )
+                        return None
+                    return entry.alternate
         try:
             stdout = run_scontrol("show", "partition", partition, quiet=True)
         except (CalledProcessErrorStderr, OSError) as e:
@@ -2030,12 +2325,18 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         """
         Resolve next partition for a spot-interrupted job.
 
-        Prefers Slurm Alternate= on the failed partition; falls back to optional
-        TOIL_SLURM_PARTITION_FAILOVER list rotation.
+        Order: explicit ``--slurmPartitionFailoverMap`` entry for the failed
+        partition, then Slurm Alternate= on the failed partition, then the
+        optional TOIL_SLURM_PARTITION_FAILOVER list rotation.
 
         :returns: (partition_name_or_None, source_label) where source is
-            ``Alternate=``, ``env_list``, or ``none``.
+            ``failover_map``, ``Alternate=``, ``env_list``, or ``none``.
         """
+        failover_map = getattr(self, "_partition_failover_map", None) or {}
+        if failed_partition:
+            mapped = failover_map.get(failed_partition)
+            if mapped:
+                return mapped, "failover_map"
         alternate = self.get_alternate_partition(failed_partition)
         if alternate:
             return alternate, "Alternate="
@@ -2286,7 +2587,100 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
     ### The interface for SLURM
     ###
     @classmethod
+    def classify_partitions(
+        cls,
+        partition_names: list[str],
+        spot_globs: list[str],
+        ondemand_globs: list[str],
+        spot_feature: str,
+        legacy_pattern: str | None,
+    ) -> dict[str, PartitionClass]:
+        """
+        Classify partitions as ``spot`` / ``on_demand`` / ``unknown`` from
+        explicit glob lists, Slurm node features (via the PartitionSet), and
+        the legacy TOIL_SLURM_PARTITION_PREFERED name pattern as last resort.
+
+        The legacy pattern applies only to partitions still ``unknown`` after
+        globs and features, and only when no explicit glob or feature matched
+        anything at all.
+        """
+        features_by_name: dict[str, str] = {}
+        partitions = getattr(cls, "_classification_partitions", None)
+        if partitions is not None:
+            for partition in partitions.all_partitions or []:
+                features_by_name.setdefault(
+                    partition.partition_name, partition.features
+                )
+        classes: dict[str, PartitionClass] = {}
+        for name in partition_names:
+            classes[name] = classify_partition(
+                name,
+                features_by_name.get(name, ""),
+                spot_globs,
+                ondemand_globs,
+                spot_feature,
+            )
+        explicit = parse_glob_list(spot_globs) or parse_glob_list(ondemand_globs)
+        # Apply the legacy name pattern as a last resort only when no explicit
+        # glob matched and no partition classified from node features. Gate on
+        # classification outcome (not on the mere existence of feature strings)
+        # so clusters whose nodes carry unrelated features (e.g. instance type)
+        # but no spot tag still honor TOIL_SLURM_PARTITION_PREFERED.
+        if legacy_pattern and not explicit and not any(
+            partition_class != "unknown" for partition_class in classes.values()
+        ):
+            for name in partition_names:
+                if classes[name] == "unknown" and re.search(
+                    legacy_pattern, name, re.IGNORECASE
+                ):
+                    classes[name] = "spot"
+        return classes
+
+    @classmethod
+    def apply_partition_classification(cls, slurm_resources) -> None:
+        """
+        Add the ``preference`` column (True for spot partitions) to an
+        assessBatchResources DataFrame, unless no partition classifies as
+        anything, in which case the column is omitted entirely (legacy
+        behavior).
+        """
+        owner = getattr(cls, "_classification_owner", None)
+        if owner is not None:
+            spot_globs, ondemand_globs, spot_feature, legacy = (
+                owner.get_classification_config()
+            )
+        else:
+            spot_globs = parse_glob_list(os.getenv("TOIL_SLURM_SPOT_PARTITIONS"))
+            ondemand_globs = parse_glob_list(
+                os.getenv("TOIL_SLURM_ONDEMAND_PARTITIONS")
+            )
+            spot_feature = os.getenv("TOIL_SLURM_SPOT_FEATURE") or DEFAULT_SPOT_FEATURE
+            # Check for correct spelling first, then old typo for backward compatibility
+            legacy = os.getenv("TOIL_SLURM_PARTITION_PREFERED") or os.getenv(
+                "TOIL_SLURM_PARTITON_PREFERED"
+            )
+        classes = cls.classify_partitions(
+            list(slurm_resources.partitions),
+            spot_globs,
+            ondemand_globs,
+            spot_feature,
+            legacy,
+        )
+        if not classes or all(
+            partition_class == "unknown" for partition_class in classes.values()
+        ):
+            # No classification matched anything: do not add the column at all.
+            return
+        slurm_resources["preference"] = slurm_resources.partitions.map(
+            lambda name: classes.get(name, "unknown") == "spot"
+        )
+
+    @classmethod
     def assessBatchResources(cls):
+        # Note: ``cls`` is always the SlurmBatchSystem class here (a bound
+        # classmethod), never an instance. Instance classification config
+        # reaches this classmethod via the ``_classification_partitions`` class
+        # attribute set in ``__init__`` (see classify_partitions).
         slurm_partition_configs = (
             os.popen(
                 r"""
@@ -2328,12 +2722,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         )
         slurm_resources["gpu"] = ~slurm_resources.gputot.isnull()
         slurm_resources.drop(columns="gres", inplace=True)
-        # Check for correct spelling first, then old typo for backward compatibility
-        preference = os.getenv("TOIL_SLURM_PARTITION_PREFERED") or os.getenv("TOIL_SLURM_PARTITON_PREFERED")
-        if preference:
-            logger.info("Setting slurm partition preference: %s", preference)
-            slurm_resources["preference"] = slurm_resources.partitions.str.contains(
-                preference, case=False
+        # Classify partitions as spot / on_demand / unknown. The preference
+        # column marks spot partitions; when nothing classifies any partition
+        # the column is omitted entirely (identical to legacy behavior).
+        cls.apply_partition_classification(cls, slurm_resources)
+        if "preference" in slurm_resources.columns:
+            logger.info(
+                "Slurm partition classification (preference=spot): %s",
+                slurm_resources[["partitions", "preference"]].values.tolist(),
             )
         else:
             logger.info("No slurm partition preference set")
@@ -2517,6 +2913,78 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             help="If True, drain Slurm nodes where a worker reported mount/storage I/O failure "
             "(requires permission to run scontrol update on nodes).",
         )
+        parser.add_argument(
+            "--slurmSpotPartitions",
+            dest="slurm_spot_partitions",
+            default=None,
+            env_var="TOIL_SLURM_SPOT_PARTITIONS",
+            help="Comma-separated glob patterns matching Slurm partition names to classify "
+            "as spot capacity (e.g. 'spot-*,*-cs'). Takes precedence over node-feature "
+            "detection and the legacy TOIL_SLURM_PARTITION_PREFERED name pattern.",
+        )
+        parser.add_argument(
+            "--slurmOnDemandPartitions",
+            dest="slurm_ondemand_partitions",
+            default=None,
+            env_var="TOIL_SLURM_ONDEMAND_PARTITIONS",
+            help="Comma-separated glob patterns matching Slurm partition names to classify "
+            "as on-demand capacity (e.g. '*-cod'). Takes precedence over node-feature "
+            "detection and the legacy TOIL_SLURM_PARTITION_PREFERED name pattern.",
+        )
+        parser.add_argument(
+            "--slurmSpotFeature",
+            dest="slurm_spot_feature",
+            default=None,
+            env_var="TOIL_SLURM_SPOT_FEATURE",
+            help=f"Slurm node feature tag marking spot capacity (default: {DEFAULT_SPOT_FEATURE}). "
+            "A partition classifies as spot when any of its nodes carries this feature.",
+        )
+        parser.add_argument(
+            "--slurmPartitionFailoverMap",
+            dest="slurm_partition_failover_map",
+            default=None,
+            env_var="TOIL_SLURM_PARTITION_FAILOVER_MAP",
+            help="Comma-separated source:target partition failover mappings "
+            "(e.g. 'spot-a:od-a,spot-b:od-b'). An explicit map entry for the failed "
+            "partition wins over Slurm Alternate=, which wins over the "
+            "--slurmPartitionFailover list rotation.",
+        )
+        parser.add_argument(
+            "--slurmJobRestartThreshold",
+            dest="slurm_job_restart_threshold",
+            type=int,
+            default=None,
+            env_var="TOIL_SLURM_JOB_RESTART_THRESHOLD",
+            help="Slurm job Restarts count at which an in-place partition switch to the "
+            "partition's Alternate= is attempted (default: 5).",
+        )
+        parser.add_argument(
+            "--slurmPartitionSwitchCooldown",
+            dest="slurm_partition_switch_cooldown",
+            type=int,
+            default=None,
+            env_var="TOIL_SLURM_PARTITION_SWITCH_COOLDOWN",
+            help="Minimum seconds between in-place partition switches for the same Slurm "
+            f"job (default: {DEFAULT_PARTITION_SWITCH_COOLDOWN}).",
+        )
+        parser.add_argument(
+            "--slurmPartitionSwitchPollInterval",
+            dest="slurm_partition_switch_poll_interval",
+            type=float,
+            default=None,
+            env_var="TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL",
+            help="Seconds between polls of jobs watched for in-place partition switches "
+            f"(default: {DEFAULT_PARTITION_SWITCH_POLL_INTERVAL}).",
+        )
+        parser.add_argument(
+            "--slurmPartitionCacheTTL",
+            dest="slurm_partition_cache_ttl",
+            type=float,
+            default=None,
+            env_var="TOIL_SLURM_PARTITION_CACHE_TTL",
+            help="Seconds to cache Slurm partition state/Alternate= metadata before "
+            f"re-querying (default: {DEFAULT_PARTITION_CACHE_TTL}).",
+        )
 
     OptionType = TypeVar("OptionType")
 
@@ -2540,3 +3008,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         setOption("slurm_spot_failover_exclude_reasons")
         setOption("slurm_spot_failover_reasons")
         setOption("slurm_drain_bad_nodes")
+        setOption("slurm_spot_partitions")
+        setOption("slurm_ondemand_partitions")
+        setOption("slurm_spot_feature")
+        setOption("slurm_partition_failover_map")
+        setOption("slurm_job_restart_threshold")
+        setOption("slurm_partition_switch_cooldown")
+        setOption("slurm_partition_switch_poll_interval")
+        setOption("slurm_partition_cache_ttl")

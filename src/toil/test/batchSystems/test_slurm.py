@@ -9,6 +9,10 @@ from datetime import datetime, timedelta
 from queue import Queue
 from unittest import mock
 
+import pandas
+
+from configargparse import ArgumentParser
+
 import pytest
 
 import toil.batchSystems.slurm
@@ -299,6 +303,44 @@ def call_sinfo(*_) -> str:
     return stdout
 
 
+def make_call_scontrol_partitions(state_by_partition, alternate_by_partition=None):
+    """
+    Build a call_command fake that answers the batched
+    ``scontrol show partition -o`` query from PartitionRegistry.
+    """
+    alternate_by_partition = alternate_by_partition or {}
+
+    def fake(*args, **_):
+        assert list(args[:2]) == ["show", "partition"], (
+            f"Unexpected command: {args}"
+        )
+        lines = []
+        for partition_name, state in state_by_partition.items():
+            line = f"PartitionName={partition_name} State={state}"
+            alternate = alternate_by_partition.get(partition_name)
+            if alternate:
+                line += f" Alternate={alternate}"
+            lines.append(line)
+        return "\n".join(lines) + "\n"
+
+    return fake
+
+
+def make_resources_dataframe(rows):
+    """
+    Build a minimal assessBatchResources-style DataFrame.
+    """
+    data = {
+        "partitions": [row[0] for row in rows],
+        "cputot": [row[1] for row in rows],
+        "realmemory": [row[2] for row in rows],
+        "gputot": [row[3] for row in rows],
+    }
+    frame = pandas.DataFrame.from_dict(data)
+    frame["gpu"] = ~frame.gputot.isnull()
+    return frame
+
+
 class FakeBatchSystem(BatchSystemSupport):
     """
     Class that implements a minimal Batch System, needed to create a Worker (see below).
@@ -323,9 +365,33 @@ class FakeBatchSystem(BatchSystemSupport):
         self._job_spot_strikes: dict[str, int] = {}
         self._job_spot_last_advance: dict[str, float] = {}
         self.slurm_spot_failover = False
+        self.partitions = None
+        self.partition_registry = None
+        self._partition_failover_map: dict[str, str] = {}
+        self._spot_partition_globs: list[str] = []
+        self._ondemand_partition_globs: list[str] = []
+        self._spot_feature = "spot"
 
     def assessBatchResources(self):
         raise NotImplementedError()
+
+    def get_classification_config(self):
+        return toil.batchSystems.slurm.SlurmBatchSystem.get_classification_config(
+            self
+        )
+
+    def resolve_partition_for_job(
+        self,
+        job_store_id: str | None,
+        cpus: int,
+        mem: int,
+        gpus,
+        use_preferred,
+        worker=None,
+    ) -> str | None:
+        return toil.batchSystems.slurm.SlurmBatchSystem.resolve_partition_for_job(
+            self, job_store_id, cpus, mem, gpus, use_preferred, worker=worker
+        )
 
     def get_alternate_partition(self, partition: str | None) -> str | None:
         return toil.batchSystems.slurm.SlurmBatchSystem.get_alternate_partition(
@@ -1637,3 +1703,475 @@ class TestSlurmMountRecovery(ToilTest):
         del boss._job_failover_partition["js-prep"]
         command2 = worker.prepareSbatch(1, 1000000, 99, "job", {}, None, True, "")
         self.assertIn("--partition=storage-spare", command2)
+
+    def test_parse_glob_list(self):
+        from toil.batchSystems.slurm_mount_recovery import parse_glob_list
+
+        self.assertEqual(parse_glob_list(None), [])
+        self.assertEqual(parse_glob_list(""), [])
+        self.assertEqual(parse_glob_list("spot-*, *-cs ,, foo"), ["spot-*", "*-cs", "foo"])
+        self.assertEqual(parse_glob_list([" a ", "", "b"]), ["a", "b"])
+
+    def test_classify_partition_explicit_globs_win(self):
+        from toil.batchSystems.slurm_mount_recovery import classify_partition
+
+        # Explicit spot glob beats on-demand glob and features.
+        self.assertEqual(
+            classify_partition("h-cs", "", ["*-cs"], ["h-cs"], "spot"), "spot"
+        )
+        self.assertEqual(
+            classify_partition("hcs", "ondemand,spot", ["hcs"], ["h*"], "spot"),
+            "spot",
+        )
+
+    def test_classify_partition_ondemand_glob(self):
+        from toil.batchSystems.slurm_mount_recovery import classify_partition
+
+        self.assertEqual(
+            classify_partition("h-cod", "", [], ["*-cod"], "spot"), "on_demand"
+        )
+
+    def test_classify_partition_feature_detection(self):
+        from toil.batchSystems.slurm_mount_recovery import classify_partition
+
+        self.assertEqual(
+            classify_partition("hcs", "m6i.large,SPOT", [], [], "spot"), "spot"
+        )
+        # Custom feature tag name.
+        self.assertEqual(
+            classify_partition("p1", "preemptible", [], [], "preemptible"),
+            "spot",
+        )
+        # No glob, no feature -> unknown.
+        self.assertEqual(
+            classify_partition("plain", "m6i.large", [], [], "spot"), "unknown"
+        )
+
+    def test_classification_all_unknown_no_preference_column(self):
+        self._clear_classification_env()
+        frame = make_resources_dataframe([("solo", 4, 8192, None)])
+        toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = (
+            self._fake_partition_set({"solo": ""})
+        )
+        try:
+            toil.batchSystems.slurm.SlurmBatchSystem.apply_partition_classification(
+                frame
+            )
+        finally:
+            toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = None
+        self.assertNotIn("preference", frame.columns)
+
+    def _clear_classification_env(self):
+        for var in (
+            "TOIL_SLURM_SPOT_PARTITIONS",
+            "TOIL_SLURM_ONDEMAND_PARTITIONS",
+            "TOIL_SLURM_SPOT_FEATURE",
+            "TOIL_SLURM_PARTITION_PREFERED",
+            "TOIL_SLURM_PARTITON_PREFERED",
+        ):
+            self.monkeypatch.delenv(var, raising=False)
+
+    @staticmethod
+    def _fake_partition_set(features_by_name):
+        partition_set = (
+            toil.batchSystems.slurm.SlurmBatchSystem.PartitionSet.__new__(
+                toil.batchSystems.slurm.SlurmBatchSystem.PartitionSet
+            )
+        )
+        partition_set.all_partitions = [
+            toil.batchSystems.slurm.SlurmBatchSystem.PartitionInfo(
+                partition_name=name,
+                gres=False,
+                time_limit=3600.0,
+                priority=1,
+                cpus="8",
+                memory="64000",
+                features=features,
+            )
+            for name, features in features_by_name.items()
+        ]
+        return partition_set
+
+    def test_classification_legacy_pattern_fallback(self):
+        self._clear_classification_env()
+        frame = make_resources_dataframe(
+            [("spot-a", 4, 8192, None), ("od-a", 4, 8192, None)]
+        )
+        self.monkeypatch.setenv("TOIL_SLURM_PARTITION_PREFERED", "spot")
+        toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = (
+            self._fake_partition_set({"spot-a": "", "od-a": ""})
+        )
+        try:
+            toil.batchSystems.slurm.SlurmBatchSystem.apply_partition_classification(
+                frame
+            )
+        finally:
+            toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = None
+        self.assertIn("preference", frame.columns)
+        by_name = dict(zip(frame.partitions, frame.preference))
+        self.assertEqual(by_name, {"spot-a": True, "od-a": False})
+
+    def test_classification_explicit_glob_no_legacy(self):
+        # Explicit globs suppress the legacy pattern entirely.
+        self._clear_classification_env()
+        frame = make_resources_dataframe(
+            [("spot-a", 4, 8192, None), ("od-a", 4, 8192, None)]
+        )
+        self.monkeypatch.setenv("TOIL_SLURM_PARTITION_PREFERED", "spot")
+        self.monkeypatch.setenv("TOIL_SLURM_ONDEMAND_PARTITIONS", "od-*")
+        toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = (
+            self._fake_partition_set({"spot-a": "", "od-a": ""})
+        )
+        try:
+            toil.batchSystems.slurm.SlurmBatchSystem.apply_partition_classification(
+                frame
+            )
+        finally:
+            toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = None
+        self.assertIn("preference", frame.columns)
+        by_name = dict(zip(frame.partitions, frame.preference))
+        self.assertEqual(by_name, {"spot-a": False, "od-a": False})
+
+    def test_classification_feature_marks_spot(self):
+        self._clear_classification_env()
+        frame = make_resources_dataframe(
+            [("compute", 4, 8192, None), ("batch", 4, 8192, None)]
+        )
+        toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = (
+            self._fake_partition_set(
+                {"compute": "m6i.large,spot", "batch": "m6i.large"}
+            )
+        )
+        try:
+            toil.batchSystems.slurm.SlurmBatchSystem.apply_partition_classification(
+                frame
+            )
+        finally:
+            toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = None
+        self.assertIn("preference", frame.columns)
+        by_name = dict(zip(frame.partitions, frame.preference))
+        self.assertEqual(by_name, {"compute": True, "batch": False})
+
+    def test_classification_legacy_pattern_with_unrelated_features(self):
+        # Nodes carrying unrelated features (e.g. instance type) but no spot
+        # tag must NOT disable the legacy TOIL_SLURM_PARTITION_PREFERED
+        # fallback (regression test for back-compat on stock ParallelCluster).
+        self._clear_classification_env()
+        frame = make_resources_dataframe(
+            [("spot-a", 4, 8192, None), ("od-a", 4, 8192, None)]
+        )
+        self.monkeypatch.setenv("TOIL_SLURM_PARTITION_PREFERED", "spot")
+        toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = (
+            self._fake_partition_set(
+                {"spot-a": "m6i.large,dynamic", "od-a": "m6i.large,dynamic"}
+            )
+        )
+        try:
+            toil.batchSystems.slurm.SlurmBatchSystem.apply_partition_classification(
+                frame
+            )
+        finally:
+            toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = None
+        self.assertIn("preference", frame.columns)
+        by_name = dict(zip(frame.partitions, frame.preference))
+        self.assertEqual(by_name, {"spot-a": True, "od-a": False})
+
+    def _make_registry_boss(self, features, states, alternates=None):
+        # The fake PartitionSet is pre-populated so it never runs sinfo.
+        boss = FakeBatchSystem()
+        boss.partitions = self._fake_partition_set(
+            {name: features.get(name, "") for name in states}
+        )
+        self.monkeypatch.setattr(
+            toil.batchSystems.slurm,
+            "run_scontrol",
+            make_call_scontrol_partitions(states, alternates),
+        )
+        boss.partition_registry = (
+            toil.batchSystems.slurm.SlurmBatchSystem.PartitionRegistry(
+                boss.partitions, ttl=60
+            )
+        )
+        return boss
+
+    def _make_registry_worker(self, boss, resources):
+        worker = toil.batchSystems.slurm.SlurmBatchSystem.GridEngineThread(
+            newJobsQueue=Queue(),
+            updatedJobsQueue=Queue(),
+            killQueue=Queue(),
+            killedJobsQueue=Queue(),
+            boss=boss,
+        )
+        worker.batchSystemResources = resources
+        return worker
+
+    def test_partition_registry_states_and_alternate(self):
+        boss = self._make_registry_boss(
+            {"main": "", "spare": ""},
+            {"main": "DOWN", "spare": "UP"},
+            {"main": "spare"},
+        )
+        entry = boss.partition_registry.get("main")
+        self.assertEqual(entry.state, "DOWN")
+        self.assertEqual(entry.alternate, "spare")
+        self.assertEqual(boss.partition_registry.get("spare").state, "UP")
+        self.assertIsNone(boss.partition_registry.get("spare").alternate)
+        # get_alternate_partition uses the registry and requires the
+        # alternate to be UP.
+        self.assertEqual(boss.get_alternate_partition("main"), "spare")
+        # Single partition with no Alternate= -> no switch target.
+        boss2 = self._make_registry_boss({"only": ""}, {"only": "UP"})
+        self.assertIsNone(boss2.get_alternate_partition("only"))
+
+    def test_select_partition_single_partition_no_recursion(self):
+        boss = self._make_registry_boss({"only": ""}, {"only": "UP"})
+        resources = make_resources_dataframe([("only", 4, 8192, None)])
+        resources["preference"] = True
+        worker = self._make_registry_worker(boss, resources)
+        # Job needs more CPUs than the only partition has: must return None,
+        # not ping-pong between preference classes forever (RecursionError).
+        self.assertIsNone(worker.select_partition(8, 1024, None, preferred=True))
+        self.assertIsNone(worker.select_partition(8, 1024, None, preferred=False))
+
+    def test_select_partition_falls_back_to_other_class(self):
+        boss = self._make_registry_boss(
+            {"spot-a": "", "od-a": ""}, {"spot-a": "UP", "od-a": "UP"}
+        )
+        resources = make_resources_dataframe(
+            [("spot-a", 4, 8192, None), ("od-a", 4, 8192, None)]
+        )
+        resources["preference"] = [True, False]
+        worker = self._make_registry_worker(boss, resources)
+        self.assertEqual(
+            worker.select_partition(1, 1024, None, preferred=True), "spot-a"
+        )
+        self.assertEqual(
+            worker.select_partition(1, 1024, None, preferred=False), "od-a"
+        )
+        # Preferred class DOWN -> falls back to the other class.
+        boss_down = self._make_registry_boss(
+            {"spot-a": "", "od-a": ""}, {"spot-a": "DOWN", "od-a": "UP"}
+        )
+        worker_down = self._make_registry_worker(boss_down, resources)
+        self.assertEqual(
+            worker_down.select_partition(1, 1024, None, preferred=True), "od-a"
+        )
+        # Both DOWN -> None (same as today: no UP partition yields None).
+        boss_all_down = self._make_registry_boss(
+            {"spot-a": "", "od-a": ""}, {"spot-a": "DOWN", "od-a": "DOWN"}
+        )
+        worker_all_down = self._make_registry_worker(boss_all_down, resources)
+        self.assertIsNone(
+            worker_all_down.select_partition(1, 1024, None, preferred=True)
+        )
+
+    def test_select_partition_no_preference_column(self):
+        boss = self._make_registry_boss({"only": ""}, {"only": "UP"})
+        resources = make_resources_dataframe([("only", 4, 8192, None)])
+        worker = self._make_registry_worker(boss, resources)
+        self.assertEqual(worker.select_partition(1, 1024, None), "only")
+        self.assertIsNone(worker.select_partition(8, 1024, None))
+
+    def test_resolve_partition_for_job_precedence(self):
+        boss = self._make_registry_boss(
+            {"main": "", "per-job": "", "global": ""},
+            {"main": "UP", "per-job": "UP", "global": "UP"},
+        )
+        resources = make_resources_dataframe(
+            [("main", 4, 8192, None), ("per-job", 4, 8192, None),
+             ("global", 4, 8192, None)]
+        )
+        worker = self._make_registry_worker(boss, resources)
+        # Plain resource-based selection.
+        self.assertEqual(
+            boss.resolve_partition_for_job(None, 1, 1024, None, True, worker=worker),
+            "main",
+        )
+        # Global storage failover beats selection.
+        boss.active_failover_partition = "global"
+        self.assertEqual(
+            boss.resolve_partition_for_job(None, 1, 1024, None, True, worker=worker),
+            "global",
+        )
+        # Per-job spot failover beats global storage failover.
+        boss._job_failover_partition["js1"] = "per-job"
+        self.assertEqual(
+            boss.resolve_partition_for_job("js1", 1, 1024, None, True, worker=worker),
+            "per-job",
+        )
+
+    def test_resolve_partition_for_job_memory_capacity_skip(self):
+        self.monkeypatch.setattr(
+            toil.batchSystems.slurm,
+            "run_scontrol",
+            make_call_scontrol_partitions({"main": "UP", "tiny": "UP"}),
+        )
+        boss = FakeBatchSystem()
+        boss.partitions = self._fake_partition_set({"main": "", "tiny": ""})
+        # "main" has large nodes; "tiny" does not fit the job below.
+        boss.partitions.all_partitions = [
+            p._replace(memory="1024000") if p.partition_name == "main" else p
+            for p in boss.partitions.all_partitions
+        ]
+        boss.partition_registry = (
+            toil.batchSystems.slurm.SlurmBatchSystem.PartitionRegistry(
+                boss.partitions, ttl=60
+            )
+        )
+        resources = make_resources_dataframe(
+            [("main", 4, 99999999, None), ("tiny", 4, 8192, None)]
+        )
+        worker = self._make_registry_worker(boss, resources)
+        # Per-job failover partition cannot fit the memory request -> skipped.
+        boss._job_failover_partition["js1"] = "tiny"
+        self.assertEqual(
+            boss.resolve_partition_for_job("js1", 1, 99999, None, True, worker=worker),
+            "main",
+        )
+        # Same for the global failover partition.
+        del boss._job_failover_partition["js1"]
+        boss.active_failover_partition = "tiny"
+        self.assertEqual(
+            boss.resolve_partition_for_job(None, 1, 99999, None, True, worker=worker),
+            "main",
+        )
+
+    def test_resolve_spot_failover_partition_map_beats_alternate(self):
+        boss = self._make_registry_boss(
+            {"main": "", "spare": "", "mapped": ""},
+            {"main": "UP", "spare": "UP", "mapped": "UP"},
+            {"main": "spare"},
+        )
+        boss.slurm_spot_failover = True
+        boss._partition_failover_map = {"main": "mapped"}
+        target, source = boss.resolve_spot_failover_partition("js1", "main")
+        self.assertEqual(target, "mapped")
+        self.assertEqual(source, "failover_map")
+
+    def test_resolve_spot_failover_partition_alternate_beats_env_list(self):
+        boss = self._make_registry_boss(
+            {"main": "", "spare": ""},
+            {"main": "UP", "spare": "UP"},
+            {"main": "spare"},
+        )
+        boss.slurm_spot_failover = True
+        boss.failover_partitions = ["env-od"]
+        target, source = boss.resolve_spot_failover_partition("js1", "main")
+        self.assertEqual(target, "spare")
+        self.assertEqual(source, "Alternate=")
+
+    def test_parse_partition_failover_map(self):
+        parse = (
+            toil.batchSystems.slurm.SlurmBatchSystem._parse_partition_failover_map
+        )
+        self.assertEqual(parse(None), {})
+        self.assertEqual(
+            parse("spot-a:od-a, spot-b:od-b"), {"spot-a": "od-a", "spot-b": "od-b"}
+        )
+        with self.assertLogs("toil.batchSystems.slurm", level="WARNING"):
+            self.assertEqual(parse("bogus,ok:fine"), {"ok": "fine"})
+
+    def test_new_cli_options_override_env(self):
+        parser = ArgumentParser()
+        toil.batchSystems.slurm.SlurmBatchSystem.add_options(parser)
+        self.monkeypatch.setenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", "9")
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FEATURE", "envtag")
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_PARTITIONS", "env-spot-*")
+        self.monkeypatch.setenv(
+            "TOIL_SLURM_PARTITION_FAILOVER_MAP", "env-a:env-b"
+        )
+        # Env values flow through configargparse when no CLI flag is given.
+        ns = parser.parse_args([])
+        self.assertEqual(ns.slurm_job_restart_threshold, 9)
+        self.assertEqual(ns.slurm_spot_feature, "envtag")
+        self.assertEqual(ns.slurm_spot_partitions, "env-spot-*")
+        self.assertEqual(ns.slurm_partition_failover_map, "env-a:env-b")
+        # CLI flags override the environment.
+        ns = parser.parse_args(
+            [
+                "--slurmJobRestartThreshold", "3",
+                "--slurmSpotFeature", "clitag",
+                "--slurmSpotPartitions", "cli-*",
+                "--slurmPartitionFailoverMap", "cli-a:cli-b",
+                "--slurmPartitionSwitchCooldown", "11",
+                "--slurmPartitionSwitchPollInterval", "0.5",
+            ]
+        )
+        self.assertEqual(ns.slurm_job_restart_threshold, 3)
+        self.assertEqual(ns.slurm_spot_feature, "clitag")
+        self.assertEqual(ns.slurm_spot_partitions, "cli-*")
+        self.assertEqual(ns.slurm_partition_failover_map, "cli-a:cli-b")
+        self.assertEqual(ns.slurm_partition_switch_cooldown, 11)
+        self.assertEqual(ns.slurm_partition_switch_poll_interval, 0.5)
+
+    def test_new_cli_option_defaults_unset(self):
+        # Ensure no leftover Slurm env vars leak defaults into the parser.
+        for var in (
+            "TOIL_SLURM_SPOT_PARTITIONS",
+            "TOIL_SLURM_ONDEMAND_PARTITIONS",
+            "TOIL_SLURM_SPOT_FEATURE",
+            "TOIL_SLURM_PARTITION_FAILOVER_MAP",
+            "TOIL_SLURM_JOB_RESTART_THRESHOLD",
+            "TOIL_SLURM_PARTITION_SWITCH_COOLDOWN",
+            "TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL",
+            "TOIL_SLURM_PARTITION_CACHE_TTL",
+        ):
+            self.monkeypatch.delenv(var, raising=False)
+        parser = ArgumentParser()
+        toil.batchSystems.slurm.SlurmBatchSystem.add_options(parser)
+        ns = parser.parse_args([])
+        self.assertIsNone(ns.slurm_spot_partitions)
+        self.assertIsNone(ns.slurm_ondemand_partitions)
+        self.assertIsNone(ns.slurm_spot_feature)
+        self.assertIsNone(ns.slurm_partition_failover_map)
+        self.assertIsNone(ns.slurm_job_restart_threshold)
+        self.assertIsNone(ns.slurm_partition_switch_cooldown)
+        self.assertIsNone(ns.slurm_partition_switch_poll_interval)
+        self.assertIsNone(ns.slurm_partition_cache_ttl)
+
+    def test_config_prefers_cli_over_env_for_switch_knobs(self):
+        boss = FakeBatchSystem()
+        boss.config.slurm_job_restart_threshold = 7
+        boss.config.slurm_partition_switch_cooldown = 42
+        boss.config.slurm_partition_switch_poll_interval = 1.5
+        self.monkeypatch.setenv("TOIL_SLURM_JOB_RESTART_THRESHOLD", "2")
+        self.monkeypatch.setenv("TOIL_SLURM_PARTITION_SWITCH_COOLDOWN", "5")
+        self.monkeypatch.setenv("TOIL_SLURM_PARTITION_SWITCH_POLL_INTERVAL", "0.1")
+        worker = toil.batchSystems.slurm.SlurmBatchSystem.GridEngineThread(
+            newJobsQueue=Queue(),
+            updatedJobsQueue=Queue(),
+            killQueue=Queue(),
+            killedJobsQueue=Queue(),
+            boss=boss,
+        )
+        self.assertEqual(worker._slurm_restart_threshold(), 7)
+        self.assertEqual(worker._partition_switch_cooldown(), 42)
+        self.assertEqual(worker._partition_switch_poll_interval(), 1.5)
+        # Unset config falls back to env, then to defaults.
+        boss.config.slurm_job_restart_threshold = None
+        boss.config.slurm_partition_switch_cooldown = None
+        boss.config.slurm_partition_switch_poll_interval = None
+        self.assertEqual(worker._slurm_restart_threshold(), 2)
+        self.assertEqual(worker._partition_switch_cooldown(), 5)
+        self.assertEqual(worker._partition_switch_poll_interval(), 0.1)
+
+    def test_single_partition_spot_failover_noop(self):
+        # Single partition, no Alternate=, empty failover list: spot failover
+        # resolves no target and does not crash or set a failover partition.
+        boss = self._make_registry_boss({"only": ""}, {"only": "UP"})
+        boss.slurm_spot_failover = True
+        boss._batch_to_job_store_id[7] = "js-single"
+        boss._batch_submitted_partition[7] = "only"
+        boss.config.slurm_spot_failover_strikes = 1
+        boss.config.slurm_spot_failover_cooldown = 0
+        with self.assertLogs("toil.batchSystems.slurm", level="WARNING") as cm:
+            boss.record_spot_interruption(7, ("FAILED", 143, ""), {"Partition": "only"})
+        self.assertNotIn("js-single", boss._job_failover_partition)
+        self.assertTrue(
+            any("fall through to --doubleMem" in msg for msg in cm.output)
+        )
+        # Failover map pointing the only partition at itself resolves, but is
+        # a harmless no-op (same partition).
+        boss._partition_failover_map = {"only": "only"}
+        boss.record_spot_interruption(7, ("FAILED", 143, ""), {"Partition": "only"})
+        self.assertEqual(boss._job_failover_partition.get("js-single"), "only")

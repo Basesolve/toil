@@ -17,10 +17,11 @@ Helpers for Slurm mount / storage I/O failure detection and recovery.
 from __future__ import annotations
 
 import errno
+import fnmatch
 import logging
 import os
 import re
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from toil.lib.misc import CalledProcessErrorStderr, call_command
 
@@ -65,6 +66,17 @@ DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS = ("user", "cancel")
 # Never treat these exit codes as spot interruptions (storage / OOM / SIGKILL).
 SPOT_FAILOVER_NEVER_EXIT_CODES = frozenset({9, 136, 137})
 
+# Spot / on-demand partition classification defaults.
+# Feature tag that marks a partition's nodes as spot capacity (configurable via
+# --slurmSpotFeature / TOIL_SLURM_SPOT_FEATURE).
+DEFAULT_SPOT_FEATURE = "spot"
+# Seconds to cache the partition registry before re-querying Slurm
+# (--slurmPartitionCacheTTL / TOIL_SLURM_PARTITION_CACHE_TTL).
+DEFAULT_PARTITION_CACHE_TTL = 60
+
+# Classification of a Slurm partition by capacity type.
+PartitionClass = Literal["spot", "on_demand", "unknown"]
+
 
 def env_float(name: str, default: float | None) -> float | None:
     raw = os.getenv(name)
@@ -92,6 +104,54 @@ def env_csv(name: str) -> list[str]:
     if not raw:
         return []
     return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def parse_glob_list(value: str | list[str] | None) -> list[str]:
+    """
+    Parse a comma-separated string (or list) of glob patterns.
+
+    Entries are stripped and empty entries are dropped.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = value.split(",")
+    else:
+        parts = list(value)
+    return [part.strip() for part in parts if part and part.strip()]
+
+
+def classify_partition(
+    partition_name: str,
+    features: str | None,
+    spot_globs: list[str],
+    ondemand_globs: list[str],
+    spot_feature: str = DEFAULT_SPOT_FEATURE,
+) -> PartitionClass:
+    """
+    Classify a Slurm partition as ``spot``, ``on_demand``, or ``unknown``.
+
+    Resolution order (first match wins):
+
+    1. Explicit spot/on-demand glob lists matched against the partition name.
+    2. Node ``features`` containing the spot feature tag (case-insensitive,
+       comma-separated as reported by ``sinfo %f``).
+    3. ``unknown``.
+
+    The legacy ``TOIL_SLURM_PARTITION_PREFERED`` name-pattern fallback is the
+    caller's responsibility, not applied here.
+    """
+    for pattern in spot_globs:
+        if fnmatch.fnmatchcase(partition_name, pattern):
+            return "spot"
+    for pattern in ondemand_globs:
+        if fnmatch.fnmatchcase(partition_name, pattern):
+            return "on_demand"
+    if features and spot_feature:
+        tags = {tag.strip().lower() for tag in features.split(",") if tag.strip()}
+        if spot_feature.strip().lower() in tags:
+            return "spot"
+    return "unknown"
 
 
 def is_fatal_storage_oserror(
