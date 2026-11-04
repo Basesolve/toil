@@ -15,8 +15,12 @@
 Signal-based spot interruption detection for Toil workers.
 
 This module provides mechanisms for workers to explicitly report when they
-receive SIGTERM/SIGKILL signals, enabling more accurate spot interruption
-detection than exit code inference alone.
+receive a catchable signal (default SIGTERM), enabling more accurate spot
+interruption detection than exit code inference alone.
+
+Note: SIGKILL cannot be caught, so a worker killed by SIGKILL (e.g. the OOM
+killer or a hard ``scontrol`` kill) leaves no marker. Spot detection for those
+deaths relies on exit-code / state inference on the batch-system side.
 """
 
 import hashlib
@@ -36,6 +40,23 @@ _JOB_STORE_ID: str = "unknown"
 _MARKER_DIR: str | None = None
 
 
+def _get_workflow_id() -> str:
+    """
+    Best-effort ID of the workflow this process belongs to.
+
+    The leader exports ``TOIL_WORKFLOW_ID`` into each worker's environment
+    (see Leader.issueJob), so a worker and its leader agree on it. On the
+    leader itself (which sets the var only in the worker env, not its own),
+    and in tests, fall back to the coordination dir. Two workflows sharing a
+    marker dir and the same jobStoreID must not clobber each other's markers.
+    """
+    return (
+        os.getenv("TOIL_WORKFLOW_ID")
+        or os.getenv("TOIL_COORDINATION_DIR")
+        or "unknown"
+    )
+
+
 def _get_spot_signal_signum() -> int:
     """
     Get the signal number to watch for spot interruption detection.
@@ -47,13 +68,20 @@ def _get_spot_signal_signum() -> int:
 
     signal_name = os.getenv("TOIL_SPOT_SIGNAL_SIG", "SIGTERM")
     try:
-        return int(getattr(signal, signal_name))
+        signum = int(getattr(signal, signal_name))
     except (AttributeError, ValueError):
         logger.warning(
             "Invalid signal name '%s' in TOIL_SPOT_SIGNAL_SIG, defaulting to SIGTERM",
             signal_name
         )
         return signal.SIGTERM
+    if signum in (signal.SIGKILL, signal.SIGSTOP):
+        logger.warning(
+            "TOIL_SPOT_SIGNAL_SIG=%s cannot be caught; defaulting to SIGTERM",
+            signal_name
+        )
+        return signal.SIGTERM
+    return signum
 
 
 def _resolve_marker_dir() -> str:
@@ -89,7 +117,11 @@ def _marker_path(job_store_id: str, marker_dir: str | None = None) -> str:
     PID, so PID-keyed markers would be unreadable by the reader side.
     """
     directory = marker_dir or _MARKER_DIR or _resolve_marker_dir()
-    digest = hashlib.md5(job_store_id.encode()).hexdigest()[:16]
+    # Namespace by workflow so two workflows that reuse a jobStoreID (or run
+    # concurrently in the same marker dir) cannot clobber each other.
+    digest = hashlib.md5(
+        f"{_get_workflow_id()}:{job_store_id}".encode()
+    ).hexdigest()[:16]
     return os.path.join(directory, f"spot_signal_{digest}.txt")
 
 
@@ -175,15 +207,6 @@ def handle_spot_signal(signal_number: int, frame: Any) -> None:
         # exit with the conventional 128+signum status so the death is
         # still reported as a signal-style termination to waitpid callers.
         os._exit(128 + signal_number)
-
-
-def get_spot_signal_received() -> int | None:
-    """
-    Get the signal number if a spot signal was received.
-    
-    :return: Signal number if spot signal received, None otherwise
-    """
-    return _SPOT_SIGNAL_RECEIVED
 
 
 def report_spot_signal(pid: int, job_store_id: str | None = None) -> str | None:
@@ -280,6 +303,37 @@ def check_spot_signal(job_store_id: str, consume: bool = True) -> tuple[bool, in
         "Found spot signal marker for job %s: signal %d", job_store_id, signal_number
     )
     return True, signal_number
+
+
+def gc_spot_signal_markers(max_age_seconds: float = 7 * 24 * 3600) -> int:
+    """
+    Delete spot-signal marker files older than ``max_age_seconds``.
+
+    Markers are normally consumed by the batch system or cleared by the next
+    attempt of the same job, but a worker SIGKILLed after writing one (or a
+    job that is never retried) leaves it behind forever. Called once at batch
+    system startup. Returns the number of markers removed.
+    """
+    marker_dir = _MARKER_DIR or _resolve_marker_dir()
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    try:
+        entries = os.scandir(marker_dir)
+    except OSError:
+        return 0
+    with entries:
+        for entry in entries:
+            if not entry.name.startswith("spot_signal_"):
+                continue
+            try:
+                if entry.stat().st_mtime < cutoff:
+                    os.remove(entry.path)
+                    removed += 1
+            except OSError:
+                continue
+    if removed:
+        logger.debug("Removed %d stale spot signal markers", removed)
+    return removed
 
 
 def clear_spot_signal(job_store_id: str) -> None:

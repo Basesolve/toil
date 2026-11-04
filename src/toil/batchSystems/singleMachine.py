@@ -869,9 +869,9 @@ class SingleMachineBatchSystem(BatchSystemSupport):
             # Report if the job failed and we didn't kill it.
             # If we killed it then it shouldn't show up in the queue.
             exit_reason = None
-            if statusCode < 0:
-                # Died by signal; check for a spot-interrupt marker left by
-                # the worker's SIGTERM handler. Workers are launched as
+            if statusCode != 0:
+                # Failed or died by signal; check for a spot-interrupt marker
+                # left by the worker's SIGTERM handler. Workers are launched as
                 # "_toil_worker <name> <locator> <jobStoreID> ...".
                 job_command = self.jobs.get(jobID, "")
                 parts = job_command.split()

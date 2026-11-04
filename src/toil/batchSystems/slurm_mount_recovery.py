@@ -121,6 +121,25 @@ def parse_glob_list(value: str | list[str] | None) -> list[str]:
     return [part.strip() for part in parts if part and part.strip()]
 
 
+def resolve_classification_env() -> tuple[list[str], list[str], str, str | None]:
+    """
+    Resolve partition-classification inputs from environment variables alone.
+
+    Returns ``(spot_globs, ondemand_globs, spot_feature, legacy_pattern)``.
+    Used as the fallback when no batch-system instance config is available
+    (e.g. the standalone ``toil cluster check`` command). Instance config
+    (CLI flags) takes precedence over this in :meth:`get_classification_config`.
+    """
+    spot_globs = parse_glob_list(os.getenv("TOIL_SLURM_SPOT_PARTITIONS"))
+    ondemand_globs = parse_glob_list(os.getenv("TOIL_SLURM_ONDEMAND_PARTITIONS"))
+    spot_feature = os.getenv("TOIL_SLURM_SPOT_FEATURE") or DEFAULT_SPOT_FEATURE
+    # Check for correct spelling first, then old typo for backward compatibility
+    legacy = os.getenv("TOIL_SLURM_PARTITION_PREFERED") or os.getenv(
+        "TOIL_SLURM_PARTITON_PREFERED"
+    )
+    return spot_globs, ondemand_globs, spot_feature, legacy
+
+
 def classify_partition(
     partition_name: str,
     features: str | None,

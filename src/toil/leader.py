@@ -1182,6 +1182,13 @@ class Leader:
             # Set the number of cores used by OpenMP applications
             "OMP_NUM_THREADS": omp_threads,
         }
+        # Let workers namespace spot-signal markers by workflow so concurrent
+        # workflows sharing a marker dir cannot clobber each other's markers.
+        # The leader must see the same value in its own env so its
+        # check_spot_signal() hashes the marker path identically to the worker.
+        if self.config.workflowID:
+            os.environ.setdefault("TOIL_WORKFLOW_ID", self.config.workflowID)
+            job_environment["TOIL_WORKFLOW_ID"] = self.config.workflowID
 
         # jobBatchSystemID is an int for each job
         jobBatchSystemID = self.batchSystem.issueBatchJob(

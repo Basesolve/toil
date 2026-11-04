@@ -66,11 +66,12 @@ from toil.batchSystems.slurm_mount_recovery import (
     parse_spot_failover_exit_codes,
     parse_spot_failover_states,
     partition_switch_reason_matches,
+    resolve_classification_env,
     run_scontrol,
     spot_failover_enabled,
     spot_interruption_matches,
 )
-from toil.signal_spot_detection import check_spot_signal
+from toil.signal_spot_detection import check_spot_signal, gc_spot_signal_markers
 from toil.bus import get_job_kind
 from toil.common import Config
 from toil.job import JobDescription, Requirer
@@ -2023,6 +2024,12 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         self._preferred_partition_type = (preferred_type or "spot").strip().lower()
         # Let the assessBatchResources classmethod honor CLI config via this owner.
         SlurmBatchSystem._classification_owner = self
+        # Drop spot-signal markers from jobs that were killed and never retried,
+        # so the shared coordination dir does not accumulate them forever.
+        try:
+            gc_spot_signal_markers()
+        except Exception as e:
+            logger.debug("Could not garbage-collect spot signal markers: %s", e)
         super().__init__(config, maxCores, maxMemory, maxDisk)
         # Unified cached view of partition state/Alternate=/class/capacity.
         registry_ttl = getattr(config, "slurm_partition_cache_ttl", None)
@@ -2647,8 +2654,22 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         """
         features_by_name: dict[str, str] = {}
         partitions = getattr(cls, "_classification_partitions", None)
+        if partitions is None:
+            # No batch-system instance wired one in (e.g. standalone
+            # `toil cluster check`): build one from sinfo. PartitionSet
+            # swallows sinfo errors and leaves all_partitions None on failure;
+            # only cache a healthy set so a transient hiccup does not stick.
+            try:
+                fresh = cls.PartitionSet()
+            except Exception:
+                fresh = None
+            if fresh is not None and getattr(fresh, "all_partitions", None):
+                cls._classification_partitions = fresh
+                partitions = fresh
+            else:
+                partitions = None
         if partitions is not None:
-            for partition in partitions.all_partitions or []:
+            for partition in getattr(partitions, "all_partitions", None) or []:
                 features_by_name.setdefault(
                     partition.partition_name, partition.features
                 )
@@ -2691,14 +2712,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 owner.get_classification_config()
             )
         else:
-            spot_globs = parse_glob_list(os.getenv("TOIL_SLURM_SPOT_PARTITIONS"))
-            ondemand_globs = parse_glob_list(
-                os.getenv("TOIL_SLURM_ONDEMAND_PARTITIONS")
-            )
-            spot_feature = os.getenv("TOIL_SLURM_SPOT_FEATURE") or DEFAULT_SPOT_FEATURE
-            # Check for correct spelling first, then old typo for backward compatibility
-            legacy = os.getenv("TOIL_SLURM_PARTITION_PREFERED") or os.getenv(
-                "TOIL_SLURM_PARTITON_PREFERED"
+            # No live instance (standalone `toil cluster check`): use env config.
+            spot_globs, ondemand_globs, spot_feature, legacy = (
+                resolve_classification_env()
             )
         classes = cls.classify_partitions(
             list(slurm_resources.partitions),

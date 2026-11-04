@@ -23,30 +23,23 @@ logger = logging.getLogger(__name__)
 
 
 def _classification_inputs() -> dict[str, str]:
-    """Resolve the effective Slurm partition-classification inputs (CLI > env)."""
-    try:
-        from toil.batchSystems.slurm_mount_recovery import DEFAULT_SPOT_FEATURE
-    except ImportError:  # pragma: no cover - slurm always installed with toil
-        DEFAULT_SPOT_FEATURE = "spot"
+    """Resolve the effective Slurm partition-classification inputs (env, for display)."""
+    from toil.batchSystems.slurm_mount_recovery import resolve_classification_env
 
-    def pick(*values: str | None, default: str = "(unset)") -> str:
-        for value in values:
-            if value:
-                return str(value)
-        return default
+    spot_globs, ondemand_globs, spot_feature, legacy = resolve_classification_env()
+
+    def show(value: list[str] | str | None, default: str = "(unset)") -> str:
+        if isinstance(value, list):
+            return ",".join(value) if value else default
+        return value or default
 
     return {
-        "spot partitions (globs)": pick(os.getenv("TOIL_SLURM_SPOT_PARTITIONS")),
-        "on-demand partitions (globs)": pick(os.getenv("TOIL_SLURM_ONDEMAND_PARTITIONS")),
-        "spot node feature": pick(
-            os.getenv("TOIL_SLURM_SPOT_FEATURE"), default=DEFAULT_SPOT_FEATURE
-        ),
-        "legacy name pattern": pick(
-            os.getenv("TOIL_SLURM_PARTITION_PREFERED"),
-            os.getenv("TOIL_SLURM_PARTITON_PREFERED"),
-        ),
-        "preference partition type": pick(
-            os.getenv("TOIL_SLURM_PREFERENCE_PARTITION_TYPE"), default="spot"
+        "spot partitions (globs)": show(spot_globs),
+        "on-demand partitions (globs)": show(ondemand_globs),
+        "spot node feature": show(spot_feature),
+        "legacy name pattern": show(legacy),
+        "preference partition type": os.getenv(
+            "TOIL_SLURM_PREFERENCE_PARTITION_TYPE", "spot"
         ),
     }
 
