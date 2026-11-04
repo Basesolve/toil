@@ -1628,12 +1628,13 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             :rtype: str
             """
             gpu = True if accelerators else False
-            logger.info("GPU Required: %s", gpu)
             # Intentionally we check here if gpu nodes exist and choose them if required.
             # This is because we need an approach to ignore accelerator specification if gpu partition not found.
             usable_resources = self.batchSystemResources
-            logger.info(
-                "Detected Cluster Partitions: %s", usable_resources.partitions.unique()
+            logger.debug(
+                "Selecting partition: gpus=%s, cluster partitions=%s",
+                gpu,
+                usable_resources.partitions.unique(),
             )
             if gpu:
                 if not any(self.batchSystemResources["gpu"]):
@@ -1682,19 +1683,18 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                         logger.info("Trying with preferred type: %s", not preferred)
                     continue
                 usable_partitions = []
-                logger.info("Feasible Partitions: %s", possible_partitions)
+                logger.debug("Feasible partitions: %s", possible_partitions)
                 for partition in possible_partitions:
                     partition_state = self._cached_partition_state(partition)
                     if partition_state == "UP":
                         usable_partitions.append(partition)
                     else:
-                        logger.info(
-                            "Skipping partition: %s, due to state being %s",
+                        logger.debug(
+                            "Skipping partition %s: state is %s",
                             partition,
                             partition_state,
                         )
                 if usable_partitions:
-                    logger.info("Selectable Partitions: %s", usable_partitions)
                     return usable_partitions[0]
                 # Candidates fit the requirements but none are UP; try the
                 # other preference class before giving up.
@@ -1953,7 +1953,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
 
             if slurm_mem and slurm_cpu:
                 partition = self.boss.resolve_partition_for_job(
-                    jobID,
+                    self.boss._batch_to_job_store_id.get(jobID),
                     slurm_cpu,
                     slurm_mem,
                     gpus,
@@ -2210,10 +2210,11 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 preferred=use_preferred,
             )
             logger.info(
-                "Selected partition: %s based on cpus: %s and memory: %s of preferred type: %s",
+                "Selected partition %s (cpus=%s, mem=%s, gpus=%s, preferred=%s)",
                 partition,
                 cpus,
                 mem,
+                gpus,
                 use_preferred,
             )
         elif partition is not None:

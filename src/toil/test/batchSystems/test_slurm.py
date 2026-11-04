@@ -366,6 +366,8 @@ class FakeBatchSystem(BatchSystemSupport):
         self._job_spot_strikes: dict[str, int] = {}
         self._job_spot_last_advance: dict[str, float] = {}
         self.slurm_spot_failover = False
+        # --mem must reach the sbatch line for partition selection to run.
+        self.config.slurm_allocate_mem = True
         self.partitions = None
         self.partition_registry = None
         self._partition_failover_map: dict[str, str] = {}
@@ -1282,7 +1284,7 @@ class TestSlurmMountRecovery(ToilTest):
             boss=boss,
         )
         command = worker.prepareSbatch(
-            1, 1000000, 99, "job", {}, None, True, ""
+            1, 1000000, 5, 99, "job", {}, None, True, ""
         )
         self.assertIn("--partition=spare", command)
         self.assertTrue(
@@ -1753,7 +1755,7 @@ class TestSlurmMountRecovery(ToilTest):
             killedJobsQueue=Queue(),
             boss=boss,
         )
-        command = worker.prepareSbatch(1, 1000000, 42, "job", {}, None, True, "")
+        command = worker.prepareSbatch(1, 1000000, 5, 42, "job", {}, None, True, "")
         self.assertIn("--partition=hcs", command)
         self.assertEqual(boss._batch_submitted_partition[42], "hcs")
 
@@ -1771,13 +1773,13 @@ class TestSlurmMountRecovery(ToilTest):
             killedJobsQueue=Queue(),
             boss=boss,
         )
-        command = worker.prepareSbatch(1, 1000000, 99, "job", {}, None, True, "")
+        command = worker.prepareSbatch(1, 1000000, 5, 99, "job", {}, None, True, "")
         self.assertIn("--partition=spot-cod", command)
         self.assertNotIn("--partition=storage-spare", command)
 
         # Without per-job override, global storage failover wins.
         del boss._job_failover_partition["js-prep"]
-        command2 = worker.prepareSbatch(1, 1000000, 99, "job", {}, None, True, "")
+        command2 = worker.prepareSbatch(1, 1000000, 5, 99, "job", {}, None, True, "")
         self.assertIn("--partition=storage-spare", command2)
 
     def test_parse_glob_list(self):
