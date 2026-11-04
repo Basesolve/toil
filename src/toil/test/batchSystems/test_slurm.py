@@ -1,5 +1,6 @@
 import errno
 import inspect
+import io
 import logging
 import os
 import sys
@@ -2046,6 +2047,57 @@ class TestSlurmMountRecovery(ToilTest):
         worker = self._make_registry_worker(boss, resources)
         self.assertEqual(worker.select_partition(1, 1024, None), "only")
         self.assertIsNone(worker.select_partition(8, 1024, None))
+
+    def test_assess_batch_resources_no_type_error(self):
+        # Regression: assessBatchResources used to pass cls explicitly into the
+        # apply_partition_classification classmethod -> "takes 2 positional
+        # arguments but 3 were given". Mock scontrol so it parses one node.
+        # assessBatchResources pipes `scontrol show node -o` through sed inside
+        # the shell; os.popen returns the post-sed config-style text. Mock that.
+        scontrol_output = (
+            "[cn001]\nCPUTot=4\nRealMemory=8192\nGres=\nPartitions=spot-a\n"
+        )
+        self._clear_classification_env()
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_PARTITIONS", "spot-*")
+        self.monkeypatch.setattr(
+            toil.batchSystems.slurm.os, "popen", lambda *a, **k: io.StringIO(scontrol_output)
+        )
+        toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = (
+            self._fake_partition_set({"spot-a": ""})
+        )
+        toil.batchSystems.slurm.SlurmBatchSystem._classification_owner = None
+        try:
+            frame = toil.batchSystems.slurm.SlurmBatchSystem.assessBatchResources()
+        finally:
+            toil.batchSystems.slurm.SlurmBatchSystem._classification_partitions = None
+            toil.batchSystems.slurm.SlurmBatchSystem._classification_owner = None
+        self.assertIn("preference", frame.columns)
+        self.assertTrue(bool(frame.loc[frame.partitions == "spot-a", "preference"].iloc[0]))
+
+    def test_select_partition_preference_partition_type(self):
+        def build():
+            boss = self._make_registry_boss(
+                {"spot-a": "", "od-a": ""}, {"spot-a": "UP", "od-a": "UP"}
+            )
+            resources = make_resources_dataframe(
+                [("spot-a", 4, 8192, None), ("od-a", 4, 8192, None)]
+            )
+            resources["preference"] = [True, False]
+            return boss, self._make_registry_worker(boss, resources)
+
+        # Default / unset -> spot first (legacy behavior).
+        boss, worker = build()
+        self.assertEqual(worker.select_partition(1, 1024, None, preferred=True), "spot-a")
+
+        # ondemand -> on-demand class first.
+        boss, worker = build()
+        boss._preferred_partition_type = "ondemand"
+        self.assertEqual(worker.select_partition(1, 1024, None, preferred=True), "od-a")
+
+        # none -> preference-agnostic; resource order decides (spot-a listed first).
+        boss, worker = build()
+        boss._preferred_partition_type = "none"
+        self.assertEqual(worker.select_partition(1, 1024, None, preferred=True), "spot-a")
 
     def test_resolve_partition_for_job_precedence(self):
         boss = self._make_registry_boss(

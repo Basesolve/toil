@@ -50,6 +50,7 @@ def get_or_die(module: types.ModuleType, name: str) -> Any:
 def loadModules() -> dict[str, types.ModuleType]:
     # noinspection PyUnresolvedReferences
     from toil.utils import toilClean  # noqa
+    from toil.utils import toilCluster  # noqa
     from toil.utils import toilConfig  # noqa
     from toil.utils import toilDebugFile  # noqa
     from toil.utils import toilDebugJob  # noqa

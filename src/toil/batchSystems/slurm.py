@@ -1650,10 +1650,14 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
                 ]
             # Try the requested preference class first, then the other class;
             # when no preference column exists there is exactly one attempt.
-            if "preference" in self.batchSystemResources.columns:
-                preference_attempts: list[bool | None] = [preferred, not preferred]
+            # The column marks spot=True; the boss's configured preference type
+            # decides whether spot or on-demand is tried first ("none" disables).
+            boss_type = getattr(self.boss, "_preferred_partition_type", "spot")
+            if boss_type == "none" or "preference" not in self.batchSystemResources.columns:
+                preference_attempts: list[bool | None] = [None]
             else:
-                preference_attempts = [None]
+                spot_first = preferred if boss_type == "spot" else not preferred
+                preference_attempts = [spot_first, not spot_first]
             for attempt, preference in enumerate(preference_attempts):
                 if preference is None:
                     possible_partitions = usable_resources.partitions[
@@ -1992,7 +1996,9 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         self._job_failover_index: dict[str, int] = {}
         self._job_spot_strikes: dict[str, int] = {}
         self._job_spot_last_advance: dict[str, float] = {}
-        super().__init__(config, maxCores, maxMemory, maxDisk)
+        # Partition classification wiring must precede super().__init__(): the
+        # grid-engine thread starts there and calls assessBatchResources, which
+        # classifies via _classification_partitions / _classification_owner.
         self.partitions = SlurmBatchSystem.PartitionSet()
         # Make node features available to assessBatchResources classification.
         SlurmBatchSystem._classification_partitions = self.partitions
@@ -2009,6 +2015,15 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         if not spot_feature:
             spot_feature = os.getenv("TOIL_SLURM_SPOT_FEATURE")
         self._spot_feature = spot_feature or DEFAULT_SPOT_FEATURE
+        # Preferred partition class for placement: spot-first (legacy default),
+        # ondemand-first, or none (preference-agnostic). CLI > env > "spot".
+        preferred_type = getattr(config, "slurm_preference_partition_type", None)
+        if not preferred_type:
+            preferred_type = os.getenv("TOIL_SLURM_PREFERENCE_PARTITION_TYPE")
+        self._preferred_partition_type = (preferred_type or "spot").strip().lower()
+        # Let the assessBatchResources classmethod honor CLI config via this owner.
+        SlurmBatchSystem._classification_owner = self
+        super().__init__(config, maxCores, maxMemory, maxDisk)
         # Unified cached view of partition state/Alternate=/class/capacity.
         registry_ttl = getattr(config, "slurm_partition_cache_ttl", None)
         if registry_ttl is None:
@@ -2750,7 +2765,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         # Classify partitions as spot / on_demand / unknown. The preference
         # column marks spot partitions; when nothing classifies any partition
         # the column is omitted entirely (identical to legacy behavior).
-        cls.apply_partition_classification(cls, slurm_resources)
+        cls.apply_partition_classification(slurm_resources)
         if "preference" in slurm_resources.columns:
             logger.info(
                 "Slurm partition classification (preference=spot): %s",
@@ -2965,6 +2980,19 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             "A partition classifies as spot when any of its nodes carries this feature.",
         )
         parser.add_argument(
+            "--slurmPreferencePartitionType",
+            dest="slurm_preference_partition_type",
+            choices=["spot", "ondemand", "none"],
+            default=None,
+            env_var="TOIL_SLURM_PREFERENCE_PARTITION_TYPE",
+            help="Which classified partition class to prefer for scheduling when a "
+            "preference column exists: 'spot' (default) tries spot first, 'ondemand' "
+            "tries on-demand first, 'none' disables preference (placement is "
+            "preference-agnostic). Applies only to batch systems that support "
+            "partition classification. Per-job usePreferredPartition=False flips "
+            "the order relative to this type.",
+        )
+        parser.add_argument(
             "--slurmPartitionFailoverMap",
             dest="slurm_partition_failover_map",
             default=None,
@@ -3036,6 +3064,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
         setOption("slurm_spot_partitions")
         setOption("slurm_ondemand_partitions")
         setOption("slurm_spot_feature")
+        setOption("slurm_preference_partition_type")
         setOption("slurm_partition_failover_map")
         setOption("slurm_job_restart_threshold")
         setOption("slurm_partition_switch_cooldown")
