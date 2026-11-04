@@ -28,12 +28,14 @@ import toil
 from toil import worker as toil_worker
 from toil.batchSystems.abstractBatchSystem import (
     EXIT_STATUS_UNAVAILABLE_VALUE,
+    BatchJobExitReason,
     BatchSystemSupport,
     InsufficientSystemResources,
     ResourcePool,
     ResourceSet,
     UpdatedBatchJobInfo,
 )
+from toil.signal_spot_detection import check_spot_signal
 from toil.batchSystems.options import OptionSetter
 from toil.bus import ExternalBatchIdMessage
 from toil.common import Config, Toil
@@ -866,12 +868,23 @@ class SingleMachineBatchSystem(BatchSystemSupport):
         if not info.killIntended:
             # Report if the job failed and we didn't kill it.
             # If we killed it then it shouldn't show up in the queue.
+            exit_reason = None
+            if statusCode < 0:
+                # Died by signal; check for a spot-interrupt marker left by
+                # the worker's SIGTERM handler. Workers are launched as
+                # "_toil_worker <name> <locator> <jobStoreID> ...".
+                job_command = self.jobs.get(jobID, "")
+                parts = job_command.split()
+                if len(parts) >= 4:
+                    signaled, _signum = check_spot_signal(parts[3])
+                    if signaled:
+                        exit_reason = BatchJobExitReason.SPOT
             self.outputQueue.put(
                 UpdatedBatchJobInfo(
                     jobID=jobID,
                     exitStatus=statusCode,
                     wallTime=time.time() - info.time,
-                    exitReason=None,
+                    exitReason=exit_reason,
                 )
             )
 

@@ -43,6 +43,10 @@ from toil.cwl.utils import (
 )
 from toil.deferred import DeferredFunctionManager
 from toil.fileStores.abstractFileStore import AbstractFileStore
+from toil.signal_spot_detection import (
+    initialize_spot_signal_handling,
+    handle_spot_signal,
+)
 from toil.job import (
     CheckpointJobDescription,
     DebugStoppingPointReached,
@@ -1052,6 +1056,13 @@ def main(argv: list[str] | None = None) -> None:
     # Watch for time-up messages from the backing scheduler
     signal.signal(WALLTIME_SIGNAL, handle_walltime_signal)
 
+    # Initialize spot-signaled interruption detection. The marker file is
+    # written inside the SIGTERM handler itself (see toil.signal_spot_detection),
+    # so a worker killed before cleanup still leaves evidence of the preemption.
+    spot_signum = initialize_spot_signal_handling(options.jobStoreID)
+    if spot_signum is not None:
+        signal.signal(spot_signum, handle_spot_signal)
+
     ##########################################
     # Load the jobStore/config file
     ##########################################
@@ -1076,5 +1087,9 @@ def main(argv: list[str] | None = None) -> None:
         # Call the worker
         exit_code = workerScript(job_store, config, options.jobName, options.jobStoreID)
 
-    # Exit with its return value
+    # Note: spot signal marker files are written directly in the SIGTERM
+    # handler (toil.signal_spot_detection), because the worker may be
+    # killed before reaching this point.
+    
+    # Exit with the return value
     sys.exit(exit_code)

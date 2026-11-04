@@ -1512,6 +1512,81 @@ class TestSlurmMountRecovery(ToilTest):
         self.assertEqual(result, (143, BatchJobExitReason.SPOT))
         self.assertEqual(boss._job_failover_partition["js-finalize"], "cod")
 
+    def test_spot_signal_marker_boosts_nonmatching_exit_code(self):
+        """A worker SIGTERM marker triggers spot failover even when the exit
+        code is not in the configured spot set (e.g. exit 1)."""
+        boss = self.worker.boss
+        boss.slurm_spot_failover = True
+        boss._batch_to_job_store_id[1] = "js-marker-boost"
+        boss._batch_submitted_partition[1] = "cs"
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_STRIKES", "1")
+        self.monkeypatch.setenv("TOIL_SLURM_SPOT_FAILOVER_COOLDOWN", "0")
+
+        # Worker left a SIGTERM marker for this jobStoreID
+        marker_dir = tempfile.mkdtemp()
+        self.monkeypatch.setenv("TOIL_SPOT_SIGNAL_DIR", marker_dir)
+        from toil import signal_spot_detection as ssd
+        ssd.initialize_spot_signal_handling("js-marker-boost")
+        ssd._SPOT_SIGNAL_RECEIVED = 15
+        ssd.report_spot_signal(12345)
+        ssd._SPOT_SIGNAL_RECEIVED = None
+
+        def fake_run_scontrol(*args, **kwargs):
+            if args[:2] == ("show", "job"):
+                return "JobId=999 JobState=FAILED Partition=cs ExitCode=1:0"
+            if args[:2] == ("show", "partition"):
+                if args[2] == "cod":
+                    return "PartitionName=cod State=UP"
+                return "PartitionName=cs Alternate=cod State=UP"
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        # Exit code 1 is NOT in the default spot exit-code set {143}, and state
+        # FAILED is not in spot states; only the marker can trigger this.
+        result = self.worker._finalize_exit_code(
+            (1, BatchJobExitReason.FAILED),
+            1,
+            999,
+            ("FAILED", 1, ""),
+        )
+        self.assertEqual(result, (1, BatchJobExitReason.SPOT))
+        self.assertEqual(boss._job_failover_partition["js-marker-boost"], "cod")
+
+    def test_spot_signal_marker_cancelled_reason_wins(self):
+        """A marker left by scancel must NOT trigger spot failover: the
+        user-cancel exclusion beats the signal marker."""
+        boss = self.worker.boss
+        boss.slurm_spot_failover = True
+        boss._batch_to_job_store_id[1] = "js-marker-cancel"
+        boss._batch_submitted_partition[1] = "cs"
+
+        marker_dir = tempfile.mkdtemp()
+        self.monkeypatch.setenv("TOIL_SPOT_SIGNAL_DIR", marker_dir)
+        from toil import signal_spot_detection as ssd
+        ssd.initialize_spot_signal_handling("js-marker-cancel")
+        ssd._SPOT_SIGNAL_RECEIVED = 15
+        ssd.report_spot_signal(12345)
+        ssd._SPOT_SIGNAL_RECEIVED = None
+
+        def fake_run_scontrol(*args, **kwargs):
+            if args[:2] == ("show", "job"):
+                return "JobId=999 JobState=CANCELLED Partition=cs ExitCode=0:15"
+            return ""
+
+        self.monkeypatch.setattr(toil.batchSystems.slurm, "run_scontrol", fake_run_scontrol)
+        result = self.worker._finalize_exit_code(
+            (1, BatchJobExitReason.FAILED),
+            1,
+            999,
+            ("CANCELLED", 1, "cancel by user"),
+        )
+        # Not SPOT: cancel exclusion wins over the marker.
+        self.assertNotEqual(
+            result,
+            (1, BatchJobExitReason.SPOT),
+            "scancel marker must not trigger spot failover",
+        )
+
     def test_spot_failover_uses_remembered_partition_when_scontrol_job_gone(self):
         boss = FakeBatchSystem()
         boss.slurm_spot_failover = True

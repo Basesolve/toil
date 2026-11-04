@@ -70,6 +70,7 @@ from toil.batchSystems.slurm_mount_recovery import (
     spot_failover_enabled,
     spot_interruption_matches,
 )
+from toil.signal_spot_detection import check_spot_signal
 from toil.bus import get_job_kind
 from toil.common import Config
 from toil.job import JobDescription, Requirer
@@ -980,13 +981,37 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             ):
                 return None
             state, _rc, reason = status
+            job_store_id = self.boss._batch_to_job_store_id.get(toil_job_id)
             if not self.boss.spot_interruption_matches_configured(
                 state, exit_code, reason
             ):
-                return None
+                # Exit-code / state inference did not match. Fall back to the
+                # explicit worker signal marker: if the worker caught SIGTERM
+                # from the scheduler and left a marker, that is stronger
+                # evidence of preemption than any exit-code guess.
+                # CANCELLED / user-cancel exclusions still win over the marker
+                # (scancel delivers SIGTERM too, but is not a spot event).
+                if job_store_id is None:
+                    return None
+                signaled, _signum = check_spot_signal(job_store_id)
+                if not signaled:
+                    return None
+                reason_lower = (reason or "").lower()
+                if any(
+                    p.lower() in reason_lower
+                    for p in (self.boss.spot_failover_exclude_reasons()
+                              or DEFAULT_SPOT_FAILOVER_EXCLUDE_REASONS)
+                ):
+                    # Marker consumed above; exclusion wins over it.
+                    return None
+                logger.info(
+                    "Spot signal marker found for jobStoreID=%s (batch=%s) despite "
+                    "non-matching exit inference; treating as spot interruption",
+                    job_store_id,
+                    toil_job_id,
+                )
             if job_details is None:
                 job_details = self._fetch_scontrol_job_details(slurm_job_id)
-            job_store_id = self.boss._batch_to_job_store_id.get(toil_job_id)
             submitted = self.boss._batch_submitted_partition.get(toil_job_id)
             if submitted is None and job_details:
                 submitted = job_details.get("Partition")

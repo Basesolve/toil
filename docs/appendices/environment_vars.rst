@@ -247,6 +247,20 @@ There are several environment variables that affect the way Toil runs.
 |                                      | interruptions. Same as                              |
 |                                      | ``--slurmSpotFailoverReasons``.                    |
 +--------------------------------------+-----------------------------------------------------+
+| TOIL_SPOT_SIGNAL_DIR                 | Directory for worker spot-signal marker files.      |
+|                                      | Workers write an atomic marker here when their      |
+|                                      | SIGTERM handler fires, letting the batch system     |
+|                                      | treat the death as a spot interruption even when    |
+|                                      | the exit code does not match. Defaults to           |
+|                                      | ``$TOIL_COORDINATION_DIR/spot_signals``, then a     |
+|                                      | node-local temp dir (not shared across nodes).      |
++--------------------------------------+-----------------------------------------------------+
+| TOIL_SPOT_SIGNAL_SIG                 | Signal name the worker treats as spot interruption  |
+|                                      | (default: ``SIGTERM``). The worker records the      |
+|                                      | signal in a marker file, then re-raises it with     |
+|                                      | default disposition so death semantics are          |
+|                                      | unchanged.                                          |
++--------------------------------------+-----------------------------------------------------+
 | TOIL_GRIDENGINE_ARGS                 | Arguments for qsub for the gridengine batch         |
 |                                      | system. Do not pass CPU or memory specifications    |
 |                                      | here. Instead, define resource requirements for     |

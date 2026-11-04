@@ -94,6 +94,10 @@ Configure ``Alternate=`` on your partition in Slurm (e.g. ParallelCluster ``Part
 
 Spot-phase failures (exit reason ``SPOT``) keep the job's memory and try count so failover can complete under the usual ``--retryCount``. ``--doubleMem`` applies to a later 143 only after that job has already been submitted on its failover partition. Related knobs: ``--slurmSpotFailoverCooldown``, ``--slurmSpotFailoverExitCodes``, ``--slurmSpotFailoverStates``, ``--slurmSpotFailoverExcludeReasons``, ``--slurmSpotFailoverReasons``.
 
+**Signal-based spot detection (workers)**
+
+Exit-code inference is fragile: applications can exit ``1`` on preemption, and not every preemption yields 143. Toil workers therefore install a ``SIGTERM`` handler that atomically writes a marker file before the process dies. When a terminal Slurm outcome does **not** match the exit-code/state inference, Toil checks for that marker (keyed by jobStoreID); if found, the failure is treated as a spot interruption. User-cancel exclusions (``user``, ``cancel``) still win over the marker, so ``scancel`` is never misclassified. The marker directory defaults to ``$TOIL_COORDINATION_DIR/spot_signals`` (shared filesystem) and can be overridden with ``TOIL_SPOT_SIGNAL_DIR``; the watched signal defaults to ``SIGTERM`` and can be changed with ``TOIL_SPOT_SIGNAL_SIG``. Workers clear stale markers at startup so a crashed previous attempt cannot contaminate a retry.
+
 .. _slurmMountRecoveryValidation:
 
 Validating mount recovery on a real cluster
