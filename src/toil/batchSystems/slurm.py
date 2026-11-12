@@ -1564,7 +1564,7 @@ class SlurmBatchSystem(AbstractGridEngineBatchSystem):
             """
             Returns the sbatch command line to run to queue the job.
             """
-            timeout = os.getenv("TOIL_SLURM_JOB_TIMEOUT", "02:30:00")
+            timeout = os.getenv("TOIL_SLURM_JOB_TIMEOUT")
             # Start by naming the job
             sbatch_line = ["sbatch", "-J", f"toil_job_{jobID}_{jobName}"]
 
